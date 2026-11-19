@@ -472,7 +472,10 @@ class SnapshotTest(unittest.TestCase):
             self.assertFalse(parsed_inf["cmux"]["ok"])
 
             huge_int_cmux = tmp / "cmux_huge_int.json"
-            huge_int_cmux.write_text(f'{{"ok": true, "vms": [{{"disk_free_gb": {10**309}}}]}}', encoding="utf-8")
+            huge_int_cmux.write_text(
+                f'{{"ok": true, "vms": [{{"vm_id": "cmux-huge", "slots": [], "disk_free_gb": {10**309}}}]}}',
+                encoding="utf-8",
+            )
             out_huge = tmp / "status_huge.json"
             proc_huge = subprocess.run(
                 [
@@ -495,37 +498,41 @@ class SnapshotTest(unittest.TestCase):
             self.assertEqual(parsed_huge["cmux"]["vms"][0]["disk_status"], "unknown")
             from unittest import mock
             with mock.patch.object(MODULE, "_opt_float", side_effect=TypeError("bad cmux shape")):
-                degraded_cmux = MODULE._public_cmux({"ok": True, "vms": [{"disk_free_gb": 10}]})
+                degraded_cmux = MODULE._public_cmux({"ok": True, "vms": [{"vm_id": "cmux-1", "slots": [], "disk_free_gb": 10}]})
             self.assertFalse(degraded_cmux["ok"])
             self.assertEqual(degraded_cmux["vms"], [])
 
-            bad_vms_cmux = tmp / "cmux_bad_vms.json"
-            bad_vms_cmux.write_text(
-                '{"ok": true, "configured": 4, "executing": 0, "idle": 4, "cycling": 0, "down": 0, "vms": 5}',
-                encoding="utf-8",
-            )
-            out_bad_vms = tmp / "status_bad_vms.json"
-            proc_bad_vms = subprocess.run(
-                [
-                    sys.executable,
-                    str(MODULE_PATH),
-                    "--mac-host", str(mac_p),
-                    "--linux-host", str(linux_p),
-                    "--observed-at", "2026-11-18T09:15:00Z",
-                    "--published-at", "2026-11-18T09:15:05Z",
-                    "--cmux", str(bad_vms_cmux),
-                    "--output", str(out_bad_vms),
-                ],
-                capture_output=True,
-                text=True,
-                timeout=15,
-            )
-            self.assertEqual(proc_bad_vms.returncode, 0, msg=proc_bad_vms.stderr)
-            parsed_bad_vms = json.loads(out_bad_vms.read_text(encoding="utf-8"))
-            self.assertFalse(parsed_bad_vms["cmux"]["ok"])
-            self.assertEqual(parsed_bad_vms["cmux"]["vms"], [])
-            self.assertEqual(parsed_bad_vms["reconciliation"]["available_pools"], 2)
-            self.assertEqual(parsed_bad_vms["reconciliation"]["configured_slots"], 24)
+            for bad_label, bad_payload in (
+                ("non_list_vms", '{"ok": true, "configured": 4, "executing": 0, "idle": 4, "cycling": 0, "down": 0, "vms": 5}'),
+                ("non_obj_vm_row", '{"ok": true, "configured": 4, "executing": 0, "idle": 4, "cycling": 0, "down": 0, "vms": [1]}'),
+                ("empty_vm_row", '{"ok": true, "configured": 4, "executing": 0, "idle": 4, "cycling": 0, "down": 0, "vms": [{}]}'),
+                ("missing_slots_list", '{"ok": true, "configured": 4, "executing": 0, "idle": 4, "cycling": 0, "down": 0, "vms": [{"vm_id": "v1"}]}'),
+            ):
+                with self.subTest(bad_cmux=bad_label):
+                    bad_vms_cmux = tmp / f"cmux_{bad_label}.json"
+                    bad_vms_cmux.write_text(bad_payload, encoding="utf-8")
+                    out_bad_vms = tmp / f"status_{bad_label}.json"
+                    proc_bad_vms = subprocess.run(
+                        [
+                            sys.executable,
+                            str(MODULE_PATH),
+                            "--mac-host", str(mac_p),
+                            "--linux-host", str(linux_p),
+                            "--observed-at", "2026-11-18T09:15:00Z",
+                            "--published-at", "2026-11-18T09:15:05Z",
+                            "--cmux", str(bad_vms_cmux),
+                            "--output", str(out_bad_vms),
+                        ],
+                        capture_output=True,
+                        text=True,
+                        timeout=15,
+                    )
+                    self.assertEqual(proc_bad_vms.returncode, 0, msg=proc_bad_vms.stderr)
+                    parsed_bad_vms = json.loads(out_bad_vms.read_text(encoding="utf-8"))
+                    self.assertFalse(parsed_bad_vms["cmux"]["ok"])
+                    self.assertEqual(parsed_bad_vms["cmux"]["vms"], [])
+                    self.assertEqual(parsed_bad_vms["reconciliation"]["available_pools"], 2)
+                    self.assertEqual(parsed_bad_vms["reconciliation"]["configured_slots"], 24)
 
 
 if __name__ == "__main__":

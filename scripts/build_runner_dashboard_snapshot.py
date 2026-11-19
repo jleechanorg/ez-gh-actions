@@ -283,7 +283,12 @@ def _public_cmux(payload):
         vms = []
         for idx, vm in enumerate(raw_vms, start=1):
             if not isinstance(vm, dict):
-                continue
+                return _empty_cmux()
+            vm_name = vm.get("vm_id") or vm.get("short") or vm.get("slug") or vm.get("id") or vm.get("name")
+            if not isinstance(vm_name, str) or not vm_name.strip():
+                return _empty_cmux()
+            if not isinstance(vm.get("slots"), list):
+                return _empty_cmux()
             anon_vm_id = f"cloud-vm-{idx}"
             free_gb = _opt_float(vm.get("disk_free_gb"))
             floor_gb = _count(vm.get("disk_floor_gb"))
@@ -339,11 +344,11 @@ def _parse_iso_utc(raw):
         return None
     try:
         parsed = datetime.datetime.fromisoformat(text.replace("Z", "+00:00"))
-    except ValueError:
+        if parsed.tzinfo is None:
+            return None
+        return parsed.astimezone(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    except (ValueError, OverflowError):
         return None
-    if parsed.tzinfo is None:
-        return None
-    return parsed.astimezone(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _public_latency(payload, repo_map):

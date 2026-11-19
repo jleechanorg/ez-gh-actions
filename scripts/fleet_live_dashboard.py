@@ -37,7 +37,8 @@ import queue_probe  # noqa: E402
 _LIVE_LATENCY_CACHE = {"key": None, "ts": 0.0, "data": None}
 _LIVE_LATENCY_TTL_S = 300.0
 MAX_LIVE_REPOS = 3
-DEFAULT_MIN_FREE_DISK_GB = 30
+DEFAULT_MIN_FREE_DISK_GB = 10
+IDLE_STARVED_THRESHOLD_MIN = 5.0
 
 
 def _cap_live_repos(repos):
@@ -91,11 +92,20 @@ def _is_valid_hosts_payload(data):
 
 
 def _is_valid_cmux_payload(data):
-    return (
-        isinstance(data.get("cmux_vms"), list)
-        or isinstance(data.get("vms"), list)
-        or data.get("ok") is False
-    )
+    if data.get("ok") is False:
+        return True
+    raw_vms = data.get("cmux_vms") if "cmux_vms" in data else data.get("vms")
+    if not isinstance(raw_vms, list):
+        return False
+    for vm in raw_vms:
+        if not isinstance(vm, dict):
+            return False
+        vm_name = vm.get("short") or vm.get("slug") or vm.get("id") or vm.get("name") or vm.get("vm_id")
+        if not isinstance(vm_name, str) or not vm_name.strip():
+            return False
+        if not isinstance(vm.get("slots"), list):
+            return False
+    return True
 
 
 def _is_valid_gh_payload(data):
@@ -421,6 +431,7 @@ def _enrich_slot(slot_raw, gh_by_runner, gh_by_run_job, host_disk_paused=False):
         "commands": [str(c)[:180] for c in cmds[:4]],
         "reason": reason,
         "labels": slot_raw.get("labels") if isinstance(slot_raw.get("labels"), list) else [],
+        "scope": slot_raw.get("scope") if isinstance(slot_raw.get("scope"), str) and slot_raw.get("scope").strip() else None,
     }
 
 
@@ -515,7 +526,11 @@ def _normalize_hosts(hosts_data, cmux_data, gh_data, errors=None):
         vms = _as_dict_list(vms_raw, "cmux.vms", errors)
         for vm in vms:
             try:
-                short = vm.get("short") or vm.get("slug") or vm.get("id")
+                short = vm.get("short") or vm.get("slug") or vm.get("id") or vm.get("name") or vm.get("vm_id")
+                if not isinstance(short, str) or not short.strip():
+                    raise ValueError("cmux vm missing valid string name/short/id")
+                if not isinstance(vm.get("slots"), list):
+                    raise ValueError("cmux vm missing slots list")
                 cfg_raw = vm.get("ezgha_config") if vm.get("ezgha_config") is not None else vm.get("config")
                 cfg = _as_dict(cfg_raw, "cmux.vm.config", errors)
                 disk = _as_dict(vm.get("disk"), "cmux.vm.disk", errors)
@@ -723,23 +738,16 @@ def _clean_int_map(mapping, label, errors):
     return cleaned
 
 
-def _normalize_reconciliation(hosts, cmux_data, gh_data, scope_note=None, hosts_partial=False, fixture_errors=None, errors=None):
-    state_counts = {
-        "EXECUTING": 0,
-        "CYCLING": 0,
-        "IDLE": 0,
-        "DOWN": 0,
-        "PARKED": 0,
-        "OFFLINE": 0,
-        "UNKNOWN": 0,
-    }
-    total_slots = 0
-    for h in hosts:
-        for s in h["slots"]:
-            total_slots += 1
-            st = s["state"]
-            state_counts[st] = state_counts.get(st, 0) + 1
+def _opt_nonneg_number(value, label, errors):
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+        _record_norm_error(errors, f"{label}: expected non-negative number, got {type(value).__name__}")
+        return None
+    return float(value)
 
+
+def _normalize_reconciliation(hosts, cmux_data, gh_data, scope_note=None, hosts_partial=False, fixture_errors=None, errors=None):
     rec_raw = (cmux_data or {}).get("github_reconciliation") if isinstance(cmux_data, dict) else None
     rec = _as_dict(rec_raw, "cmux.github_reconciliation", errors)
     gh_summary_raw = (gh_data or {}).get("summary") if isinstance(gh_data, dict) else None
@@ -792,6 +800,9 @@ def _normalize_reconciliation(hosts, cmux_data, gh_data, scope_note=None, hosts_
     ghost_q = _opt_int(wa_q.get("queued_runs_zero_jobs"), "queued_breakdown.queued_runs_zero_jobs", errors)
     if ghost_q is None:
         ghost_q = _opt_int(gh_summary.get("inert_ghosts"), "github.summary.inert_ghosts", errors)
+    oldest_wait = _opt_nonneg_number(wa_q.get("oldest_fresh_wait_minutes"), "queued_breakdown.oldest_fresh_wait_minutes", errors)
+    if oldest_wait is None:
+        oldest_wait = _opt_nonneg_number(gh_summary.get("oldest_fresh_wait_minutes"), "github.summary.oldest_fresh_wait_minutes", errors)
 
     fresh_scope = None
     total_q_api = _opt_int(wa_q.get("total_queued_runs_api"), "queued_breakdown.total_queued_runs_api", errors)
@@ -823,6 +834,41 @@ def _normalize_reconciliation(hosts, cmux_data, gh_data, scope_note=None, hosts_
     q_succ = _opt_int(gh_summary.get("q_succeeded_repos"), "github.summary.q_succeeded_repos", errors)
     q_repos_covered = f"{q_succ}/{q_exp}" if isinstance(q_exp, int) and isinstance(q_succ, int) else None
 
+    idle_starved_active = (
+        not q_partial
+        and q_unverified_runs == 0
+        and isinstance(fresh_q, int)
+        and fresh_q > 0
+        and oldest_wait is not None
+        and oldest_wait >= IDLE_STARVED_THRESHOLD_MIN
+    )
+
+    state_counts = {
+        "EXECUTING": 0,
+        "CYCLING": 0,
+        "IDLE": 0,
+        "IDLE-STARVED": 0,
+        "DOWN": 0,
+        "PARKED": 0,
+        "OFFLINE": 0,
+        "UNKNOWN": 0,
+    }
+    total_slots = 0
+    for h in hosts:
+        for s in h["slots"]:
+            if idle_starved_active and s.get("state") == "IDLE" and not s.get("scope"):
+                s["state"] = "IDLE-STARVED"
+                s["alert_level"] = "critical"
+                s["phase_badge"] = "idle_starved"
+                if not s.get("reason"):
+                    s["reason"] = (
+                        f"idle-starved ({fresh_q} fresh queued run(s), oldest wait "
+                        f"{round(oldest_wait, 1)}m >= {int(IDLE_STARVED_THRESHOLD_MIN)}m threshold)"
+                    )
+            total_slots += 1
+            st = s["state"]
+            state_counts[st] = state_counts.get(st, 0) + 1
+
     return {
         "total_slots": total_slots,
         "state_counts": state_counts,
@@ -841,6 +887,8 @@ def _normalize_reconciliation(hosts, cmux_data, gh_data, scope_note=None, hosts_
         "queued_jobs_total": total_q_jobs,
         "fresh_queued_runs": fresh_q,
         "inert_ghosts": ghost_q,
+        "oldest_fresh_wait_minutes": oldest_wait,
+        "idle_starved": idle_starved_active,
         "queued_sample_note": gh_summary.get("queued_sample_note"),
         "in_progress_runs_by_repo": ip_runs_by_repo,
         "in_progress_jobs_by_repo": ip_jobs_by_repo,
@@ -1019,20 +1067,25 @@ def _probe_docker_host_core(*, is_mac=False, mac_disabled=False, cfg=None, servi
     raw_floor = cfg.get("min_free_disk_gb")
     floor_gb = raw_floor if isinstance(raw_floor, int) and not isinstance(raw_floor, bool) else None
     disk_info = {}
-    free_gb = None
+    free_bytes = None
+    free_gb_str = None
     try:
         usage = disk_usage("/")
-        free_gb = round(usage.free / (1024 ** 3), 1)
+        free_bytes = usage.free
+        raw_gib = usage.free / (1024 ** 3)
+        free_gb_floor = math.floor(raw_gib * 100) / 100.0
+        free_gb_str = f"{free_gb_floor:.2f}".rstrip("0").rstrip(".") or "0"
         total_gb = round(usage.total / (1024 ** 3), 1)
         use_pct = f"{round((usage.used / usage.total) * 100)}%" if usage.total else "?"
         disk_info = {
-            "avail": f"{free_gb}G",
+            "avail": f"{free_gb_str}G",
+            "avail_bytes": usage.free,
             "total": f"{total_gb}G",
             "use_pct": use_pct,
             "min_free_disk_gb_floor": floor_gb if floor_gb is not None else "unknown",
         }
         if is_mac:
-            disk_info["root_avail"] = f"{free_gb}G"
+            disk_info["root_avail"] = f"{free_gb_str}G"
     except OSError:
         pass
 
@@ -1042,12 +1095,13 @@ def _probe_docker_host_core(*, is_mac=False, mac_disabled=False, cfg=None, servi
     except OSError:
         pass
 
+    floor_bytes = floor_gb * (1024 ** 3) if floor_gb is not None else None
     disk_paused = (
         not is_mac
         and not mac_disabled
-        and isinstance(free_gb, (int, float))
-        and floor_gb is not None
-        and free_gb < floor_gb
+        and isinstance(free_bytes, int)
+        and floor_bytes is not None
+        and free_bytes < floor_bytes
     )
 
     observed_by_name = {}
@@ -1133,7 +1187,7 @@ def _probe_docker_host_core(*, is_mac=False, mac_disabled=False, cfg=None, servi
                 if mac_disabled:
                     miss_reason = "operator disabled (MAC_RUNNER_DISABLED=1)"
                 elif disk_paused:
-                    miss_reason = f"respawn blocked by disk-floor admission pause ({free_gb}G free < {floor_gb}G floor)"
+                    miss_reason = f"respawn blocked by disk-floor admission pause ({free_gb_str}G free < {floor_gb}G floor)"
                 elif not docker_ok:
                     miss_reason = "docker daemon unreachable"
                 else:
@@ -1160,7 +1214,7 @@ def _probe_docker_host_core(*, is_mac=False, mac_disabled=False, cfg=None, servi
     configured_count = cfg.get("count") if cfg.get("count") is not None else len(slots)
     if disk_paused:
         admission_status = "PAUSED_DISK_FLOOR"
-        admission_message = f"runner admission paused: host free disk {free_gb}G < {floor_gb}G floor"
+        admission_message = f"runner admission paused: host free disk {free_gb_str}G < {floor_gb}G floor"
     elif not docker_ok:
         admission_status = f"service {service_status} / docker_unreachable"
         admission_message = None
@@ -1249,6 +1303,7 @@ def _collect_live_github_snapshot(repos=None):
     q_runs_by_repo = {}
     total_fresh = 0
     total_ghosts = 0
+    oldest_fresh_wait_min = None
     fresh_complete = True
     ip_failed_repos = set()
     ip_capped = bool(cap_note)
@@ -1320,6 +1375,9 @@ def _collect_live_github_snapshot(repos=None):
                 else:
                     total_fresh += q_probe["fresh"]
                     total_ghosts += q_probe["ghosts"]
+                    ow = q_probe.get("oldest_fresh_wait_minutes")
+                    if isinstance(ow, (int, float)) and not isinstance(ow, bool) and math.isfinite(ow) and ow >= 0:
+                        oldest_fresh_wait_min = ow if oldest_fresh_wait_min is None else max(oldest_fresh_wait_min, ow)
         except Exception as exc:
             fresh_complete = False
             q_failed_repos.add(repo)
@@ -1344,6 +1402,7 @@ def _collect_live_github_snapshot(repos=None):
             "queued_jobs_by_repo": {},
             "fresh_queued_runs": total_fresh if fresh_complete else None,
             "inert_ghosts": total_ghosts if fresh_complete else None,
+            "oldest_fresh_wait_minutes": oldest_fresh_wait_min if fresh_complete else None,
             "queued_sample_note": "; ".join(sample_notes) if sample_notes else None,
         },
     }
@@ -1365,7 +1424,7 @@ def _cached_live_latency(repos):
 
 
 _REMOTE_PROBE_PY = "\n".join([
-    "import json, os, re, shutil, socket, subprocess",
+    "import json, math, os, re, shutil, socket, subprocess",
     "from pathlib import Path",
     f"DEFAULT_MIN_FREE_DISK_GB = {DEFAULT_MIN_FREE_DISK_GB}",
     inspect.getsource(_read_local_ezgha_config),
@@ -1580,6 +1639,8 @@ def build_operator_state(*, audit_dir=None, hosts_json=None, cmux_json=None, git
     )
     lat_errors = []
     latency = _normalize_latency(latency_raw, errors=lat_errors)
+    if norm_errors:
+        reconciliation["gh_errors"] = list(reconciliation.get("gh_errors") or []) + list(norm_errors)
     extra_errors = rec_errors + lat_errors
     if extra_errors:
         fixture_errors.extend(extra_errors)
@@ -1669,7 +1730,7 @@ def render_html(state, *, auto_refresh_ms=0):
       font-weight: 700; text-transform: uppercase; border: 1px solid var(--line);
     }}
     .badge-EXECUTING {{ color: var(--green); border-color: var(--green); background: rgb(105 226 125 / 0.1); }}
-    .badge-DOWN, .badge-OFFLINE, .badge-CRITICAL {{ color: var(--red); border-color: var(--red); background: rgb(255 107 87 / 0.14); }}
+    .badge-DOWN, .badge-OFFLINE, .badge-CRITICAL, .badge-IDLE-STARVED {{ color: var(--red); border-color: var(--red); background: rgb(255 107 87 / 0.14); }}
     .badge-CYCLING, .badge-IDLE, .badge-WARN {{ color: var(--amber); border-color: var(--amber); background: rgb(244 201 93 / 0.12); }}
     .badge-PARKED {{ color: var(--blue); border-color: var(--blue); background: rgb(122 179 239 / 0.12); }}
     .badge-UNKNOWN {{ color: var(--muted); border-color: var(--muted); background: rgb(157 168 161 / 0.12); }}
@@ -1820,6 +1881,7 @@ def render_html(state, *, auto_refresh_ms=0):
           <option value="EXECUTING">EXECUTING</option>
           <option value="DOWN">DOWN</option>
           <option value="CYCLING">CYCLING</option>
+          <option value="IDLE-STARVED">IDLE-STARVED</option>
           <option value="IDLE">IDLE</option>
           <option value="PARKED">PARKED</option>
           <option value="OFFLINE">OFFLINE</option>
@@ -1877,7 +1939,10 @@ def render_html(state, *, auto_refresh_ms=0):
       document.getElementById('slot-total-badge').textContent = (rec.total_slots || 0) + ' TOTAL SLOTS';
       const downHosts = (state.hosts || []).filter((h) => (h.slots || []).some((s) => s.state === 'DOWN')).map((h) => h.id);
       const downSub = downHosts.length ? downHosts.join(', ') + ' down/paused slots' : 'No DOWN slots';
-      const idleSub = (sc.IDLE || 0) + ' idle slot(s) across hosts';
+      const starvedCount = sc['IDLE-STARVED'] || 0;
+      const idleSub = starvedCount > 0
+        ? starvedCount + ' IDLE-STARVED slot(s) (>=5m verified queue), ' + (sc.IDLE || 0) + ' IDLE-OK'
+        : (sc.IDLE || 0) + ' idle slot(s) across hosts';
       const qSub = rec.queued_sample_note
         ? rec.queued_sample_note
         : (rec.queue_partial
@@ -1905,7 +1970,7 @@ def render_html(state, *, auto_refresh_ms=0):
         ['Active GH Runs' + (rec.active_runs_partial ? ' (Partial)' : ''), activeRunsVal, rec.active_runs_partial ? 'Partial' + partialTag + ' — see error banner' : 'Workflow rows showing in_progress'],
         ['Active GH Jobs' + (rec.active_runs_partial ? ' (Partial)' : ''), activeJobsVal, rec.active_runs_partial ? 'Partial' + partialTag + ' — see error banner' : 'Observed in_progress jobs'],
         ['Executing Slots', sc.EXECUTING || 0, 'Docker + native + special executing'],
-        ['Cycling / Idle', (sc.CYCLING || 0) + 'C / ' + (sc.IDLE || 0) + 'I', idleSub],
+        ['Cycling / Idle', (sc.CYCLING || 0) + 'C / ' + (sc.IDLE || 0) + 'I' + (starvedCount > 0 ? ' / ' + starvedCount + 'S' : ''), idleSub],
         ['Down / Offline / Unknown', (sc.DOWN || 0) + 'D / ' + (sc.OFFLINE || 0) + 'O / ' + (sc.UNKNOWN || 0) + 'U', downSub],
         ['Parked (Mac)', sc.PARKED || 0, 'Intentionally disabled'],
         ['Queued (Fresh / Ghosts)' + (rec.queue_partial ? ' (Partial)' : ''), qVal, qSub],
@@ -1915,6 +1980,9 @@ def render_html(state, *, auto_refresh_ms=0):
       ).join('');
 
       const alerts = [];
+      if (starvedCount > 0) {{
+        alerts.push(`<div class="alert-box"><strong>IDLE-STARVED:</strong> ${{esc(starvedCount)}} idle slot(s) while ${{esc(rec.fresh_queued_runs)}} verified fresh run(s) waited >=5m (${{esc(rec.oldest_fresh_wait_minutes)}}m).</div>`);
+      }}
       if (rec.scope_note) {{
         alerts.push(`<div class="alert-box warn"><strong>Fleet Scope:</strong> ${{esc(rec.scope_note)}}</div>`);
       }}
