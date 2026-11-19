@@ -178,6 +178,39 @@ def job_count(repo, run_id, *, budget=None, reserve=0):
     return payload if type(payload) is int else None
 
 
+def inspect_run_jobs(repo, run_id, *, budget=None, reserve=0):
+    """Fetch a run's jobs page once and return (total_count, queued_jobs, has_job_details)."""
+    payload = _call_gh(
+        ["api", f"repos/{repo}/actions/runs/{run_id}/jobs?per_page=100"],
+        budget=budget,
+        reserve=reserve,
+    )
+    if type(payload) is int:
+        return payload, [], False
+    if not isinstance(payload, dict):
+        return None, [], False
+    total = payload.get("total_count")
+    count = total if type(total) is int else None
+    raw_jobs = payload.get("jobs")
+    if isinstance(raw_jobs, list):
+        queued_jobs = []
+        for job in raw_jobs:
+            if not isinstance(job, dict) or job.get("status") != "queued":
+                continue
+            labels = [
+                lb.strip().lower()
+                for lb in (job.get("labels") or [])
+                if isinstance(lb, str) and lb.strip()
+            ]
+            queued_jobs.append({
+                "repo": repo,
+                "created_at": job.get("created_at"),
+                "labels": labels,
+            })
+        return count, queued_jobs, True
+    return count, [], False
+
+
 def minutes_since(stamp):
     if not isinstance(stamp, str):
         return None
@@ -237,16 +270,24 @@ def probe_repo(repo, *, max_job_checks=None, max_requests=None, _budget=None, _r
     fresh = ghosts = unreadable_jobs = checked_runs = 0
     oldest = None
     budget_capped_jobs = False
+    queued_jobs_out = []
+    job_details_complete = True
     for run in to_check:
         run_id = run.get("id")
         if run_id is None:
             count = None
+            run_queued_jobs = []
+            has_job_details = False
+            job_details_complete = False
         else:
             try:
-                count = job_count(repo, run_id, budget=budget, reserve=_reserve)
+                count, run_queued_jobs, has_job_details = inspect_run_jobs(
+                    repo, run_id, budget=budget, reserve=_reserve
+                )
             except RequestBudgetExhausted as exc:
                 budget_error = budget_error or str(exc)
                 budget_capped_jobs = True
+                job_details_complete = False
                 break
             except RuntimeError as exc:
                 message = str(exc).lower()
@@ -257,12 +298,17 @@ def probe_repo(repo, *, max_job_checks=None, max_requests=None, _budget=None, _r
                             "queued_total": queued_total, "sample_capped": False,
                             "sampled_fresh": None, "sampled_ghosts": None,
                             "partial": False, "unverified_runs": 0,
+                            "queued_jobs": [], "job_details_complete": False,
                             "error": f"rate limited while reading jobs: {str(exc)[:150]}"}
                 count = None
+                run_queued_jobs = []
+                has_job_details = False
+                job_details_complete = False
 
         checked_runs += 1
         if count is None:
             unreadable_jobs += 1
+            job_details_complete = False
 
         if count == 0:
             ghosts += 1
@@ -270,9 +316,17 @@ def probe_repo(repo, *, max_job_checks=None, max_requests=None, _budget=None, _r
 
         # count >= 1, or unreadable: both count as real waiting work.
         fresh += 1
-        wait = minutes_since(run.get("created_at"))
-        if wait is not None and (oldest is None or wait > oldest):
-            oldest = wait
+        if has_job_details:
+            queued_jobs_out.extend(run_queued_jobs)
+            for qj in run_queued_jobs:
+                wait = minutes_since(qj.get("created_at"))
+                if wait is not None and (oldest is None or wait > oldest):
+                    oldest = wait
+        else:
+            job_details_complete = False
+            wait = minutes_since(run.get("created_at"))
+            if wait is not None and (oldest is None or wait > oldest):
+                oldest = wait
 
     budget_exhausted = budget_error is not None or budget_capped_jobs
     remaining_unchecked = max(0, max(queued_total, len(queued)) - checked_runs)
@@ -285,6 +339,8 @@ def probe_repo(repo, *, max_job_checks=None, max_requests=None, _budget=None, _r
             "queued_total": queued_total, "sample_capped": bool(sample_capped or budget_exhausted),
             "sampled_fresh": fresh, "sampled_ghosts": ghosts,
             "partial": bool(unverified_runs > 0 or incomplete), "unverified_runs": unverified_runs,
+            "queued_jobs": queued_jobs_out,
+            "job_details_complete": bool(job_details_complete and not incomplete and unreadable_jobs == 0),
             "error": budget_error[:200] if budget_error else None}
 
 

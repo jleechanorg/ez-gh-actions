@@ -272,7 +272,10 @@ build_site() {
 import json, sys
 from pathlib import Path
 doc = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-assert isinstance(doc, dict) and doc.get("schema_version") == 1 and isinstance(doc.get("repos"), list)
+assert isinstance(doc, dict) and doc.get("schema_version") == 1
+raw = doc.get("queue") if isinstance(doc.get("queue"), dict) else doc
+repos = raw.get("repos")
+assert isinstance(repos, list) and all(isinstance(item, dict) for item in repos)
 PY
       then
         echo "queue probe exited non-zero with partial payload; preserving diagnostics" >&2

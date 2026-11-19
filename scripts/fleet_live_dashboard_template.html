@@ -495,7 +495,10 @@
 
     function renderAll() {
       const mode = state.source_mode || 'LIVE PROBE';
-      const refreshTag = refreshCount > 0 ? ' (refresh #' + refreshCount + ')' : '';
+      const refreshErr = state.last_refresh_error || state.stale_refresh_error;
+      const refreshTag = refreshErr
+        ? ' (STALE - refresh failed: ' + refreshErr + ')'
+        : (refreshCount > 0 ? ' (refresh #' + refreshCount + ')' : '');
       document.getElementById('live-stamp').textContent = mode + ' · RENDERED ' + (state.generated_at_utc || '') + refreshTag;
       const stamps = Object.entries(state.source_timestamps || {})
         .filter(([, v]) => v)
@@ -534,7 +537,12 @@
         opts.signal = AbortSignal.timeout(15000);
       }
       const r = await fetch('/api/state?ts=' + Date.now(), opts);
-      if (r.ok) { refreshCount += 1; state = await r.json(); renderAll(); }
+      if (r.ok) {
+        const next = await r.json();
+        if (!(next.last_refresh_error || next.stale_refresh_error)) refreshCount += 1;
+        state = next;
+        renderAll();
+      }
     }
     const manualBtn = document.getElementById('manual-refresh-btn');
     if (manualBtn) {

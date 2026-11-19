@@ -343,6 +343,67 @@ class OldestFreshWait(unittest.TestCase):
         finally:
             queue_probe.gh_json = original
 
+    def test_job_details_ground_oldest_wait_and_capture_labels(self):
+        from datetime import datetime, timedelta, timezone
+
+        now = datetime.now(timezone.utc)
+        old_run_created = (now - timedelta(hours=4)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        recent_job_created = (now - timedelta(minutes=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        def fake_gh(args):
+            joined = " ".join(args)
+            if "status=queued" in joined:
+                return {
+                    "total_count": 1,
+                    "workflow_runs": [{"id": 701, "created_at": old_run_created}],
+                }
+            if "status=in_progress" in joined:
+                return 0
+            if "/actions/runs/701/jobs" in joined:
+                return {
+                    "total_count": 2,
+                    "jobs": [
+                        {
+                            "id": 1,
+                            "status": "in_progress",
+                            "created_at": old_run_created,
+                            "labels": ["self-hosted", "Linux", "X64"],
+                        },
+                        {
+                            "id": 2,
+                            "status": "queued",
+                            "created_at": recent_job_created,
+                            "labels": ["self-hosted", "Linux", "X64"],
+                        },
+                    ],
+                }
+            raise AssertionError(f"unexpected call: {args}")
+
+        original = queue_probe.gh_json
+        queue_probe.gh_json = fake_gh
+        try:
+            result = queue_probe.probe_repo("org/repo")
+        finally:
+            queue_probe.gh_json = original
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["fresh"], 1)
+        self.assertEqual(result["ghosts"], 0)
+        self.assertFalse(result["partial"])
+        self.assertTrue(result["job_details_complete"])
+        self.assertIsNotNone(result["oldest_fresh_wait_minutes"])
+        self.assertLess(result["oldest_fresh_wait_minutes"], 10.0)
+        self.assertEqual(
+            result["queued_jobs"],
+            [
+                {
+                    "repo": "org/repo",
+                    "created_at": recent_job_created,
+                    "labels": ["self-hosted", "linux", "x64"],
+                }
+            ],
+        )
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

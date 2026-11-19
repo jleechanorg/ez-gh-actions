@@ -240,7 +240,8 @@ def _public_queue(payload, repo_map):
         return value if type(value) is int and value >= 0 else None
 
     repos = []
-    for entry in raw.get("repos") or []:
+    raw_repos = raw.get("repos")
+    for entry in (raw_repos if isinstance(raw_repos, list) else []):
         if not isinstance(entry, dict):
             continue
         repos.append({

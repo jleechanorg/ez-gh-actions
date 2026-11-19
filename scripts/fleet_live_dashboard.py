@@ -10,6 +10,7 @@ Modes:
 
 import argparse
 import datetime
+import fcntl
 import html as html_lib
 import http.server
 import inspect
@@ -17,7 +18,9 @@ import json
 import math
 import os
 import platform
+import plistlib
 import re
+import shlex
 import shutil
 import socket
 import socketserver
@@ -35,11 +38,84 @@ if SCRIPT_DIR not in sys.path:
 import ci_latency_probe  # noqa: E402
 import queue_probe  # noqa: E402
 
-_LIVE_LATENCY_CACHE = {"key": None, "ts": 0.0, "attempt_ts": None, "data": None, "error": None}
+_LIVE_LATENCY_CACHE = {"key": None, "ts": 0.0, "attempt_ts": None, "wall_ts": 0.0, "data": None, "error": None}
 _LIVE_LATENCY_TTL_S = 300.0
+_LIVE_GITHUB_TTL_S = 120.0
+_SHARED_CACHE_LOCK = threading.Lock()
 MAX_LIVE_REPOS = 3
 DEFAULT_MIN_FREE_DISK_GB = 10
 IDLE_STARVED_THRESHOLD_MIN = 5.0
+
+
+def _get_shared_cache_path():
+    raw = os.environ.get("EZGHA_OPERATOR_SHARED_CACHE_PATH")
+    if raw and raw.strip():
+        return Path(raw.strip())
+    return Path.home() / ".local" / "state" / "ezgha" / "operator_live_cache.json"
+
+
+def _shared_cache_read(bucket, key, ttl_s, *, min_newer_than=0.0):
+    path = _get_shared_cache_path()
+    lock_path = path.with_suffix(".lock")
+    try:
+        with _SHARED_CACHE_LOCK:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with lock_path.open("a+", encoding="utf-8") as lf:
+                fcntl.flock(lf.fileno(), fcntl.LOCK_SH)
+                try:
+                    if not path.is_file():
+                        return None
+                    doc = json.loads(path.read_text(encoding="utf-8"))
+                finally:
+                    fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+    except (OSError, json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(doc, dict):
+        return None
+    entry = (doc.get(bucket) or {}).get(key) if isinstance(doc.get(bucket), dict) else None
+    if not isinstance(entry, dict):
+        return None
+    wall_ts = entry.get("wall_ts")
+    if not isinstance(wall_ts, (int, float)) or isinstance(wall_ts, bool):
+        return None
+    if wall_ts <= min_newer_than:
+        return None
+    if (time.time() - wall_ts) < ttl_s:
+        return entry
+    return None
+
+
+def _shared_cache_write(bucket, key, *, data=None, error=None):
+    path = _get_shared_cache_path()
+    lock_path = path.with_suffix(".lock")
+    wall_ts = time.time()
+    try:
+        with _SHARED_CACHE_LOCK:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with lock_path.open("a+", encoding="utf-8") as lf:
+                fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+                try:
+                    doc = {}
+                    if path.is_file():
+                        try:
+                            loaded = json.loads(path.read_text(encoding="utf-8"))
+                            if isinstance(loaded, dict):
+                                doc = loaded
+                        except (OSError, json.JSONDecodeError, ValueError):
+                            doc = {}
+                    bkt = doc.setdefault(bucket, {})
+                    if not isinstance(bkt, dict):
+                        bkt = {}
+                        doc[bucket] = bkt
+                    bkt[key] = {"wall_ts": wall_ts, "data": data, "error": error}
+                    tmp_path = path.with_suffix(f".tmp.{os.getpid()}")
+                    tmp_path.write_text(json.dumps(doc), encoding="utf-8")
+                    tmp_path.replace(path)
+                finally:
+                    fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+    except OSError:
+        pass
+    return wall_ts
 
 
 def _cap_live_repos(repos):
@@ -377,13 +453,25 @@ def _enrich_slot(slot_raw, gh_by_runner, gh_by_run_job, host_disk_paused=False):
     if raw_elapsed is not None:
         if isinstance(raw_elapsed, bool) or not isinstance(raw_elapsed, (int, float)):
             raise ValueError(f"slot elapsed_minutes must be numeric, got {type(raw_elapsed).__name__}")
-        elapsed_min = raw_elapsed
+        try:
+            f_elapsed = float(raw_elapsed)
+        except (OverflowError, TypeError, ValueError) as exc:
+            raise ValueError(f"slot elapsed_minutes out of range: {exc}") from exc
+        if not math.isfinite(f_elapsed) or f_elapsed < 0:
+            raise ValueError("slot elapsed_minutes must be finite and non-negative")
+        elapsed_min = round(f_elapsed, 2) if isinstance(raw_elapsed, float) else raw_elapsed
     else:
         raw_etimes = slot_raw.get("worker_etimes_sec")
         if raw_etimes is not None:
             if isinstance(raw_etimes, bool) or not isinstance(raw_etimes, (int, float)):
                 raise ValueError(f"slot worker_etimes_sec must be numeric, got {type(raw_etimes).__name__}")
-            elapsed_min = round(raw_etimes / 60.0, 1)
+            try:
+                f_etimes = float(raw_etimes)
+            except (OverflowError, TypeError, ValueError) as exc:
+                raise ValueError(f"slot worker_etimes_sec out of range: {exc}") from exc
+            if not math.isfinite(f_etimes) or f_etimes < 0:
+                raise ValueError("slot worker_etimes_sec must be finite and non-negative")
+            elapsed_min = round(f_etimes / 60.0, 1)
         else:
             elapsed_min = None
 
@@ -495,10 +583,17 @@ def _normalize_hosts(hosts_data, cmux_data, gh_data, errors=None):
             load = _as_list(ju.get("load_average"), f"hosts.{host_key}.load_average", errors)
             contributors = _as_list(ju.get("disk_pressure_contributors"), f"hosts.{host_key}.disk_pressure_contributors", errors)
             paused = "PAUSED" in str(ju.get("admission_status") or "").upper()
+            host_scope = ju.get("scope")
+            host_labels = ju.get("labels") if isinstance(ju.get("labels"), list) else None
             slots = []
             for s in _as_dict_list(ju.get("slots"), f"hosts.{host_key}.slots", errors):
+                slot_in = {**s, "managed_pool": True, "kind": s.get("kind") or "container"}
+                if not slot_in.get("scope") and isinstance(host_scope, str) and host_scope.strip():
+                    slot_in["scope"] = host_scope
+                if not isinstance(slot_in.get("labels"), list) and host_labels is not None:
+                    slot_in["labels"] = host_labels
                 enriched = _safe_enrich_slot(
-                    {**s, "managed_pool": True, "kind": s.get("kind") or "container"},
+                    slot_in,
                     gh_by_runner,
                     gh_by_run_job,
                     host_disk_paused=paused,
@@ -553,10 +648,17 @@ def _normalize_hosts(hosts_data, cmux_data, gh_data, errors=None):
                     if mem
                     else vm.get("mem") or None
                 )
+                vm_scope = vm.get("scope")
+                vm_labels = vm.get("labels") if isinstance(vm.get("labels"), list) else None
                 slots = []
                 for s in _as_dict_list(vm.get("slots"), "cmux.vm.slots", errors):
+                    slot_in = {**s, "managed_pool": True, "kind": s.get("kind") or "container"}
+                    if not slot_in.get("scope") and isinstance(vm_scope, str) and vm_scope.strip():
+                        slot_in["scope"] = vm_scope
+                    if not isinstance(slot_in.get("labels"), list) and vm_labels is not None:
+                        slot_in["labels"] = vm_labels
                     enriched = _safe_enrich_slot(
-                        {**s, "managed_pool": True, "kind": s.get("kind") or "container"},
+                        slot_in,
                         gh_by_runner,
                         gh_by_run_job,
                         host_disk_paused=False,
@@ -599,12 +701,28 @@ def _normalize_hosts(hosts_data, cmux_data, gh_data, errors=None):
             mac = mac_raw
             disk = _as_dict(mac.get("disk"), "hosts.mac.disk", errors)
             load = _as_list(mac.get("load_average"), "hosts.mac.load_average", errors)
+            mac_scope = mac.get("scope")
+            mac_labels = mac.get("labels") if isinstance(mac.get("labels"), list) else None
             c_slots = [
                 enriched
                 for s in _as_dict_list(mac.get("container_slots"), "hosts.mac.container_slots", errors)
                 for enriched in [
                     _safe_enrich_slot(
-                        {**s, "managed_pool": True, "kind": s.get("kind") or "container"},
+                        {
+                            **s,
+                            "managed_pool": True,
+                            "kind": s.get("kind") or "container",
+                            **(
+                                {"scope": mac_scope}
+                                if not s.get("scope") and isinstance(mac_scope, str) and mac_scope.strip()
+                                else {}
+                            ),
+                            **(
+                                {"labels": mac_labels}
+                                if not isinstance(s.get("labels"), list) and mac_labels is not None
+                                else {}
+                            ),
+                        },
                         gh_by_runner,
                         gh_by_run_job,
                         label="hosts.mac.container_slots",
@@ -777,14 +895,64 @@ def _opt_nonneg_number(value, label, errors):
 
 
 def _is_general_purpose_managed_slot(slot):
-    """Return True only for general-purpose managed fleet container slots eligible for IDLE-STARVED."""
+    """Return True only for explicitly scoped general-purpose managed fleet container slots."""
     if slot.get("managed_pool") is not True:
         return False
     kind = (slot.get("kind") or "container").strip().lower()
     if kind != "container":
         return False
     scope = (slot.get("scope") or "").strip().lower()
-    return scope in ("", "org")
+    return scope == "org" or scope.startswith("repo:")
+
+
+def _queued_job_age_minutes(job, now_utc=None):
+    age_val = job.get("age_minutes")
+    if age_val is not None:
+        if isinstance(age_val, bool) or not isinstance(age_val, (int, float)):
+            return None
+        try:
+            fval = float(age_val)
+        except (OverflowError, TypeError, ValueError):
+            return None
+        return fval if math.isfinite(fval) and fval >= 0 else None
+    stamp = job.get("created_at")
+    if not isinstance(stamp, str) or not stamp.strip():
+        return None
+    try:
+        created = datetime.datetime.fromisoformat(stamp.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=datetime.timezone.utc)
+    ref = now_utc or datetime.datetime.now(datetime.timezone.utc)
+    return max(0.0, (ref - created).total_seconds() / 60.0)
+
+
+def _slot_can_serve_job(slot, job):
+    if not _is_general_purpose_managed_slot(slot):
+        return False
+    scope = (slot.get("scope") or "").strip().lower()
+    if scope.startswith("repo:"):
+        target_repo = scope[5:].strip().lower()
+        job_repo = str(job.get("repo") or "").strip().lower()
+        if not target_repo or job_repo != target_repo:
+            return False
+    raw_job_labels = job.get("labels")
+    job_labels = {
+        str(lb).strip().lower()
+        for lb in (raw_job_labels if isinstance(raw_job_labels, list) else [])
+        if isinstance(lb, str) and lb.strip()
+    }
+    raw_slot_labels = slot.get("labels")
+    slot_labels = {
+        str(lb).strip().lower()
+        for lb in (raw_slot_labels if isinstance(raw_slot_labels, list) else [])
+        if isinstance(lb, str) and lb.strip()
+    }
+    if job_labels:
+        if not slot_labels or not job_labels.issubset(slot_labels):
+            return False
+    return True
 
 
 def _normalize_reconciliation(hosts, cmux_data, gh_data, scope_note=None, hosts_partial=False, fixture_errors=None, errors=None):
@@ -875,14 +1043,17 @@ def _normalize_reconciliation(hosts, cmux_data, gh_data, scope_note=None, hosts_
     q_succ = _opt_int(gh_summary.get("q_succeeded_repos"), "github.summary.q_succeeded_repos", errors)
     q_repos_covered = f"{q_succ}/{q_exp}" if isinstance(q_exp, int) and isinstance(q_succ, int) else None
 
-    idle_starved_active = (
-        not q_partial
-        and q_unverified_runs == 0
-        and isinstance(fresh_q, int)
-        and fresh_q > 0
-        and oldest_wait is not None
-        and oldest_wait >= IDLE_STARVED_THRESHOLD_MIN
-    )
+    raw_queued_jobs = gh_summary.get("queued_jobs")
+    queued_jobs = [j for j in raw_queued_jobs if isinstance(j, dict)] if isinstance(raw_queued_jobs, list) else []
+    job_details_complete = gh_summary.get("job_details_complete") is not False
+    starving_jobs = []
+    if not q_partial and q_unverified_runs == 0 and job_details_complete and queued_jobs:
+        for job in queued_jobs:
+            age_min = _queued_job_age_minutes(job)
+            if age_min is not None and age_min >= IDLE_STARVED_THRESHOLD_MIN:
+                starving_jobs.append((job, age_min))
+
+    idle_starved_active = False
 
     state_counts = {
         "EXECUTING": 0,
@@ -897,15 +1068,19 @@ def _normalize_reconciliation(hosts, cmux_data, gh_data, scope_note=None, hosts_
     total_slots = 0
     for h in hosts:
         for s in h["slots"]:
-            if idle_starved_active and s.get("state") == "IDLE" and _is_general_purpose_managed_slot(s):
-                s["state"] = "IDLE-STARVED"
-                s["alert_level"] = "critical"
-                s["phase_badge"] = "idle_starved"
-                if not s.get("reason"):
-                    s["reason"] = (
-                        f"idle-starved ({fresh_q} fresh queued run(s), oldest wait "
-                        f"{round(oldest_wait, 1)}m >= {int(IDLE_STARVED_THRESHOLD_MIN)}m threshold)"
-                    )
+            if starving_jobs and s.get("state") == "IDLE":
+                matching_ages = [age_min for job, age_min in starving_jobs if _slot_can_serve_job(s, job)]
+                if matching_ages:
+                    idle_starved_active = True
+                    oldest_eligible = max(matching_ages)
+                    s["state"] = "IDLE-STARVED"
+                    s["alert_level"] = "critical"
+                    s["phase_badge"] = "idle_starved"
+                    if not s.get("reason"):
+                        s["reason"] = (
+                            f"idle-starved ({len(matching_ages)} eligible queued job(s) >= "
+                            f"{int(IDLE_STARVED_THRESHOLD_MIN)}m, oldest wait {round(oldest_eligible, 1)}m)"
+                        )
             total_slots += 1
             st = s["state"]
             state_counts[st] = state_counts.get(st, 0) + 1
@@ -984,7 +1159,7 @@ def _normalize_latency(latency_raw, errors=None):
 
 def _read_local_ezgha_config(config_path=None):
     path = Path(config_path) if config_path else (Path.home() / ".config" / "ezgha" / "config.toml")
-    out = {"count": None, "name_prefix": None, "min_free_disk_gb": DEFAULT_MIN_FREE_DISK_GB}
+    out = {"count": None, "name_prefix": None, "min_free_disk_gb": DEFAULT_MIN_FREE_DISK_GB, "scope": "unknown", "labels": []}
     if not path.is_file():
         return out
     try:
@@ -1000,17 +1175,29 @@ def _read_local_ezgha_config(config_path=None):
         if isinstance(cfg, dict):
             runner = cfg.get("runner") if isinstance(cfg.get("runner"), dict) else {}
             limits = cfg.get("limits") if isinstance(cfg.get("limits"), dict) else {}
+            github_cfg = cfg.get("github") if isinstance(cfg.get("github"), dict) else {}
             cnt = runner.get("count")
             if type(cnt) is int and cnt > 0:
                 out["count"] = cnt
             prefix = runner.get("name_prefix")
             if isinstance(prefix, str) and prefix:
                 out["name_prefix"] = prefix
+            raw_labels = runner.get("labels")
+            if isinstance(raw_labels, list):
+                out["labels"] = [str(lb).strip().lower() for lb in raw_labels if isinstance(lb, str) and lb.strip()]
+            gh_scope = str(github_cfg.get("scope") or "").strip().lower()
+            gh_target = str(github_cfg.get("target") or "").strip()
+            if gh_scope == "org":
+                out["scope"] = "org"
+            elif gh_scope == "repo" and "/" in gh_target:
+                out["scope"] = f"repo:{gh_target.lower()}"
             floor = limits.get("min_free_disk_gb")
             if type(floor) is int and floor >= 0:
                 out["min_free_disk_gb"] = floor
         return out
     section = None
+    gh_scope_raw = ""
+    gh_target_raw = ""
     try:
         for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
             line = raw.split("#", 1)[0].strip()
@@ -1027,11 +1214,61 @@ def _read_local_ezgha_config(config_path=None):
                 out["count"] = int(clean_int)
             elif section == "runner" and key == "name_prefix":
                 out["name_prefix"] = val.strip().strip('"').strip("'")
+            elif section == "runner" and key == "labels" and val.startswith("[") and val.endswith("]"):
+                out["labels"] = [item.strip().strip('"').strip("'").lower() for item in val[1:-1].split(",") if item.strip().strip('"').strip("'")]
+            elif section == "github" and key == "scope":
+                gh_scope_raw = val.strip().strip('"').strip("'").lower()
+            elif section == "github" and key == "target":
+                gh_target_raw = val.strip().strip('"').strip("'")
             elif section == "limits" and key == "min_free_disk_gb" and clean_int.isdigit():
                 out["min_free_disk_gb"] = int(clean_int)
     except OSError:
         pass
+    if gh_scope_raw == "org":
+        out["scope"] = "org"
+    elif gh_scope_raw == "repo" and "/" in gh_target_raw:
+        out["scope"] = f"repo:{gh_target_raw.lower()}"
     return out
+
+
+def _resolve_daemon_docker_host(is_mac, run_fn=None, plist_path=None):
+    """Resolve the DOCKER_HOST endpoint owned by the ezgha daemon, ignoring shell context."""
+    run = run_fn or subprocess.run
+    if is_mac:
+        plist = Path(plist_path) if plist_path else (Path.home() / "Library" / "LaunchAgents" / "org.jleechanorg.ezgha.plist")
+        if plist.is_file():
+            try:
+                doc = plistlib.loads(plist.read_bytes())
+                if isinstance(doc, dict):
+                    env_map = doc.get("EnvironmentVariables")
+                    if isinstance(env_map, dict):
+                        dh = env_map.get("DOCKER_HOST")
+                        if isinstance(dh, str) and dh.strip():
+                            return dh.strip()
+            except (OSError, plistlib.InvalidFileException, ValueError):
+                pass
+        return None
+    try:
+        load_proc = run(
+            ["systemctl", "--user", "show", "ezgha.service", "-p", "LoadState", "--value"],
+            capture_output=True, text=True, timeout=5, errors="replace",
+        )
+        if load_proc.returncode != 0 or load_proc.stdout.strip() != "loaded":
+            return None
+        env_proc = run(
+            ["systemctl", "--user", "show", "ezgha.service", "-p", "Environment", "--value"],
+            capture_output=True, text=True, timeout=5, errors="replace",
+        )
+        if env_proc.returncode != 0:
+            return None
+        for item in shlex.split(env_proc.stdout):
+            if item.startswith("DOCKER_HOST_OVERRIDE="):
+                val = item.split("=", 1)[1].strip()
+                if val:
+                    return val
+        return "unix:///var/run/docker.sock"
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return None
 
 
 def _probe_local_service_status(is_mac, run_fn=None):
@@ -1149,7 +1386,7 @@ def _collect_local_native_runners():
 
 
 def _probe_docker_host_core(*, is_mac=False, mac_disabled=False, cfg=None, service_status=None,
-                            hostname=None, run_fn=None, disk_usage_fn=None, loadavg_fn=None):
+                            hostname=None, run_fn=None, disk_usage_fn=None, loadavg_fn=None, plist_path=None):
     """Shared local/SSH Docker runner + disk-floor + load probe."""
     run = run_fn or subprocess.run
     disk_usage = disk_usage_fn or shutil.disk_usage
@@ -1157,6 +1394,13 @@ def _probe_docker_host_core(*, is_mac=False, mac_disabled=False, cfg=None, servi
     cfg = cfg if isinstance(cfg, dict) else _read_local_ezgha_config()
     if service_status is None:
         service_status = _probe_local_service_status(is_mac, run_fn=run)
+    daemon_docker_host = _resolve_daemon_docker_host(is_mac, run_fn=run, plist_path=plist_path)
+    docker_env = None
+    if daemon_docker_host:
+        docker_env = {k: v for k, v in os.environ.items() if k != "DOCKER_CONTEXT"}
+        docker_env["DOCKER_HOST"] = daemon_docker_host
+    slot_scope = cfg.get("scope") if isinstance(cfg.get("scope"), str) and cfg.get("scope").strip() else "unknown"
+    slot_labels = list(cfg.get("labels") or []) if isinstance(cfg.get("labels"), list) else []
     host_name = hostname or socket.gethostname()
 
     raw_floor = cfg.get("min_free_disk_gb")
@@ -1203,9 +1447,12 @@ def _probe_docker_host_core(*, is_mac=False, mac_disabled=False, cfg=None, servi
     ordered_names = []
     docker_ok = True
     try:
+        docker_kwargs = {"capture_output": True, "text": True, "timeout": 10, "errors": "replace"}
+        if docker_env is not None:
+            docker_kwargs["env"] = docker_env
         proc = run(
             ["docker", "ps", "-a", "--filter", "label=ezgha=managed", "--format", "{{.Names}}\t{{.Status}}"],
-            capture_output=True, text=True, timeout=10, errors="replace",
+            **docker_kwargs,
         )
         if proc.returncode == 0:
             for line in proc.stdout.splitlines():
@@ -1222,7 +1469,7 @@ def _probe_docker_host_core(*, is_mac=False, mac_disabled=False, cfg=None, servi
                     top = None
                     top_timed_out = False
                     try:
-                        top = run(["docker", "top", cname, "-eo", "pid,etimes,comm,args"], capture_output=True, text=True, timeout=10, errors="replace")
+                        top = run(["docker", "top", cname, "-eo", "pid,etimes,comm,args"], **docker_kwargs)
                     except subprocess.TimeoutExpired:
                         top_timed_out = True
                     except OSError:
@@ -1264,6 +1511,8 @@ def _probe_docker_host_core(*, is_mac=False, mac_disabled=False, cfg=None, servi
                     "elapsed_minutes": elapsed_min,
                     "active_child_commands": cmds,
                     "reason": reason,
+                    "scope": slot_scope,
+                    "labels": list(slot_labels),
                 }
         else:
             docker_ok = False
@@ -1294,6 +1543,8 @@ def _probe_docker_host_core(*, is_mac=False, mac_disabled=False, cfg=None, servi
                     "elapsed_minutes": None,
                     "active_child_commands": [],
                     "reason": miss_reason,
+                    "scope": slot_scope,
+                    "labels": list(slot_labels),
                 })
         for cname in ordered_names:
             if cname not in expected_names:
@@ -1326,6 +1577,8 @@ def _probe_docker_host_core(*, is_mac=False, mac_disabled=False, cfg=None, servi
         "admission_status": admission_status,
         "admission_message": admission_message,
         "configured_slots": configured_count,
+        "scope": slot_scope,
+        "labels": list(slot_labels),
         "slots": slots,
     }
 
@@ -1367,6 +1620,8 @@ def _collect_local_host_slots():
                     "load_average": probed["load_average"],
                     "configured_slots": probed["configured_slots"],
                     "configured_container_slots": probed["configured_slots"],
+                    "scope": probed["scope"],
+                    "labels": probed["labels"],
                     "container_slots": probed["slots"],
                     "native_runners": native_runners,
                 }
@@ -1383,6 +1638,8 @@ def _collect_local_host_slots():
                 "disk": probed["disk"],
                 "load_average": probed["load_average"],
                 "configured_slots": probed["configured_slots"],
+                "scope": probed["scope"],
+                "labels": probed["labels"],
                 "slots": probed["slots"],
             }
         },
@@ -1392,6 +1649,10 @@ def _collect_local_host_slots():
 def _collect_live_github_snapshot(repos=None):
     """Fallback bounded live GitHub query when no audit-dir is supplied."""
     target_repos, cap_note = _cap_live_repos(repos)
+    cache_key = json.dumps(target_repos)
+    shared = _shared_cache_read("github", cache_key, _LIVE_GITHUB_TTL_S)
+    if shared is not None and isinstance(shared.get("data"), dict):
+        return shared["data"]
     all_ip_jobs = []
     ip_runs_by_repo = {}
     ip_jobs_by_repo = {}
@@ -1400,6 +1661,8 @@ def _collect_live_github_snapshot(repos=None):
     total_ghosts = 0
     oldest_fresh_wait_min = None
     fresh_complete = True
+    job_details_complete = True
+    queued_jobs = []
     ip_failed_repos = set()
     ip_capped = bool(cap_note)
     q_failed_repos = set()
@@ -1450,6 +1713,7 @@ def _collect_live_github_snapshot(repos=None):
             q_probe = queue_probe.probe_repo(repo, max_job_checks=10)
             if not q_probe.get("ok"):
                 fresh_complete = False
+                job_details_complete = False
                 q_failed_repos.add(repo)
                 if q_probe.get("error"):
                     errors.append(f"{repo}: {q_probe['error']}")
@@ -1461,8 +1725,13 @@ def _collect_live_github_snapshot(repos=None):
                     sample_notes.append(
                         f"{short}: {q_probe['unverified_runs']} of {q_probe.get('queued_total')} queued run(s) unverified"
                     )
+                if isinstance(q_probe.get("queued_jobs"), list):
+                    queued_jobs.extend(q_probe["queued_jobs"])
+                if q_probe.get("job_details_complete") is False:
+                    job_details_complete = False
                 if q_probe.get("sample_capped") or q_probe.get("fresh") is None or q_probe.get("ghosts") is None:
                     fresh_complete = False
+                    job_details_complete = False
                     if q_probe.get("sample_capped"):
                         sample_notes.append(
                             f"{short}: sampled {q_probe['sampled_fresh']} fresh / {q_probe['sampled_ghosts']} ghosts of {q_probe['queued_total']} (>10 cap)"
@@ -1475,10 +1744,11 @@ def _collect_live_github_snapshot(repos=None):
                         oldest_fresh_wait_min = ow_val if oldest_fresh_wait_min is None else max(oldest_fresh_wait_min, ow_val)
         except Exception as exc:
             fresh_complete = False
+            job_details_complete = False
             q_failed_repos.add(repo)
             errors.append(f"{repo}: queue probe failed: {str(exc)[:120]}")
     q_partial = bool(q_failed_repos or q_unverified_runs > 0 or not fresh_complete)
-    return {
+    snap = {
         "captured_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "all_in_progress_jobs": all_ip_jobs,
         "errors": errors,
@@ -1495,12 +1765,16 @@ def _collect_live_github_snapshot(repos=None):
             "in_progress_jobs_by_repo": ip_jobs_by_repo,
             "total_queued_runs_by_repo": q_runs_by_repo,
             "queued_jobs_by_repo": {},
+            "queued_jobs": queued_jobs,
+            "job_details_complete": bool(job_details_complete and not q_partial),
             "fresh_queued_runs": total_fresh if fresh_complete else None,
             "inert_ghosts": total_ghosts if fresh_complete else None,
             "oldest_fresh_wait_minutes": oldest_fresh_wait_min if fresh_complete else None,
             "queued_sample_note": "; ".join(sample_notes) if sample_notes else None,
         },
     }
+    _shared_cache_write("github", cache_key, data=snap)
+    return snap
 
 
 def _cached_live_latency(repos):
@@ -1508,15 +1782,28 @@ def _cached_live_latency(repos):
     target = tuple(capped)
     now = time.monotonic()
     attempt_ts = _LIVE_LATENCY_CACHE.get("attempt_ts")
-    if (
-        _LIVE_LATENCY_CACHE["key"] == target
-        and attempt_ts is not None
-        and (now - attempt_ts) < _LIVE_LATENCY_TTL_S
-    ):
+    inproc_match = _LIVE_LATENCY_CACHE["key"] == target and attempt_ts is not None
+    if inproc_match and (now - attempt_ts) < _LIVE_LATENCY_TTL_S:
         if _LIVE_LATENCY_CACHE["data"] is not None:
             return _LIVE_LATENCY_CACHE["data"]
         if _LIVE_LATENCY_CACHE.get("error") is not None:
             return _LIVE_LATENCY_CACHE["error"]
+    shared_key = json.dumps(list(target))
+    min_newer = _LIVE_LATENCY_CACHE.get("wall_ts", 0.0) + 0.1 if inproc_match else 0.0
+    shared = _shared_cache_read("latency", shared_key, _LIVE_LATENCY_TTL_S, min_newer_than=min_newer)
+    if shared is not None:
+        s_data = shared.get("data")
+        s_err = shared.get("error")
+        if isinstance(s_data, dict) or isinstance(s_err, dict):
+            _LIVE_LATENCY_CACHE.update({
+                "key": target,
+                "ts": now,
+                "attempt_ts": now,
+                "wall_ts": shared.get("wall_ts") or time.time(),
+                "data": s_data if isinstance(s_data, dict) else None,
+                "error": s_err if isinstance(s_err, dict) else None,
+            })
+            return s_data if isinstance(s_data, dict) else s_err
     data = None
     err_payload = None
     try:
@@ -1534,10 +1821,12 @@ def _cached_live_latency(repos):
         }
     finally:
         done_ts = time.monotonic()
+        done_wall = _shared_cache_write("latency", shared_key, data=data, error=err_payload)
         _LIVE_LATENCY_CACHE.update({
             "key": target,
             "ts": done_ts,
             "attempt_ts": done_ts,
+            "wall_ts": done_wall,
             "data": data,
             "error": err_payload,
         })
@@ -1545,10 +1834,11 @@ def _cached_live_latency(repos):
 
 
 _REMOTE_PROBE_PY = "\n".join([
-    "import json, math, os, re, shutil, socket, subprocess",
+    "import json, math, os, plistlib, re, shlex, shutil, socket, subprocess",
     "from pathlib import Path",
     f"DEFAULT_MIN_FREE_DISK_GB = {DEFAULT_MIN_FREE_DISK_GB}",
     inspect.getsource(_read_local_ezgha_config),
+    inspect.getsource(_resolve_daemon_docker_host),
     inspect.getsource(_probe_local_service_status),
     inspect.getsource(_probe_docker_host_core),
     "print(json.dumps(_probe_docker_host_core(is_mac=False)))",
@@ -1922,6 +2212,9 @@ def create_server(*, host="127.0.0.1", port=8790, audit_dir=None, hosts_json=Non
             if cached is not None:
                 if (now - cache_state["attempt_ts"]) >= effective_ttl_s and cache_state["building"] is None:
                     _spawn_refresh_locked()
+                if cache_state["last_error"] is not None:
+                    err_text = f"{type(cache_state['last_error']).__name__}: {str(cache_state['last_error'])[:160]}"
+                    return {**cached, "last_refresh_error": err_text, "stale_refresh_error": err_text}
                 return cached
             if (
                 uses_live_github

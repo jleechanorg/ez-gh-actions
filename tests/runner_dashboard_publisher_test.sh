@@ -339,4 +339,30 @@ assert doc["queue"]["unverified_runs"] == 5, doc["queue"]
 assert len(doc["queue"]["repos"]) == 2, doc["queue"]
 PY
 
+BAD_NESTED_QUEUE="$WORK/bad_nested_queue_probe.sh"
+cat > "$BAD_NESTED_QUEUE" <<'SH'
+#!/usr/bin/env bash
+out=""
+while [[ $# -gt 0 ]]; do
+  if [[ "$1" == "--output" ]]; then out="$2"; shift 2; else shift; fi
+done
+printf '{"schema_version":1,"repos":[],"queue":{"repos":"invalid"}}\n' > "$out"
+exit 1
+SH
+chmod +x "$BAD_NESTED_QUEUE"
+EZGHA_DASHBOARD_QUEUE_PROBE=1 \
+EZGHA_DASHBOARD_QUEUE_PROBE_CMD="$BAD_NESTED_QUEUE" \
+EZGHA_DASHBOARD_LATENCY_PROBE=0 \
+EZGHA_DASHBOARD_CMUX_PROBE_CMD="" \
+EZGHA_DASHBOARD_PROBE_DIR="$PROBES" \
+EZGHA_DASHBOARD_ASSET_DIR="$ROOT/dashboard" \
+EZGHA_DASHBOARD_LOCK_DIR="$WORK/bad-nested-q.lock" \
+  /bin/bash "$PUBLISHER" --collect-only "$WORK/bad-nested-q-site"
+python3 - "$WORK/bad-nested-q-site/status.json" <<'PY'
+import json, sys
+doc = json.loads(open(sys.argv[1], encoding="utf-8").read())
+assert doc["sources"]["mac_host"]["ok"] is True
+assert doc["queue"]["ok"] is False, doc["queue"]
+PY
+
 echo "runner dashboard publisher tests passed"

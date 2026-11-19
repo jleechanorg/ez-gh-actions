@@ -3,6 +3,7 @@
 
 import importlib.util
 import json
+import os
 import sys
 import tempfile
 import threading
@@ -200,6 +201,18 @@ def fixture_audit_dir(tmp: Path):
 
 
 class FleetLiveDashboardTest(unittest.TestCase):
+    def setUp(self):
+        self._shared_cache_tmp = tempfile.TemporaryDirectory()
+        self._orig_shared_cache = os.environ.get("EZGHA_OPERATOR_SHARED_CACHE_PATH")
+        os.environ["EZGHA_OPERATOR_SHARED_CACHE_PATH"] = str(Path(self._shared_cache_tmp.name) / "shared_cache.json")
+
+    def tearDown(self):
+        if self._orig_shared_cache is None:
+            os.environ.pop("EZGHA_OPERATOR_SHARED_CACHE_PATH", None)
+        else:
+            os.environ["EZGHA_OPERATOR_SHARED_CACHE_PATH"] = self._orig_shared_cache
+        self._shared_cache_tmp.cleanup()
+
     def test_build_state_and_render_html_with_clickable_links(self):
         mod = load_module()
         with tempfile.TemporaryDirectory() as directory:
@@ -736,13 +749,13 @@ class FleetLiveDashboardTest(unittest.TestCase):
             fake_systemctl.chmod(0o755)
             probe_script = (
                 mod._REMOTE_PROBE_PY
-                .replace('pid,etimes,comm,args"], capture_output=True, text=True, timeout=10', 'pid,etimes,comm,args"], capture_output=True, text=True, timeout=0.5')
+                .replace('"timeout": 10', '"timeout": 0.5')
                 .replace(
                     "print(json.dumps(_probe_docker_host_core(is_mac=False)))",
                     "print(json.dumps(_probe_docker_host_core(is_mac=False, disk_usage_fn=lambda _p: type('U', (), {'total': 200*(1024**3), 'used': 120*(1024**3), 'free': 80*(1024**3)})(), loadavg_fn=lambda: (1.0, 1.0, 1.0))))",
                 )
             )
-            self.assertIn("timeout=0.5", probe_script)
+            self.assertIn('"timeout": 0.5', probe_script)
             env = dict(os.environ, HOME=str(tmp), PATH=f"{bin_dir}:{os.environ.get('PATH', '')}")
             proc = subprocess.run(
                 ["python3", "-c", probe_script],
@@ -790,7 +803,7 @@ class FleetLiveDashboardTest(unittest.TestCase):
 
             with mock.patch.object(mod.ci_latency_probe, "gh_json", side_effect=fake_gh), \
                  mock.patch.object(mod.queue_probe, "gh_json", side_effect=fake_gh):
-                gh_snap = mod._collect_live_github_snapshot(repos=["org/repo"])
+                gh_snap = mod._collect_live_github_snapshot(repos=[f"org/repo-q-{reported_total}"])
             self.assertTrue(gh_snap["summary"]["q_partial"])
             self.assertEqual(gh_snap["summary"]["q_unverified_runs"], expected_unverified)
             self.assertIsNone(gh_snap["summary"]["fresh_queued_runs"])
@@ -811,7 +824,7 @@ class FleetLiveDashboardTest(unittest.TestCase):
 
         with mock.patch.object(mod.ci_latency_probe, "gh_json", side_effect=fake_ip_short_runs), \
              mock.patch.object(mod.queue_probe, "gh_json", side_effect=fake_ip_short_runs):
-            gh_ip_runs = mod._collect_live_github_snapshot(repos=["org/repo"])
+            gh_ip_runs = mod._collect_live_github_snapshot(repos=["org/repo-ip-runs"])
         self.assertTrue(gh_ip_runs["summary"]["ip_partial"])
         self.assertEqual(mod._normalize_reconciliation([], {}, gh_ip_runs)["active_runs_partial"], True)
         self.assertTrue(any("1 of 8 returned" in e for e in gh_ip_runs["errors"]))
@@ -830,7 +843,7 @@ class FleetLiveDashboardTest(unittest.TestCase):
 
         with mock.patch.object(mod.ci_latency_probe, "gh_json", side_effect=fake_ip_short_jobs), \
              mock.patch.object(mod.queue_probe, "gh_json", side_effect=fake_ip_short_jobs):
-            gh_ip_jobs = mod._collect_live_github_snapshot(repos=["org/repo"])
+            gh_ip_jobs = mod._collect_live_github_snapshot(repos=["org/repo-ip-jobs"])
         self.assertTrue(gh_ip_jobs["summary"]["ip_partial"])
         self.assertEqual(mod._normalize_reconciliation([], {}, gh_ip_jobs)["active_runs_partial"], True)
         self.assertTrue(any("1 of 120 returned" in e for e in gh_ip_jobs["errors"]))
@@ -1652,6 +1665,8 @@ class FleetLiveDashboardTest(unittest.TestCase):
                 "hosts": {
                     "jeff-ubuntu": {
                         "configured_slots": 1,
+                        "scope": "org",
+                        "labels": ["self-hosted", "linux", "x64"],
                         "slots": [{"slot": 1, "name": "ez-runner-c-1", "state": "IDLE"}],
                     },
                     "mac": {
@@ -1698,12 +1713,19 @@ class FleetLiveDashboardTest(unittest.TestCase):
             self.assertEqual(live_natives[2]["kind"], "native")
             self.assertEqual(live_natives[2]["scope"], "repo:org/bom-repo")
 
+            old_job = {"repo": "org/app", "age_minutes": 6.0, "labels": ["self-hosted", "linux"]}
+            young_job = {"repo": "org/app", "age_minutes": 4.9, "labels": ["self-hosted", "linux"]}
+            incompatible_os_job = {"repo": "org/app", "age_minutes": 15.0, "labels": ["ubuntu-latest"]}
+            incompatible_label_job = {"repo": "org/app", "age_minutes": 15.0, "labels": ["self-hosted", "gpu"]}
             for gh_summary, expect_starved in (
-                ({"fresh_queued_runs": 0, "inert_ghosts": 2, "oldest_fresh_wait_minutes": 10, "q_partial": False, "q_unverified_runs": 0}, False),
-                ({"fresh_queued_runs": 2, "inert_ghosts": 0, "oldest_fresh_wait_minutes": 4.9, "q_partial": False, "q_unverified_runs": 0}, False),
-                ({"fresh_queued_runs": 2, "inert_ghosts": 0, "oldest_fresh_wait_minutes": 6.0, "q_partial": True, "q_unverified_runs": 0}, False),
-                ({"fresh_queued_runs": 2, "inert_ghosts": 0, "oldest_fresh_wait_minutes": 6.0, "q_partial": False, "q_unverified_runs": 1}, False),
-                ({"fresh_queued_runs": 2, "inert_ghosts": 0, "oldest_fresh_wait_minutes": 5.0, "q_partial": False, "q_unverified_runs": 0}, True),
+                ({"fresh_queued_runs": 0, "inert_ghosts": 2, "oldest_fresh_wait_minutes": 10, "q_partial": False, "q_unverified_runs": 0, "queued_jobs": []}, False),
+                ({"fresh_queued_runs": 2, "inert_ghosts": 0, "oldest_fresh_wait_minutes": 33.4, "q_partial": False, "q_unverified_runs": 0, "queued_jobs": []}, False),
+                ({"fresh_queued_runs": 2, "inert_ghosts": 0, "oldest_fresh_wait_minutes": 33.4, "q_partial": False, "q_unverified_runs": 0, "queued_jobs": [young_job]}, False),
+                ({"fresh_queued_runs": 2, "inert_ghosts": 0, "oldest_fresh_wait_minutes": 15.0, "q_partial": False, "q_unverified_runs": 0, "queued_jobs": [incompatible_os_job]}, False),
+                ({"fresh_queued_runs": 2, "inert_ghosts": 0, "oldest_fresh_wait_minutes": 15.0, "q_partial": False, "q_unverified_runs": 0, "queued_jobs": [incompatible_label_job]}, False),
+                ({"fresh_queued_runs": 2, "inert_ghosts": 0, "oldest_fresh_wait_minutes": 6.0, "q_partial": True, "q_unverified_runs": 0, "queued_jobs": [old_job]}, False),
+                ({"fresh_queued_runs": 2, "inert_ghosts": 0, "oldest_fresh_wait_minutes": 6.0, "q_partial": False, "q_unverified_runs": 1, "queued_jobs": [old_job]}, False),
+                ({"fresh_queued_runs": 2, "inert_ghosts": 0, "oldest_fresh_wait_minutes": 5.0, "q_partial": False, "q_unverified_runs": 0, "queued_jobs": [old_job]}, True),
             ):
                 gh_f = tmp / "gh.json"
                 gh_f.write_text(json.dumps({"summary": gh_summary}), encoding="utf-8")
@@ -1728,23 +1750,51 @@ class FleetLiveDashboardTest(unittest.TestCase):
                     self.assertEqual(st["reconciliation"]["state_counts"]["IDLE-STARVED"], 0)
                     self.assertFalse(st["reconciliation"]["idle_starved"])
 
+            # Repo-scoped managed slot stays IDLE on queued jobs for another repo, and missing scope/labels stays IDLE
+            scoped_hosts = {
+                "hosts": {
+                    "scoped-host": {
+                        "configured_slots": 2,
+                        "slots": [
+                            {"slot": 1, "name": "scoped-1", "state": "IDLE", "scope": "repo:org/allowed", "labels": ["self-hosted", "linux"]},
+                            {"slot": 2, "name": "unscoped-2", "state": "IDLE", "labels": ["self-hosted", "linux"]},
+                        ],
+                    }
+                }
+            }
+            norm_scoped = mod._normalize_hosts(scoped_hosts, {"vms": []}, {"all_in_progress_jobs": []})
+            rec_scoped = mod._normalize_reconciliation(
+                norm_scoped,
+                {"vms": []},
+                {"summary": {"q_partial": False, "q_unverified_runs": 0, "queued_jobs": [{"repo": "org/other", "age_minutes": 12.0, "labels": ["self-hosted", "linux"]}]}},
+            )
+            self.assertEqual(rec_scoped["state_counts"]["IDLE-STARVED"], 0)
+            self.assertEqual([s["state"] for s in norm_scoped[0]["slots"]], ["IDLE", "IDLE"])
+
             # Live native runner with unknown/omitted scope must NEVER become IDLE-STARVED when normalized
             hosts_live_native = {"hosts": {"mac": {"parked": True, "configured_container_slots": 0, "container_slots": [], "native_runners": live_natives}}}
             norm_hosts_live = mod._normalize_hosts(hosts_live_native, {"vms": []}, {"all_in_progress_jobs": []})
             rec_live = mod._normalize_reconciliation(
                 norm_hosts_live,
                 {"vms": []},
-                {"summary": {"fresh_queued_runs": 3, "inert_ghosts": 0, "oldest_fresh_wait_minutes": 10.0, "q_partial": False, "q_unverified_runs": 0}},
+                {"summary": {"fresh_queued_runs": 3, "inert_ghosts": 0, "oldest_fresh_wait_minutes": 10.0, "q_partial": False, "q_unverified_runs": 0, "queued_jobs": [old_job]}},
             )
             self.assertEqual(rec_live["state_counts"]["IDLE-STARVED"], 0)
             self.assertEqual([s["state"] for s in norm_hosts_live[0]["slots"]], ["IDLE", "IDLE", "IDLE"])
 
-            # _read_local_ezgha_config parses TOML underscore ints (e.g. 3_0) via tomllib
+            # _read_local_ezgha_config parses TOML underscore ints (e.g. 3_0), scope, and labels via tomllib
             toml_cfg = tmp / "ezgha_underscore.toml"
-            toml_cfg.write_text('[runner]\ncount = 2_0\nname_prefix = "ez-runner-c"\n[limits]\nmin_free_disk_gb = 3_0\n', encoding="utf-8")
+            toml_cfg.write_text(
+                '[github]\nscope = "org"\ntarget = "jleechanorg"\n'
+                '[runner]\ncount = 2_0\nname_prefix = "ez-runner-c"\nlabels = ["self-hosted", "Linux", "X64"]\n'
+                '[limits]\nmin_free_disk_gb = 3_0\n',
+                encoding="utf-8",
+            )
             parsed_cfg = mod._read_local_ezgha_config(toml_cfg)
             self.assertEqual(parsed_cfg["count"], 20)
             self.assertEqual(parsed_cfg["min_free_disk_gb"], 30)
+            self.assertEqual(parsed_cfg["scope"], "org")
+            self.assertEqual(parsed_cfg["labels"], ["self-hosted", "linux", "x64"])
 
             # Live-mode refresh failures respect cache_ttl_s cooldown without hammering GitHub
             import urllib.error
@@ -1848,7 +1898,8 @@ class FleetLiveDashboardTest(unittest.TestCase):
             (huge_dir / "cmux_and_github_reconciliation.json").write_text(json.dumps(huge_cmux), encoding="utf-8")
             huge_state = mod.build_operator_state(audit_dir=huge_dir)
             self.assertTrue(huge_state["reconciliation"]["queue_partial"])
-            self.assertIn("numeric value out of range", " ".join(huge_state["reconciliation"]["fixture_errors"]))
+            self.assertIn("cmux.vm.memory_mb: numeric value out of range", " ".join(huge_state["reconciliation"]["fixture_errors"]))
+            self.assertIn("oldest_fresh_wait_minutes: numeric value out of range", " ".join(huge_state["reconciliation"]["fixture_errors"]))
             huge_explicit = mod.build_operator_state(
                 hosts_json=huge_dir / "ubuntu_mac_slots.json",
                 cmux_json=huge_dir / "cmux_and_github_reconciliation.json",
@@ -1856,7 +1907,13 @@ class FleetLiveDashboardTest(unittest.TestCase):
                 latency_json=huge_dir / "ci_latency_percentiles.json",
             )
             self.assertTrue(huge_explicit["reconciliation"]["queue_partial"])
-            self.assertIn("numeric value out of range", " ".join(huge_explicit["reconciliation"]["fixture_errors"]))
+            self.assertIn("cmux.vm.memory_mb: numeric value out of range", " ".join(huge_explicit["reconciliation"]["fixture_errors"]))
+            self.assertIn("oldest_fresh_wait_minutes: numeric value out of range", " ".join(huge_explicit["reconciliation"]["fixture_errors"]))
+
+            # Huge/negative elapsed_minutes in slot fails closed cleanly instead of rendering Infinitym
+            self.assertIsNone(
+                mod._safe_enrich_slot({"name": "s1", "state": "EXECUTING", "elapsed_minutes": 10**309}, {}, {}, label="slot-elapsed", errors=[])
+            )
 
             # Cold _cached_live_latency failure enforces 300s cooldown without re-probing
             lat_calls = {"n": 0}
@@ -1866,7 +1923,7 @@ class FleetLiveDashboardTest(unittest.TestCase):
                 lat_calls["n"] += 1
                 raise json.JSONDecodeError("bad gh output", "{", 1)
 
-            mod._LIVE_LATENCY_CACHE.update({"key": None, "ts": 0.0, "attempt_ts": None, "data": None, "error": None})
+            mod._LIVE_LATENCY_CACHE.update({"key": None, "ts": 0.0, "attempt_ts": None, "wall_ts": 0.0, "data": None, "error": None})
             with mock.patch.object(mod.ci_latency_probe, "probe_latency", side_effect=bad_json_probe), \
                  mock.patch.object(mod.time, "monotonic", side_effect=lambda: clock["now"]):
                 r1 = mod._cached_live_latency(["org/repo"])
@@ -1880,6 +1937,121 @@ class FleetLiveDashboardTest(unittest.TestCase):
                 r3 = mod._cached_live_latency(["org/repo"])
                 self.assertFalse(r3["ok"])
                 self.assertEqual(lat_calls["n"], 2)
+
+            # Daemon Docker endpoint resolution overrides conflicting shell DOCKER_HOST / DOCKER_CONTEXT
+            import plistlib
+            mac_plist = tmp / "org.jleechanorg.ezgha.plist"
+            mac_plist.write_bytes(plistlib.dumps({"EnvironmentVariables": {"DOCKER_HOST": "unix:///daemon/mac.sock"}}))
+            seen_envs = []
+
+            def fake_daemon_docker(cmd, **kwargs):
+                if cmd[:2] == ["docker", "ps"]:
+                    seen_envs.append(("mac_ps", dict(kwargs.get("env") or {})))
+                    return SimpleNamespace(returncode=0, stdout="ez-mac-runner-h-1\tUp 4 minutes\n", stderr="")
+                if cmd[:2] == ["docker", "top"]:
+                    seen_envs.append(("mac_top", dict(kwargs.get("env") or {})))
+                    return SimpleNamespace(returncode=0, stdout="PID ELAPSED COMMAND ARGS\n101 120 Runner.Worker Runner.Worker\n", stderr="")
+                if cmd[:3] == ["systemctl", "--user", "show"]:
+                    if "LoadState" in cmd:
+                        return SimpleNamespace(returncode=0, stdout="loaded\n", stderr="")
+                    return SimpleNamespace(returncode=0, stdout="DOCKER_HOST_OVERRIDE=unix:///daemon/linux.sock FOO=bar\n", stderr="")
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            with mock.patch.dict(os.environ, {"DOCKER_HOST": "unix:///wrong/shell.sock", "DOCKER_CONTEXT": "wrong-ctx"}):
+                mac_probed = mod._probe_docker_host_core(
+                    is_mac=True, cfg={"count": 1, "name_prefix": "ez-mac-runner-h", "min_free_disk_gb": 10, "scope": "org", "labels": ["macos"]},
+                    service_status="active", run_fn=fake_daemon_docker, plist_path=mac_plist,
+                    disk_usage_fn=lambda _: SimpleNamespace(free=50 * 1024**3, used=10 * 1024**3, total=60 * 1024**3),
+                    loadavg_fn=lambda: (1.0, 1.0, 1.0),
+                )
+                self.assertEqual(mac_probed["slots"][0]["state"], "EXECUTING")
+                self.assertEqual(seen_envs[0][1].get("DOCKER_HOST"), "unix:///daemon/mac.sock")
+                self.assertNotIn("DOCKER_CONTEXT", seen_envs[0][1])
+
+                seen_linux_envs = []
+                def fake_linux_docker(cmd, **kwargs):
+                    if cmd[:2] in (["docker", "ps"], ["docker", "top"]):
+                        seen_linux_envs.append(dict(kwargs.get("env") or {}))
+                    return fake_daemon_docker(cmd, **kwargs)
+
+                lin_probed = mod._probe_docker_host_core(
+                    is_mac=False, cfg={"count": 1, "name_prefix": "ez-mac-runner-h", "min_free_disk_gb": 10, "scope": "org", "labels": ["linux"]},
+                    service_status="active", run_fn=fake_linux_docker,
+                    disk_usage_fn=lambda _: SimpleNamespace(free=50 * 1024**3, used=10 * 1024**3, total=60 * 1024**3),
+                    loadavg_fn=lambda: (1.0, 1.0, 1.0),
+                )
+                self.assertEqual(lin_probed["slots"][0]["state"], "EXECUTING")
+                self.assertEqual(seen_linux_envs[0].get("DOCKER_HOST"), "unix:///daemon/linux.sock")
+                self.assertNotIn("DOCKER_CONTEXT", seen_linux_envs[0])
+
+            # Concurrent two-server shared live cache enforces single token probe across servers
+            gh_shared_calls = {"n": 0}
+            lat_shared_calls = {"n": 0}
+            def fake_shared_gh(args, timeout=20):
+                gh_shared_calls["n"] += 1
+                joined = " ".join(args)
+                if "status=in_progress" in joined:
+                    return {"total_count": 0, "workflow_runs": []}
+                if "status=queued" in joined:
+                    return {"total_count": 0, "workflow_runs": []}
+                return 0
+
+            def fake_shared_lat(repos, limit=15, job_run_limit=8):
+                lat_shared_calls["n"] += 1
+                return {"ok": True, "overall": {}, "workflows": []}
+
+            mod._LIVE_LATENCY_CACHE.update({"key": None, "ts": 0.0, "attempt_ts": None, "wall_ts": 0.0, "data": None, "error": None})
+            with mock.patch.object(mod, "_collect_local_host_slots", return_value={"generated_at_utc": "2026-11-18T10:00:00Z", "hosts": {"local": {"slots": []}}}), \
+                 mock.patch.object(mod.ci_latency_probe, "gh_json", side_effect=fake_shared_gh), \
+                 mock.patch.object(mod.queue_probe, "gh_json", side_effect=fake_shared_gh), \
+                 mock.patch.object(mod.ci_latency_probe, "probe_latency", side_effect=fake_shared_lat):
+                srv1 = mod.create_server(port=0, repos=["org/shared-a"])
+                srv2 = mod.create_server(port=0, repos=["org/shared-a"])
+                t1 = threading.Thread(target=srv1.serve_forever, daemon=True)
+                t2 = threading.Thread(target=srv2.serve_forever, daemon=True)
+                t1.start(); t2.start()
+                try:
+                    p1, p2 = srv1.server_address[1], srv2.server_address[1]
+                    b1 = json.loads(urllib.request.urlopen(f"http://127.0.0.1:{p1}/api/state", timeout=5).read().decode("utf-8"))
+                    calls_after_srv1 = gh_shared_calls["n"]
+                    mod._LIVE_LATENCY_CACHE.update({"key": None, "ts": 0.0, "attempt_ts": None, "wall_ts": 0.0, "data": None, "error": None})
+                    b2 = json.loads(urllib.request.urlopen(f"http://127.0.0.1:{p2}/api/state", timeout=5).read().decode("utf-8"))
+                    self.assertEqual(b1["source_mode"], "LIVE PROBE")
+                    self.assertEqual(b2["source_mode"], "LIVE PROBE")
+                    self.assertEqual(calls_after_srv1, 3)
+                    self.assertEqual(gh_shared_calls["n"], calls_after_srv1)
+                    self.assertEqual(lat_shared_calls["n"], 1)
+                finally:
+                    srv1.shutdown(); srv1.server_close()
+                    srv2.shutdown(); srv2.server_close()
+
+            # Warm refresh failure sets last_refresh_error / stale_refresh_error on /api/state instead of hiding failure
+            warm_calls = {"n": 0}
+            orig_build_operator_state = mod.build_operator_state
+            def warm_then_fail(**kwargs):
+                warm_calls["n"] += 1
+                if warm_calls["n"] == 1:
+                    return orig_build_operator_state(audit_dir=huge_dir)
+                raise RuntimeError("warm refresh boom")
+
+            with mock.patch.object(mod, "build_operator_state", side_effect=warm_then_fail):
+                srv_w = mod.create_server(port=0, repos=["org/warm"], cache_ttl_s=0.05)
+                t_w = threading.Thread(target=srv_w.serve_forever, daemon=True)
+                t_w.start()
+                try:
+                    pw = srv_w.server_address[1]
+                    ok_st = json.loads(urllib.request.urlopen(f"http://127.0.0.1:{pw}/api/state", timeout=5).read().decode("utf-8"))
+                    self.assertNotIn("last_refresh_error", ok_st)
+                    self.assertNotIn("stale_refresh_error", ok_st)
+                    import time as py_time
+                    py_time.sleep(0.08)
+                    urllib.request.urlopen(f"http://127.0.0.1:{pw}/api/state", timeout=5).read()
+                    py_time.sleep(0.08)
+                    stale_st = json.loads(urllib.request.urlopen(f"http://127.0.0.1:{pw}/api/state", timeout=5).read().decode("utf-8"))
+                    self.assertIn("warm refresh boom", stale_st.get("last_refresh_error", ""))
+                    self.assertIn("warm refresh boom", stale_st.get("stale_refresh_error", ""))
+                finally:
+                    srv_w.shutdown(); srv_w.server_close()
 
 
 if __name__ == "__main__":
