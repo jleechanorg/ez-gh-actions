@@ -979,3 +979,67 @@ grep -q '"status":"BLIND"' "$TMP/gcloud-corrupt.log" || fail "corrupt STATE_FILE
 grep -q '"mode":"corrupt_state_file_reset"' "$TMP/gcloud-corrupt.log" || fail "corrupt STATE_FILE must emit mode=corrupt_state_file_reset"
 jq -e 'type == "object" and .api_failures == 0' "$TMP/state-corrupt.json" >/dev/null || fail "corrupt STATE_FILE must be reset to valid JSON and recover on healthy billing"
 pass "midnight-crossing jobs clip accurately across UTC days and corrupt STATE_FILE resets with WARNING BLIND"
+
+# 21. Zero-byte & multi-object STATE_FILE recovery: folds BLIND into simultaneous COST_SPIKE or emits WARNING BLIND alone,
+#     top_net_repo ranks by netAmount, and short midnight-straddling jobs cap total minutes at ceil(dur/60).
+: > "$TMP/state-empty-spike.json"
+BILLING_FIXTURE="$TMP/billing-nobin-err.json" \
+  run_alert "$TMP/state-empty-spike.json" "$TMP/gcloud-empty-spike.log" "$TMP/gh-empty-spike.log" >/dev/null 2>"$TMP/empty-spike.err"
+[ "$(error_count "$TMP/gcloud-empty-spike.log")" = 1 ] || fail "0-byte STATE_FILE + COST_SPIKE must emit exactly 1 ERROR log"
+! grep -q '"status":"BLIND"' "$TMP/gcloud-empty-spike.log" || fail "0-byte STATE_FILE + COST_SPIKE must fold BLIND into ERROR rather than emitting separate WARNING BLIND"
+grep -q '; ALSO BLIND' "$TMP/gcloud-empty-spike.log" || fail "0-byte STATE_FILE + COST_SPIKE must include '; ALSO BLIND'"
+grep -q 'corrupt_state_file_reset' "$TMP/gcloud-empty-spike.log" || fail "0-byte STATE_FILE + COST_SPIKE must cite corrupt_state_file_reset"
+jq -e 'type == "object" and .api_failures == 0 and (.last_blind > 0) and (.sent["2026-11-18:COST_SPIKE"] > 0)' "$TMP/state-empty-spike.json" >/dev/null || \
+  fail "0-byte STATE_FILE + COST_SPIKE must recover valid JSON state and record .sent + .last_blind"
+
+: > "$TMP/state-empty-ok.json"
+BILLING_FIXTURE="$TMP/billing-corrupt-ok.json" \
+  run_alert "$TMP/state-empty-ok.json" "$TMP/gcloud-empty-ok.log" "$TMP/gh-empty-ok.log" >/dev/null 2>"$TMP/empty-ok.err"
+grep -q 'severity=WARNING' "$TMP/gcloud-empty-ok.log" || fail "0-byte STATE_FILE with \$0 spend must emit WARNING"
+grep -q '"status":"BLIND"' "$TMP/gcloud-empty-ok.log" || fail "0-byte STATE_FILE with \$0 spend must emit status=BLIND"
+grep -q '"mode":"corrupt_state_file_reset"' "$TMP/gcloud-empty-ok.log" || fail "0-byte STATE_FILE with \$0 spend must emit mode=corrupt_state_file_reset"
+jq -e 'type == "object" and .api_failures == 0 and (.last_blind > 0)' "$TMP/state-empty-ok.json" >/dev/null || \
+  fail "0-byte STATE_FILE with \$0 spend must recover valid JSON state"
+
+printf '{}{}\n' > "$TMP/state-multiobj.json"
+BILLING_FIXTURE="$TMP/billing-corrupt-ok.json" \
+  run_alert "$TMP/state-multiobj.json" "$TMP/gcloud-multiobj.log" "$TMP/gh-multiobj.log" >/dev/null 2>"$TMP/multiobj.err"
+grep -q '"mode":"corrupt_state_file_reset"' "$TMP/gcloud-multiobj.log" || fail "multi-object STATE_FILE must trigger corrupt_state_file_reset"
+jq -e 'type == "object" and .api_failures == 0' "$TMP/state-multiobj.json" >/dev/null || fail "multi-object STATE_FILE must recover to single JSON object"
+
+cat > "$TMP/billing-net-rank.json" <<'JSON'
+{
+  "usageItems": [
+    {"date":"2026-11-18T00:15:00Z","product":"actions","sku":"Actions macOS 3-core","quantity":20.0,"unitType":"Minutes","pricePerUnit":0.062,"grossAmount":20.00,"discountAmount":20.00,"netAmount":0.0,"organizationName":"jleechanorg","repositoryName":"free-heavy"},
+    {"date":"2026-11-18T01:15:00Z","product":"actions","sku":"Actions macOS 3-core","quantity":20.0,"unitType":"Minutes","pricePerUnit":0.062,"grossAmount":12.00,"discountAmount":0.0,"netAmount":12.00,"organizationName":"jleechanorg","repositoryName":"paid-culprit"}
+  ]
+}
+JSON
+BILLING_FIXTURE="$TMP/billing-net-rank.json" \
+  run_alert "$TMP/state-net-rank.json" "$TMP/gcloud-net-rank.log" "$TMP/gh-net-rank.log" >/dev/null
+grep -q 'top repo free-heavy' "$TMP/gcloud-net-rank.log" || fail "COST_SPIKE must name highest-gross repo free-heavy"
+grep -q 'top repo paid-culprit (\$12.00 net, \$12.00 gross)' "$TMP/gcloud-net-rank.log" || fail "NET_SPEND_BREACH must rank top_net_repo by netAmount (paid-culprit)"
+
+cat > "$TMP/runs-short-midnight.json" <<'JSON'
+{
+  "workflow_runs": [
+    {"id":9403,"status":"completed","conclusion":"success","created_at":"2026-11-17T12:00:00Z","updated_at":"2026-11-18T13:00:00Z"}
+  ]
+}
+JSON
+cat > "$TMP/jobs/9403.json" <<'JSON'
+{
+  "total_count": 3,
+  "jobs": [
+    {"id":43,"labels":["macos-15"],"started_at":"2026-11-17T12:00:00Z","completed_at":"2026-11-17T12:59:00Z"},
+    {"id":44,"labels":["macos-15"],"started_at":"2026-11-17T23:59:50Z","completed_at":"2026-11-18T00:00:10Z"},
+    {"id":45,"labels":["macos-15"],"started_at":"2026-11-18T12:00:00Z","completed_at":"2026-11-18T12:59:00Z"}
+  ]
+}
+JSON
+short_mid_out="$(
+  BILLING_STUB_FAIL=1 REPOS_FIXTURE="$TMP/repos.json" RUNS_FIXTURE="$TMP/runs-short-midnight.json" JOBS_FIXTURE_DIR="$TMP/jobs" \
+  run_alert "$TMP/state-short-mid.json" "$TMP/gcloud-short-mid.log" "$TMP/gh-short-mid.log"
+)"
+grep -q 'alerts_emitted=1' <<<"$short_mid_out" || fail "20s midnight-straddling job must allocate 1 total min across days (total 119m => only 1 day reaches 60m, got: $short_mid_out)"
+pass "zero-byte/multi-object state recovery, netAmount top-repo ranking, and midnight split minute cap hold"

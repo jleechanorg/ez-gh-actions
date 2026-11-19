@@ -7,7 +7,7 @@
 #   GitHub's org billing budget tracks only NET billed spend (~$0 when public
 #   repos receive a 100% discount) and ignores free-tier gross usage spikes
 #   such as Nov 17's 2,389 hosted macOS minutes ($148.12 gross).
-# Authority: operator ask (2026-11-18: "fix this we accidentally using gh macOS actions instead of running it on thi machine ... also wes hould have gh actions cost alerts they seemed to not be firing") and AGENTS.md § "GitHub Actions cost & hosted-macOS alert".
+# Authority: operator ask (2026-11-18: "fix this we accidentally using gh macOS actions instead of running it on thi machine ... also wes hould have gh actions cost alerts they seemed to not be firing"), origin/main:AGENTS.md:211-239 (Slack-only ezgha-runner-alerts isolation & $HOME/.local/state/ezgha state), and origin/main:AGENTS.md:241-250 (Safety & Monitoring Principles).
 #
 # Blast radius:
 #   - Normal peak (primary billing API): StartInterval=3600 (24 runs/day) -> at
@@ -38,7 +38,7 @@
 #   gh-actions-cost-alert.sh [--dry-run] [--ensure-gcp-policy] [--test-alert]
 set -euo pipefail
 
-# Authority: defensive operational bounds (MAX_APP_API_CALLS=60, MIN_RATE_LIMIT_REMAINING=50, COOLDOWN_SEC=21600, STATE_LOCK_TIMEOUT_SEC=30, MAX_API_FAILURES=3) per AGENTS.md § "Safety & Monitoring Principles" (self-outage prevention & blast-radius caps; unrequested defaults disclosed in PR #238).
+# Authority: defensive operational bounds (MAX_APP_API_CALLS=60, MIN_RATE_LIMIT_REMAINING=50, COOLDOWN_SEC=21600, STATE_LOCK_TIMEOUT_SEC=30, MAX_API_FAILURES=3) per operator ask (2026-11-18, #L10) and origin/main:AGENTS.md:246-247,257-258 (self-outage prevention & blast-radius caps; unrequested defaults disclosed in PR #238).
 ALERT_ORG="${ALERT_ORG:-jleechanorg}"
 DAILY_GROSS_WARN_USD="${DAILY_GROSS_WARN_USD:-25}"
 DAILY_MACOS_MIN_WARN="${DAILY_MACOS_MIN_WARN:-60}"
@@ -355,6 +355,8 @@ PY
   return 0
 }
 
+STATE_CORRUPT_RESET=0
+
 if [ "$DRY_RUN" -eq 1 ]; then
   if [ -r "$STATE_FILE" ]; then
     cp "$STATE_FILE" "$tmp.snapshot"
@@ -364,8 +366,8 @@ if [ "$DRY_RUN" -eq 1 ]; then
   STATE_FILE="$tmp.snapshot"
   STATE_STAGE_TMP="${STATE_FILE}.tmp.$$"
   STATE_NEXT_TMP="${STATE_FILE}.next.$$"
-  if ! jq -e 'if type != "object" then error("state must be JSON object") else . end' "$STATE_FILE" >/dev/null 2>&1; then
-    echo "[$NOW_ISO] WARN: corrupt state snapshot; resetting for dry-run" >&2
+  if [ ! -s "$STATE_FILE" ] || ! jq -se 'length == 1 and (.[0] | type == "object")' "$STATE_FILE" >/dev/null 2>&1; then
+    echo "[$NOW_ISO] WARN: corrupt or empty state snapshot; resetting for dry-run" >&2
     printf '%s\n' '{"sent":{},"last_sent":0,"api_failures":3,"last_blind":0}' > "$STATE_STAGE_TMP"
     mv -f "$STATE_STAGE_TMP" "$STATE_FILE"
   fi
@@ -382,16 +384,18 @@ else
     printf '%s\n' '{"sent":{},"last_sent":0,"api_failures":0,"last_blind":0}' > "$STATE_STAGE_TMP"
     mv -f "$STATE_STAGE_TMP" "$STATE_FILE"
   fi
-  if ! jq --argjson cutoff "$((NOW - 3024000))" \
-    'if type != "object" then error("state must be JSON object") else . end | .sent = ((.sent // {}) | with_entries(select(.value > $cutoff))) | .last_sent = (.last_sent // 0) | .api_failures = (.api_failures // 0) | .last_blind = (.last_blind // 0)' \
-    "$STATE_FILE" > "$STATE_NEXT_TMP" 2>"$tmp.err"; then
+  if [ ! -s "$STATE_FILE" ] || \
+     ! jq -se 'length == 1 and (.[0] | type == "object")' "$STATE_FILE" >/dev/null 2>&1 || \
+     ! jq --argjson cutoff "$((NOW - 3024000))" \
+       'if type != "object" then error("state must be JSON object") else . end | .sent = ((.sent // {}) | with_entries(select(.value > $cutoff))) | .last_sent = (.last_sent // 0) | .api_failures = (.api_failures // 0) | .last_blind = (.last_blind // 0)' \
+       "$STATE_FILE" > "$STATE_NEXT_TMP" 2>"$tmp.err" || \
+     [ ! -s "$STATE_NEXT_TMP" ] || \
+     ! jq -se 'length == 1 and (.[0] | type == "object")' "$STATE_NEXT_TMP" >/dev/null 2>&1; then
     rm -f "$STATE_NEXT_TMP"
-    echo "[$NOW_ISO] WARN: corrupt STATE_FILE '$STATE_FILE'; resetting and emitting WARNING BLIND (corrupt_state_file_reset)" >&2
+    echo "[$NOW_ISO] WARN: corrupt or empty STATE_FILE '$STATE_FILE'; resetting and scheduling BLIND (corrupt_state_file_reset)" >&2
     printf '%s\n' '{"sent":{},"last_sent":0,"api_failures":3,"last_blind":0}' > "$STATE_STAGE_TMP"
     mv -f "$STATE_STAGE_TMP" "$STATE_FILE"
-    emit WARNING BLIND "$TODAY_UTC" \
-      "CORRUPT_STATE_FILE: reset corrupt state file $STATE_FILE for $ALERT_ORG; monitoring continues" \
-      0 null 0 "" "corrupt_state_file_reset" null null || true
+    STATE_CORRUPT_RESET=1
   else
     mv -f "$STATE_NEXT_TMP" "$STATE_FILE"
   fi
@@ -433,7 +437,7 @@ FALLBACK_INCOMPLETE=0
 FALLBACK_CAP_HIT=0
 FALLBACK_MODE="app_token_fallback"
 
-# Authority: defensive gross-only fallback (bounded by MAX_APP_API_CALLS=60) per AGENTS.md § "GitHub Actions cost & hosted-macOS alert" when primary billing auth/quota is unavailable.
+# Authority: defensive gross-only fallback (bounded by MAX_APP_API_CALLS=60) per operator ask (2026-11-18, #L10) and origin/main:AGENTS.md:246-247 (self-outage prevention & blast-radius bounds when primary billing auth/quota is unavailable).
 run_app_token_fallback() {
   local reason="$1"
   local app_token app_rem calls_used=0 repo_count runs_count
@@ -533,15 +537,29 @@ run_app_token_fallback() {
           (.started_at | fromdateiso8601) as $j_start |
           ((.completed_at // $now_iso) | fromdateiso8601) as $j_end |
           select($j_end > $j_start) |
-          (
-            {day: $yesterday, w_start: $yest_start, w_end: $today_start},
-            {day: $today, w_start: $today_start, w_end: $tomorrow_start}
-          ) as $win |
-          ([$j_start, $win.w_start] | max) as $ov_start |
-          ([$j_end, $win.w_end] | min) as $ov_end |
-          ($ov_end - $ov_start) as $ov_secs |
-          select($ov_secs > 0) |
-          (($ov_secs / 60) | ceil) as $m |
+          ($j_end - $j_start) as $j_dur |
+          (($j_dur / 60) | ceil) as $total_min |
+          ([
+            {key: "pre", secs: ([0, ([$j_end, $yest_start] | min) - $j_start] | max)},
+            {key: "yest", secs: ([0, ([$j_end, $today_start] | min) - ([$j_start, $yest_start] | max)] | max)},
+            {key: "today", secs: ([0, ([$j_end, $tomorrow_start] | min) - ([$j_start, $today_start] | max)] | max)},
+            {key: "post", secs: ([0, $j_end - ([$j_start, $tomorrow_start] | max)] | max)}
+          ] | map(
+            (($total_min * .secs) / $j_dur) as $exact |
+            ($exact | floor) as $base |
+            . + {base: $base, rem: ($exact - $base)}
+          )) as $buckets |
+          ($total_min - ($buckets | map(.base) | add)) as $leftover |
+          ($buckets
+            | to_entries
+            | sort_by([-(.value.rem), -(.value.secs), .key])
+            | to_entries
+            | map(.value.value + {m: (.value.value.base + (if .key < $leftover then 1 else 0 end))})
+          )[] |
+          select(.key == "yest" or .key == "today") |
+          .m as $m |
+          select($m > 0) |
+          (if .key == "yest" then $yesterday else $today end) as $win_day |
           (if ($j | is_standard_macos) then {macos_min: $m, gross: ($m * 0.062), unpriced: false}
            elif ($j | is_any_hosted_macos) then {macos_min: $m, gross: 0, unpriced: ($m > 0)}
            elif ($j | is_standard_ubuntu) then {macos_min: 0, gross: ($m * 0.006), unpriced: false}
@@ -550,7 +568,7 @@ run_app_token_fallback() {
            else {macos_min: 0, gross: 0, unpriced: false}
            end)
           | {
-              day: $win.day,
+              day: $win_day,
               repo: $repo,
               macos_min: .macos_min,
               gross_usd: .gross,
@@ -621,7 +639,10 @@ run_app_token_fallback() {
           top_repo: ($repos[0].repo // "(none)"),
           top_repo_gross_usd: ($repos[0].gross_usd // 0),
           top_repo_net_usd: null,
-          top_repo_macos_min: ($repos[0].macos_min // 0)
+          top_repo_macos_min: ($repos[0].macos_min // 0),
+          top_net_repo: null,
+          top_net_repo_net_usd: null,
+          top_net_repo_gross_usd: null
         };
     . as $rows
     | {
@@ -678,6 +699,7 @@ if [ -z "$fallback_reason" ]; then
           net_usd: sum_net,
           macos_min: sum_macos_min
         }) | sort_by(-.gross_usd, -.macos_min, -.net_usd)) as $repos
+      | ($repos | sort_by(-.net_usd, -.gross_usd, -.macos_min)) as $net_repos
       | {
           day: $d,
           gross_usd: ($items | sum_gross),
@@ -686,7 +708,10 @@ if [ -z "$fallback_reason" ]; then
           top_repo: ($repos[0].repo // "(none)"),
           top_repo_gross_usd: ($repos[0].gross_usd // 0),
           top_repo_net_usd: ($repos[0].net_usd // 0),
-          top_repo_macos_min: ($repos[0].macos_min // 0)
+          top_repo_macos_min: ($repos[0].macos_min // 0),
+          top_net_repo: ($net_repos[0].repo // "(none)"),
+          top_net_repo_net_usd: ($net_repos[0].net_usd // 0),
+          top_net_repo_gross_usd: ($net_repos[0].gross_usd // 0)
         };
     [(.usageItems // [])[] | select(((.product // "") | ascii_downcase) == "actions")] as $all_actions
     | [$all_actions[] | select(((.date // "")[:7]) == $year_month)] as $mtd_actions
@@ -713,7 +738,13 @@ if [ -n "$fallback_reason" ]; then
     run_mode="$FALLBACK_MODE"
   else
     increment_api_failure
-    emit_blind_if_due "$fallback_reason" "blind"
+    blind_exit_reason="$fallback_reason"
+    blind_exit_mode="blind"
+    if [ "$STATE_CORRUPT_RESET" -eq 1 ]; then
+      blind_exit_reason="corrupt_state_file_reset; ${fallback_reason}"
+      blind_exit_mode="corrupt_state_file_reset"
+    fi
+    emit_blind_if_due "$blind_exit_reason" "$blind_exit_mode"
     exit 2
   fi
 fi
@@ -734,6 +765,14 @@ elif [ "$rollover_yest_failed" -eq 1 ]; then
   increment_api_failure
 fi
 
+if [ "$STATE_CORRUPT_RESET" -eq 1 ]; then
+  BLIND_DUE=1
+  if [ "$FAILURES_NOW" -eq 0 ]; then
+    FAILURES_NOW=3
+  fi
+  BLIND_REASON="corrupt_state_file_reset${BLIND_REASON:+; $BLIND_REASON}"
+fi
+
 fmt_usd() { awk -v v="$1" 'BEGIN{printf "%.2f", v + 0}'; }
 fmt_min() { awk -v v="$1" 'BEGIN{if (v + 0 == int(v + 0)) printf "%d", v + 0; else printf "%.1f", v + 0}'; }
 ge_num() { awk -v a="$1" -v b="$2" 'BEGIN{exit !(a + 0 >= b + 0)}'; }
@@ -746,7 +785,7 @@ should_emit() {
 
 append_blind_context() {
   local base="$1"
-  if [ "$PRIMARY_FAILED" -eq 1 ] && [ "$BLIND_DUE" -eq 1 ] && [ "$BLIND_COMBINED" -eq 0 ]; then
+  if [ "$BLIND_DUE" -eq 1 ] && [ "$BLIND_COMBINED" -eq 0 ]; then
     printf '%s; ALSO BLIND: authoritative billing usage failed %s consecutive times (%s)' "$base" "$FAILURES_NOW" "$BLIND_REASON"
   else
     printf '%s' "$base"
@@ -793,7 +832,7 @@ else
 fi
 
 alerted=0
-while IFS=$'\t' read -r day d_gross d_net d_macos top_repo top_gross top_net top_macos; do
+while IFS=$'\t' read -r day d_gross d_net d_macos top_repo top_gross top_macos top_net_repo top_net_repo_net top_net_repo_gross; do
   [ -n "$day" ] || continue
   d_gross_fmt="$(fmt_usd "$d_gross")"
   d_macos_fmt="$(fmt_min "$d_macos")"
@@ -801,10 +840,12 @@ while IFS=$'\t' read -r day d_gross d_net d_macos top_repo top_gross top_net top
   top_macos_fmt="$(fmt_min "$top_macos")"
   if [ "$d_net" != "null" ]; then
     d_net_fmt="$(fmt_usd "$d_net")"
-    top_net_fmt="$(fmt_usd "$top_net")"
+    top_net_repo_net_fmt="$(fmt_usd "$top_net_repo_net")"
+    top_net_repo_gross_fmt="$(fmt_usd "$top_net_repo_gross")"
   else
     d_net_fmt="null"
-    top_net_fmt="null"
+    top_net_repo_net_fmt="null"
+    top_net_repo_gross_fmt="null"
   fi
 
   if ge_num "$d_gross" "$DAILY_GROSS_WARN_USD" || ge_num "$d_macos" "$DAILY_MACOS_MIN_WARN"; then
@@ -822,11 +863,11 @@ while IFS=$'\t' read -r day d_gross d_net d_macos top_repo top_gross top_net top
   if [ "$used_fallback" -eq 0 ] && [ "$d_net" != "null" ] && ge_num "$d_net" "$DAILY_NET_WARN_USD"; then
     key="${day}:NET_SPEND_BREACH"
     if should_emit "$key"; then
-      msg="GitHub Actions daily NET spend breach in $ALERT_ORG on $day: \$${d_net_fmt} net (>= \$${DAILY_NET_WARN_USD}; \$${d_gross_fmt} gross, ${d_macos_fmt} macOS min); top repo $top_repo (\$${top_net_fmt} net, \$${top_gross_fmt} gross); MTD \$${mtd_net_fmt} net"
-      queue_due_breach "$key" NET_SPEND_BREACH "$day" "$msg" "$d_gross" "$d_net" "$d_macos" "$top_repo"
+      msg="GitHub Actions daily NET spend breach in $ALERT_ORG on $day: \$${d_net_fmt} net (>= \$${DAILY_NET_WARN_USD}; \$${d_gross_fmt} gross, ${d_macos_fmt} macOS min); top repo $top_net_repo (\$${top_net_repo_net_fmt} net, \$${top_net_repo_gross_fmt} gross); MTD \$${mtd_net_fmt} net"
+      queue_due_breach "$key" NET_SPEND_BREACH "$day" "$msg" "$d_gross" "$d_net" "$d_macos" "$top_net_repo"
     fi
   fi
-done < <(jq -r '.days[] | [.day, .gross_usd, (.net_usd // "null"), .macos_min, .top_repo, .top_repo_gross_usd, (.top_repo_net_usd // "null"), .top_repo_macos_min] | @tsv' "$tmp.summary")
+done < <(jq -r '.days[] | [.day, .gross_usd, (.net_usd // "null"), .macos_min, .top_repo, .top_repo_gross_usd, .top_repo_macos_min, (.top_net_repo // .top_repo), (.top_net_repo_net_usd // .top_repo_net_usd // "null"), (.top_net_repo_gross_usd // .top_repo_gross_usd // "null")] | @tsv' "$tmp.summary")
 
 if [ "$used_fallback" -eq 0 ] && [ "$mtd_net" != "null" ] && ge_num "$mtd_net" "$MTD_NET_WARN_USD"; then
   key="${YEAR_MONTH}:MTD_NET_BREACH"
@@ -862,7 +903,7 @@ if [ "${#DUE_KEYS[@]}" -gt 0 ]; then
        "${DUE_GROSS[0]}" "${DUE_NET[0]}" "${DUE_MACOS[0]}" "${DUE_REPO[0]}" \
        "$run_mode" "$mtd_gross" "$mtd_net" "$breach_keys_json"; then
     mark_blind=0
-    if [ "$PRIMARY_FAILED" -eq 1 ] && [ "$BLIND_DUE" -eq 1 ] && [ "$BLIND_COMBINED" -eq 0 ]; then
+    if [ "$BLIND_DUE" -eq 1 ] && [ "$BLIND_COMBINED" -eq 0 ]; then
       mark_blind=1
       BLIND_COMBINED=1
     fi
@@ -879,8 +920,14 @@ if [ "${#DUE_KEYS[@]}" -gt 0 ]; then
   fi
 fi
 
+if [ "$PRIMARY_FAILED" -eq 1 ] || [ "$BLIND_DUE" -eq 1 ]; then
+  blind_mode="$run_mode"
+  if [ "$STATE_CORRUPT_RESET" -eq 1 ] && [ "$PRIMARY_FAILED" -eq 0 ]; then
+    blind_mode="corrupt_state_file_reset"
+  fi
+  emit_blind_if_due "$BLIND_REASON" "$blind_mode"
+fi
 if [ "$PRIMARY_FAILED" -eq 1 ]; then
-  emit_blind_if_due "$BLIND_REASON" "$run_mode"
   echo "[$NOW_ISO] DEGRADED: org=$ALERT_ORG mode=$run_mode mtd_gross=${mtd_gross_fmt} mtd_net=${mtd_net_fmt} mtd_macos_min=${mtd_macos_fmt} api_failures=${FAILURES_NOW} fallback_incomplete=$FALLBACK_INCOMPLETE alerts_emitted=${alerted}"
 else
   echo "[$NOW_ISO] OK: org=$ALERT_ORG mode=$run_mode mtd_gross=\$${mtd_gross_fmt} mtd_net=\$${mtd_net_fmt} mtd_macos_min=${mtd_macos_fmt} alerts_emitted=${alerted}"

@@ -68,6 +68,8 @@ dry_out="$(
 
 grep -q -- '--no-default-labels' <<<"$dry_out" || fail "registration must include --no-default-labels"
 grep -qE -- '--labels[= ]self-hosted-native-macos([[:space:]]|$)' <<<"$dry_out" || fail "registration must include --labels self-hosted-native-macos"
+grep -q 'ACTIONS_RUNNER_INPUT_TOKEN=<redacted>' <<<"$dry_out" || fail "dry-run CONFIG_CMD must pass token via ACTIONS_RUNNER_INPUT_TOKEN"
+! grep -q -- '--token' <<<"$dry_out" || fail "dry-run CONFIG_CMD must never pass --token in argv"
 grep -q "$TMP/home/actions-runner-macos-ci" <<<"$dry_out" || fail "runner install dir must default to \$HOME/actions-runner-macos-ci"
 ! grep -qE "^(RUNNER_DIR=|.*<string>)$TMP/home/actions-runner(</string>|/run\\.sh|$)" <<<"$dry_out" || fail "setup script must never target \$HOME/actions-runner as runner dir"
 grep -q "$TMP/scratch/native-macos-ci-work" <<<"$dry_out" || fail "work dir must resolve via Scratch (native-macos-ci-work)"
@@ -168,6 +170,10 @@ chmod +x "$RUNNER_DIR_T/bin/Runner.Listener"
 cat > "$RUNNER_DIR_T/config.sh" <<STUB
 #!/usr/bin/env bash
 set -euo pipefail
+if [ -z "\${ACTIONS_RUNNER_INPUT_TOKEN:-}" ]; then
+  echo "config.sh error: missing ACTIONS_RUNNER_INPUT_TOKEN" >&2
+  exit 1
+fi
 if [ -e "$RUNNER_DIR_T/.runner" ] || [ -e "$RUNNER_DIR_T/.credentials" ] || [ -e "$RUNNER_DIR_T/.credentials_rsaparams" ]; then
   echo "ConfigurationManager error: runner is already configured" >&2
   exit 1
@@ -176,6 +182,9 @@ printf 'config.sh %s\n' "\$*" >> "$TMP/config.log"
 printf '{"agentId":101,"agentName":"mac-native-ci-1","workFolder":"%s","gitHubUrl":"https://github.com/jleechanorg"}\n' "$TMP/scratch/native-macos-ci-work" > "$RUNNER_DIR_T/.runner"
 printf 'creds\n' > "$RUNNER_DIR_T/.credentials"
 printf 'rsa\n' > "$RUNNER_DIR_T/.credentials_rsaparams"
+if [ -n "\${CONFIG_RAN_MARKER:-}" ]; then
+  : > "\$CONFIG_RAN_MARKER"
+fi
 STUB
 chmod +x "$RUNNER_DIR_T/config.sh"
 
@@ -297,7 +306,11 @@ case "$*" in
     ;;
   *"actions/runners"*)
     default_live='{"runners":[{"id":101,"name":"mac-native-ci-1","labels":[{"name":"self-hosted-native-macos"}]}]}'
-    emit_json "${LIVE_RUNNERS_JSON:-$default_live}"
+    if [ -n "${LIVE_RUNNERS_POST_CONFIG_JSON:-}" ] && [ -n "${CONFIG_RAN_MARKER:-}" ] && [ -f "$CONFIG_RAN_MARKER" ]; then
+      emit_json "$LIVE_RUNNERS_POST_CONFIG_JSON"
+    else
+      emit_json "${LIVE_RUNNERS_JSON:-$default_live}"
+    fi
     ;;
   *"repos/"*)
     default_repo='{"private":true}'
@@ -326,6 +339,7 @@ HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-v
   "$SETUP_SCRIPT" >/dev/null
 
 grep -q 'config.sh .*--labels self-hosted-native-macos' "$TMP/config.log" || fail "label change must re-run config.sh"
+! grep -q -- '--token' "$TMP/config.log" || fail "config.sh must never receive --token in argv"
 [ "$(tr -d '\r\n' < "$RUNNER_DIR_T/.ezgha-labels")" = "self-hosted-native-macos" ] || fail ".ezgha-labels must persist configured labels"
 first_unload_line="$(grep -n "launchctl unload $PLIST_T" "$TMP/launchctl.log" | head -n1 | cut -d: -f1 || true)"
 [ -n "$first_unload_line" ] || fail "reconfigure must unload existing LaunchAgent"
@@ -741,10 +755,17 @@ fi
 cat > "$RUNNER_DIR_T/config.sh" <<STUB
 #!/usr/bin/env bash
 set -euo pipefail
+if [ -z "\${ACTIONS_RUNNER_INPUT_TOKEN:-}" ]; then
+  echo "config.sh error: missing ACTIONS_RUNNER_INPUT_TOKEN" >&2
+  exit 1
+fi
 printf 'config.sh %s\n' "\$*" >> "$TMP/config.log"
 printf '{"agentId":101,"agentName":"mac-native-ci-1","workFolder":"%s","gitHubUrl":"https://github.com/jleechanorg"}\n' "$TMP/scratch/native-macos-ci-work" > "$RUNNER_DIR_T/.runner"
 printf 'creds\n' > "$RUNNER_DIR_T/.credentials"
 printf 'rsa\n' > "$RUNNER_DIR_T/.credentials_rsaparams"
+if [ -n "\${CONFIG_RAN_MARKER:-}" ]; then
+  : > "\$CONFIG_RAN_MARKER"
+fi
 STUB
 chmod +x "$RUNNER_DIR_T/config.sh"
 cp "$RUNNER_DIR_T/config.sh" "$TMP/home/actions-runner/config.sh"
@@ -941,10 +962,18 @@ ln -sfn "$EXISTING_SYM/externals.2.338.2" "$EXISTING_SYM/externals"
 cat > "$EXISTING_SYM/config.sh" <<STUB
 #!/usr/bin/env bash
 set -euo pipefail
+if [ -z "\${ACTIONS_RUNNER_INPUT_TOKEN:-}" ]; then
+  echo "config.sh error: missing ACTIONS_RUNNER_INPUT_TOKEN" >&2
+  exit 1
+fi
+printf 'config.sh %s\n' "\$*" >> "$TMP/config.log"
 printf '{"agentId":101,"agentName":"mac-native-ci-1","workFolder":"%s","gitHubUrl":"https://github.com/jleechanorg"}\n' "$TMP/scratch/native-macos-ci-work" > "\$(pwd)/.runner"
 umask 022
 printf 'creds\n' > "\$(pwd)/.credentials"
 printf 'rsa\n' > "\$(pwd)/.credentials_rsaparams"
+if [ -n "\${CONFIG_RAN_MARKER:-}" ]; then
+  : > "\$CONFIG_RAN_MARKER"
+fi
 STUB
 chmod +x "$EXISTING_SYM/config.sh"
 printf '#!/usr/bin/env bash\nexit 0\n' > "$EXISTING_SYM/run.sh"
@@ -952,7 +981,11 @@ chmod +x "$EXISTING_SYM/run.sh"
 : > "$EXISTING_SYM/run-helper.sh.template"
 : > "$EXISTING_SYM/env.sh"
 
-RUNNER_GROUPS_JSON="$MIXED_GROUPS" FORK_APPROVAL_JSON='{"approval_policy":"first_time_contributors"}' \
+rm -f "$TMP/config-ran-17"
+CONFIG_RAN_MARKER="$TMP/config-ran-17" \
+  LIVE_RUNNERS_JSON='{"runners":[]}' \
+  LIVE_RUNNERS_POST_CONFIG_JSON='{"runners":[{"id":101,"name":"mac-native-ci-1","labels":[{"name":"self-hosted-native-macos"}]}]}' \
+  RUNNER_GROUPS_JSON="$MIXED_GROUPS" FORK_APPROVAL_JSON='{"approval_policy":"first_time_contributors"}' \
   HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
   EXISTING_RUNNER_DIR="$EXISTING_SYM" "$SETUP_SCRIPT" --runner-dir "$ISOLATED_SYM" --runner-group macos-restricted >/dev/null
 
@@ -1050,11 +1083,15 @@ fi
 # triggers reconfiguration, and fails closed if post-config live state still mismatches.
 printf '{"agentId":101,"agentName":"mac-native-ci-1","workFolder":"%s","gitHubUrl":"https://github.com/jleechanorg"}\n' "$TMP/scratch/native-macos-ci-work" > "$RUNNER_DIR_T/.runner"
 : > "$TMP/config.log"
-RUNNER_GROUPS_JSON="$MIXED_GROUPS" FORK_APPROVAL_JSON='{"approval_policy":"first_time_contributors"}' \
+rm -f "$TMP/config-ran-18"
+CONFIG_RAN_MARKER="$TMP/config-ran-18" \
+  RUNNER_GROUPS_JSON="$MIXED_GROUPS" FORK_APPROVAL_JSON='{"approval_policy":"first_time_contributors"}' \
   LIVE_RUNNERS_JSON='{"runners":[]}' \
+  LIVE_RUNNERS_POST_CONFIG_JSON='{"runners":[{"id":101,"name":"mac-native-ci-1","labels":[{"name":"self-hosted-native-macos"}]}]}' \
   HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
   "$SETUP_SCRIPT" --runner-group macos-restricted >/dev/null
 grep -q 'config.sh ' "$TMP/config.log" || fail "normal setup must reconfigure when live runner is missing on GitHub"
+! grep -q -- '--replace' "$TMP/config.log" || fail "normal setup must NOT pass --replace when no live runner has RUNNER_NAME"
 
 : > "$TMP/config.log"
 bad_post_rc=0
@@ -1066,3 +1103,121 @@ RUNNER_GROUPS_JSON="$MIXED_GROUPS" FORK_APPROVAL_JSON='{"approval_policy":"first
 grep -q 'config.sh ' "$TMP/config.log" || fail "normal setup must detect out-of-group drift and invoke config.sh"
 [ ! -e "$TMP/launchctl.loaded" ] || fail "failed post-config verification must leave LaunchAgent stopped"
 pass "--repo/--runner-group exclusion, per-repo fork-approval overrides, strict agentId, and normal-setup live drift checks pass"
+
+# 19. Post-config.sh API absence fails closed (exit 4) without calling launchctl load and preserves backup.
+rm -rf "${RUNNER_DIR_T}"/.backup-pre-reconfigure.*
+printf '{"agentId":101,"agentName":"mac-native-ci-1","workFolder":"%s","gitHubUrl":"https://github.com/jleechanorg"}\n' "$TMP/scratch/native-macos-ci-work" > "$RUNNER_DIR_T/.runner"
+: > "$TMP/config.log"
+: > "$TMP/launchctl.log"
+rm -f "$TMP/launchctl.loaded"
+post_absent_rc=0
+POST_CONFIG_VERIFY_ATTEMPTS=1 POST_CONFIG_VERIFY_SLEEP_SEC=0 \
+  RUNNER_GROUPS_JSON="$MIXED_GROUPS" FORK_APPROVAL_JSON='{"approval_policy":"first_time_contributors"}' \
+  LIVE_RUNNERS_JSON='{"runners":[]}' \
+  HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
+  "$SETUP_SCRIPT" --runner-group macos-restricted >/dev/null 2>&1 || post_absent_rc=$?
+[ "$post_absent_rc" -eq 4 ] || fail "post-config.sh API absence must exit 4 fail-closed (got $post_absent_rc)"
+grep -q 'config.sh ' "$TMP/config.log" || fail "post-config absence test must have invoked config.sh"
+! grep -q 'launchctl load' "$TMP/launchctl.log" || fail "post-config API absence must never call launchctl load"
+[ ! -e "$TMP/launchctl.loaded" ] || fail "post-config API absence must leave LaunchAgent stopped"
+absent_backups=("$RUNNER_DIR_T"/.backup-pre-reconfigure.*)
+[ "${#absent_backups[@]}" -eq 1 ] && [ -d "${absent_backups[0]}" ] || fail "post-config API absence must preserve .backup-pre-reconfigure.<pid>"
+rm -rf "${RUNNER_DIR_T}"/.backup-pre-reconfigure.*
+pass "post-config.sh API absence exits 4 fail-closed without calling launchctl load"
+
+# 20. Safe --replace guard: fresh setup refuses live name collision (exit 6), succeeds without --replace when absent,
+#     passes --replace when local .runner agentId matches, and never passes --token in argv.
+FRESH_COLLIDE="$TMP/home/fresh-collide-runner"
+mkdir -p "$FRESH_COLLIDE"
+: > "$TMP/config.log"
+: > "$TMP/launchctl.log"
+rm -f "$TMP/launchctl.loaded"
+collide_rc=0
+collide_err="$(
+  RUNNER_GROUPS_JSON="$MIXED_GROUPS" FORK_APPROVAL_JSON='{"approval_policy":"first_time_contributors"}' \
+  LIVE_RUNNERS_JSON='{"runners":[{"id":999,"name":"mac-native-ci-1","labels":[{"name":"self-hosted-native-macos"}]}]}' \
+  HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
+  EXISTING_RUNNER_DIR="$EXISTING_SYM" \
+  "$SETUP_SCRIPT" --runner-dir "$FRESH_COLLIDE" --runner-group macos-restricted 2>&1 >/dev/null
+)" || collide_rc=$?
+[ "$collide_rc" -eq 6 ] || fail "fresh setup with colliding live runner id=999 must exit 6 (got $collide_rc)"
+grep -q '999' <<<"$collide_err" || fail "collision refusal must name conflicting live runner id 999 (got: $collide_err)"
+[ ! -s "$TMP/config.log" ] || fail "collision refusal must abort BEFORE invoking config.sh"
+
+: > "$TMP/config.log"
+rm -f "$TMP/config-ran-20"
+CONFIG_RAN_MARKER="$TMP/config-ran-20" \
+  RUNNER_GROUPS_JSON="$MIXED_GROUPS" FORK_APPROVAL_JSON='{"approval_policy":"first_time_contributors"}' \
+  LIVE_RUNNERS_JSON='{"runners":[]}' \
+  LIVE_RUNNERS_POST_CONFIG_JSON='{"runners":[{"id":101,"name":"mac-native-ci-1","labels":[{"name":"self-hosted-native-macos"}]}]}' \
+  HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
+  EXISTING_RUNNER_DIR="$EXISTING_SYM" \
+  "$SETUP_SCRIPT" --runner-dir "$FRESH_COLLIDE" --runner-group macos-restricted >/dev/null
+grep -q 'config.sh ' "$TMP/config.log" || fail "fresh setup without live collision must invoke config.sh"
+! grep -q -- '--replace' "$TMP/config.log" || fail "fresh setup without live collision must NOT pass --replace"
+! grep -q -- '--token' "$TMP/config.log" || fail "config.sh must never receive --token in argv"
+
+: > "$TMP/config.log"
+RUNNER_GROUPS_JSON="$MIXED_GROUPS" FORK_APPROVAL_JSON='{"approval_policy":"first_time_contributors"}' \
+  LIVE_RUNNERS_JSON='{"runners":[{"id":101,"name":"mac-native-ci-1","labels":[{"name":"self-hosted-native-macos"}]}]}' \
+  HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
+  EXISTING_RUNNER_DIR="$EXISTING_SYM" \
+  "$SETUP_SCRIPT" --runner-dir "$FRESH_COLLIDE" --reconfigure --runner-group macos-restricted >/dev/null
+grep -q -- '--replace' "$TMP/config.log" || fail "--reconfigure with matching local agentId=101 must pass --replace"
+! grep -q -- '--token' "$TMP/config.log" || fail "--reconfigure must never pass --token in argv"
+pass "safe --replace collision guard and ACTIONS_RUNNER_INPUT_TOKEN handling hold"
+
+# 21. Realpath containment: existing RUNNER_DIR with bin/Runner.Listener symlinked into EXISTING_RUNNER_DIR
+#     fails --verify and gets repaired into an isolated copy (including nested symlinks rewritten relatively).
+ln -sfn "$EXISTING_SYM/externals.2.338.2/node20/bin/node" "$EXISTING_SYM/bin.2.338.2/nested-node-link"
+LEAK_RUNNER="$TMP/home/leak-symlink-runner"
+mkdir -p "$LEAK_RUNNER/bin" "$LEAK_RUNNER/externals"
+ln -sfn "$EXISTING_SYM/bin.2.338.2/Runner.Listener" "$LEAK_RUNNER/bin/Runner.Listener"
+cp "$EXISTING_SYM/config.sh" "$LEAK_RUNNER/config.sh"
+cp "$EXISTING_SYM/run.sh" "$LEAK_RUNNER/run.sh"
+: > "$LEAK_RUNNER/run-helper.sh.template"
+: > "$LEAK_RUNNER/env.sh"
+printf '{"agentId":101,"agentName":"mac-native-ci-1","workFolder":"%s","gitHubUrl":"https://github.com/jleechanorg"}\n' "$TMP/scratch/native-macos-ci-work" > "$LEAK_RUNNER/.runner"
+printf 'self-hosted-native-macos\n' > "$LEAK_RUNNER/.ezgha-labels"
+printf 'macos-restricted\n' > "$LEAK_RUNNER/.ezgha-group"
+python3 - "$TMP/plist.ok" "$PLIST_T" "$LEAK_RUNNER" <<'PY'
+import plistlib, sys
+from pathlib import Path
+d = plistlib.loads(Path(sys.argv[1]).read_bytes())
+r = sys.argv[3]
+d["WorkingDirectory"] = r
+d["ProgramArguments"] = ["/bin/bash", f"{r}/run.sh"]
+Path(sys.argv[2]).write_bytes(plistlib.dumps(d))
+PY
+: > "$TMP/launchctl.loaded"
+
+if HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
+    "$SETUP_SCRIPT" --verify --offline --runner-dir "$LEAK_RUNNER" --runner-group macos-restricted >/dev/null 2>&1; then
+  fail "--verify must fail when bin/Runner.Listener symlinks outside RUNNER_DIR"
+fi
+
+RUNNER_GROUPS_JSON="$MIXED_GROUPS" FORK_APPROVAL_JSON='{"approval_policy":"first_time_contributors"}' \
+  LIVE_RUNNERS_JSON='{"runners":[{"id":101,"name":"mac-native-ci-1","labels":[{"name":"self-hosted-native-macos"}]}]}' \
+  HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
+  EXISTING_RUNNER_DIR="$EXISTING_SYM" \
+  "$SETUP_SCRIPT" --runner-dir "$LEAK_RUNNER" --runner-group macos-restricted >/dev/null
+
+LEAK_RUNNER="$LEAK_RUNNER" EXISTING_SYM="$EXISTING_SYM" python3 - <<'PY' || fail "repaired runner symlinks escaped RUNNER_DIR"
+import os
+from pathlib import Path
+
+runner = Path(os.environ["LEAK_RUNNER"]).resolve()
+existing = Path(os.environ["EXISTING_SYM"]).resolve()
+listener_real = (runner / "bin" / "Runner.Listener").resolve()
+assert str(listener_real).startswith(str(runner) + "/"), f"Runner.Listener escaped: {listener_real}"
+assert existing not in listener_real.parents and listener_real != existing, f"Runner.Listener still points into existing: {listener_real}"
+nested = runner / "bin.2.338.2" / "nested-node-link"
+assert os.path.islink(nested), "nested symlink should remain a symlink"
+assert os.readlink(nested) == "../externals.2.338.2/node20/bin/node", f"unexpected nested readlink: {os.readlink(nested)!r}"
+nested_real = nested.resolve()
+assert str(nested_real).startswith(str(runner) + "/"), f"nested symlink escaped: {nested_real}"
+PY
+HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
+  "$SETUP_SCRIPT" --verify --offline --runner-dir "$LEAK_RUNNER" --runner-group macos-restricted >/dev/null || \
+  fail "--verify must pass after repairing symlink-leaking RUNNER_DIR"
+pass "realpath containment catches escaping Runner.Listener symlinks and repairs nested symlinks cleanly"

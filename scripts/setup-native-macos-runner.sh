@@ -13,13 +13,14 @@
 #   `approval_policy=all_external_contributors`) is required and enforced
 #   fail-closed by `setup-native-macos-runner.sh` (unless
 #   `--allow-public-fork-exposure` is explicitly passed).
-# Authority: operator ask (2026-11-18: "fix this we accidentally using gh macOS actions instead of running it on thi machine ... also wes hould have gh actions cost alerts they seemed to not be firing") and AGENTS.md § "Native macOS CI runner".
+# Authority: operator ask (2026-11-18: "fix this we accidentally using gh macOS actions instead of running it on thi machine ... also wes hould have gh actions cost alerts they seemed to not be firing") and origin/main:AGENTS.md:241-250,257-258 (Safety & Monitoring Principles & /code-standards gates).
 #
 # Usage:
 #   setup-native-macos-runner.sh [--dry-run] [--verify] [--uninstall]
 #     [--org ORG] [--repo OWNER/REPO] [--runner-group GROUP]
-#     [--allow-public-fork-exposure] [--name RUNNER_NAME]
-#     [--runner-dir DIR] [--labels CSV] [--work-dir DIR] [--version VER]
+#     [--allow-public-fork-exposure] [--force-replace-name]
+#     [--name RUNNER_NAME] [--runner-dir DIR] [--labels CSV]
+#     [--work-dir DIR] [--version VER]
 set -euo pipefail
 
 RUNNER_ORG="${RUNNER_ORG:-${GITHUB_ORG:-jleechanorg}}"
@@ -31,6 +32,9 @@ if [ -n "$RUNNER_GROUP" ]; then
   RUNNER_GROUP_SET=1
 fi
 ALLOW_PUBLIC_FORK_EXPOSURE="${ALLOW_PUBLIC_FORK_EXPOSURE:-0}"
+FORCE_REPLACE_NAME="${FORCE_REPLACE_NAME:-0}"
+POST_CONFIG_VERIFY_ATTEMPTS="${POST_CONFIG_VERIFY_ATTEMPTS:-3}"
+POST_CONFIG_VERIFY_SLEEP_SEC="${POST_CONFIG_VERIFY_SLEEP_SEC:-1}"
 RUNNER_NAME="${NATIVE_MACOS_RUNNER_NAME:-mac-native-ci-1}"
 RUNNER_DIR="${RUNNER_DIR:-$HOME/actions-runner-macos-ci}"
 EXISTING_RUNNER_DIR="${EXISTING_RUNNER_DIR:-$HOME/actions-runner}"
@@ -53,13 +57,14 @@ usage() {
 Usage: setup-native-macos-runner.sh [OPTIONS]
   --dry-run                       Print planned setup, config.sh command, and LaunchAgent plist without mutating host
   --verify                        Verify existing runner dir, .runner, .ezgha-labels, live GitHub labels, fork protection, work dir, and LaunchAgent
-  --reconfigure                   Force unload, removal of local .runner/.credentials*, and fresh ./config.sh --replace
-  --offline                       Skip live GitHub API verification during --verify or --dry-run
+  --reconfigure                   Force unload, removal of local .runner/.credentials*, and fresh ./config.sh (passing --replace only when live runner matches local agentId)
+  --offline                       Skip live GitHub API check during --verify (--dry-run never calls GitHub)
   --uninstall                     Unload and remove org.jleechanorg.ezgha-native-macos-runner LaunchAgent
   --org ORG                       GitHub org scope (default: jleechanorg)
   --repo OWNER/REPO               Optional repo scope (overrides --org)
   --runner-group GROUP            Optional GitHub org runner group name (passed as --runnergroup to config.sh)
   --allow-public-fork-exposure    Explicitly allow setup/verify even when public fork PRs lack all_external_contributors approval
+  --force-replace-name            Allow --replace even when a live runner with the same name exists without matching local .runner agentId
   --name NAME                     Runner name (default: mac-native-ci-1)
   --runner-dir DIR                Install directory (default: $HOME/actions-runner-macos-ci)
   --labels CSV                    Comma-separated labels (default: self-hosted-native-macos)
@@ -80,6 +85,7 @@ while [ "$#" -gt 0 ]; do
     --repo) RUNNER_REPO="${2:?missing --repo value}"; shift 2 ;;
     --runner-group) RUNNER_GROUP="${2:?missing --runner-group value}"; RUNNER_GROUP_SET=1; shift 2 ;;
     --allow-public-fork-exposure) ALLOW_PUBLIC_FORK_EXPOSURE=1; shift ;;
+    --force-replace-name) FORCE_REPLACE_NAME=1; shift ;;
     --name) RUNNER_NAME="${2:?missing --name value}"; shift 2 ;;
     --runner-dir) RUNNER_DIR="${2:?missing --runner-dir value}"; shift 2 ;;
     --labels) LABELS="${2:?missing --labels value}"; RUNNER_LABELS="$LABELS"; shift 2 ;;
@@ -90,7 +96,7 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
-# Authority: defensive operational guards/bounds (SETUP_LOCK_TIMEOUT_SEC=30, --offline scope, --repo/--runner-group exclusion) per AGENTS.md § "Native macOS CI runner" & § "Safety & Monitoring Principles" (unrequested defaults disclosed in PR #238).
+# Authority: defensive operational guards/bounds (SETUP_LOCK_TIMEOUT_SEC=30, POST_CONFIG_VERIFY_ATTEMPTS=3, --offline scope, --repo/--runner-group exclusion) per operator ask (2026-11-18, #L16) and origin/main:AGENTS.md:246-247,257-258 (self-outage prevention; unrequested defaults disclosed in PR #238).
 if [ -n "$RUNNER_REPO" ] && [ "$RUNNER_GROUP_SET" -eq 1 ]; then
   echo "ERROR: --runner-group cannot be combined with --repo (runner groups are org/enterprise-scoped)" >&2
   exit 2
@@ -104,6 +110,23 @@ fi
 case "$ALLOW_PUBLIC_FORK_EXPOSURE" in
   0|1) ;;
   *) echo "ERROR: invalid ALLOW_PUBLIC_FORK_EXPOSURE='$ALLOW_PUBLIC_FORK_EXPOSURE' (expected 0 or 1)" >&2; exit 2 ;;
+esac
+
+case "$FORCE_REPLACE_NAME" in
+  0|1) ;;
+  *) echo "ERROR: invalid FORCE_REPLACE_NAME='$FORCE_REPLACE_NAME' (expected 0 or 1)" >&2; exit 2 ;;
+esac
+
+case "$POST_CONFIG_VERIFY_ATTEMPTS" in
+  ''|*[!0-9]*) echo "ERROR: invalid POST_CONFIG_VERIFY_ATTEMPTS='$POST_CONFIG_VERIFY_ATTEMPTS' (expected positive integer)" >&2; exit 2 ;;
+esac
+if [ "$POST_CONFIG_VERIFY_ATTEMPTS" -lt 1 ]; then
+  echo "ERROR: invalid POST_CONFIG_VERIFY_ATTEMPTS='$POST_CONFIG_VERIFY_ATTEMPTS' (expected >= 1)" >&2
+  exit 2
+fi
+
+case "$POST_CONFIG_VERIFY_SLEEP_SEC" in
+  ''|*[!0-9]*) echo "ERROR: invalid POST_CONFIG_VERIFY_SLEEP_SEC='$POST_CONFIG_VERIFY_SLEEP_SEC' (expected non-negative integer)" >&2; exit 2 ;;
 esac
 
 # Ponytail standalone-libexec rationale: resolve_python3 and fcntl.flock remain inline so setup-native-macos-runner.sh runs standalone without sibling helper dependencies (matching launchd/install-launchagents.sh).
@@ -268,7 +291,7 @@ if [ "$UNINSTALL" -eq 1 ]; then
   exit 0
 fi
 
-# Authority: fail-closed path-isolation guard per AGENTS.md § "Native macOS CI runner" (never touch $HOME, /, or TestFlight/SMTP-egress runner dirs, including case-insensitive APFS aliases and parents).
+# Authority: fail-closed path-isolation guard per operator ask (2026-11-18, #L16) and origin/main:AGENTS.md:246-247 (self-outage prevention: never touch $HOME, /, or TestFlight/SMTP-egress runner dirs, including case-insensitive APFS aliases and parents).
 is_reserved_runner_dir() {
   local target="$1" py_bin=""
   shift
@@ -357,7 +380,7 @@ normalize_labels() {
   printf '%s' "$out"
 }
 
-# Authority: fail-closed label-isolation guard per AGENTS.md § "Native macOS CI runner" (require self-hosted-native-macos; reject bare self-hosted and worldai-testflight-native-mac).
+# Authority: fail-closed label-isolation guard per operator ask (2026-11-18, #L16) and origin/main:AGENTS.md:246-247,257 (require self-hosted-native-macos; reject bare self-hosted and worldai-testflight-native-mac).
 validate_labels() {
   local raw="$1" item trimmed lower has_native=0
   [ -n "$raw" ] || { echo "ERROR: --labels must not be empty" >&2; exit 2; }
@@ -512,13 +535,79 @@ PLIST
 }
 
 runner_binaries_ready() {
-  local dir="$1"
-  [ -x "${dir}/bin/Runner.Listener" ] && [ -x "${dir}/config.sh" ] && [ -x "${dir}/run.sh" ] && [ -f "${dir}/run-helper.sh.template" ] && [ -f "${dir}/env.sh" ] && { [ -d "${dir}/externals" ] || compgen -G "${dir}/externals.*" >/dev/null; }
+  local dir="$1" py_bin=""
+  [ -d "$dir" ] || return 1
+  py_bin="$(resolve_python3)" || return 1
+  "$py_bin" - "$dir" <<'PY'
+import os
+import sys
+
+root = sys.argv[1]
+if not os.path.isdir(root):
+    sys.exit(1)
+root_real = os.path.realpath(root)
+prefix = root_real.rstrip("/") + "/"
+
+def is_inside(path: str) -> bool:
+    rp = os.path.realpath(path)
+    return rp.startswith(prefix)
+
+for rel in ("bin/Runner.Listener", "config.sh", "run.sh"):
+    p = os.path.join(root, rel)
+    if not (os.path.isfile(p) and os.access(p, os.X_OK) and is_inside(p)):
+        sys.exit(1)
+
+for rel in ("run-helper.sh.template", "env.sh"):
+    p = os.path.join(root, rel)
+    if not (os.path.isfile(p) and is_inside(p)):
+        sys.exit(1)
+
+has_externals = False
+try:
+    entries = list(os.scandir(root))
+except OSError:
+    sys.exit(1)
+
+for entry in entries:
+    if entry.name == "externals" or entry.name.startswith("externals."):
+        if os.path.isdir(entry.path) and is_inside(entry.path):
+            has_externals = True
+if not has_externals:
+    sys.exit(1)
+
+top_scripts = {"config.sh", "run.sh", "run-helper.sh.template", "env.sh", "safe_sleep.sh"}
+walk_roots = []
+for entry in entries:
+    if entry.name.startswith("bin") or entry.name.startswith("externals") or entry.name in top_scripts:
+        if os.path.islink(entry.path):
+            if not is_inside(entry.path):
+                sys.exit(1)
+        if (entry.name.startswith("bin") or entry.name.startswith("externals")) and os.path.isdir(entry.path):
+            walk_roots.append(entry.path)
+            if os.path.islink(entry.path):
+                walk_roots.append(os.path.realpath(entry.path))
+
+seen_dirs = set()
+for wroot in walk_roots:
+    wreal = os.path.realpath(wroot)
+    if not wreal.startswith(prefix) and wreal != root_real:
+        sys.exit(1)
+    if wreal in seen_dirs:
+        continue
+    seen_dirs.add(wreal)
+    for cur, dirnames, filenames in os.walk(wreal, followlinks=False):
+        for name in dirnames + filenames:
+            p = os.path.join(cur, name)
+            if os.path.islink(p) and not is_inside(p):
+                sys.exit(1)
+
+sys.exit(0)
+PY
 }
 
 VERIFIED_RUNNER_GROUP_ID=""
 
-# Authority: fail-closed server-side fork-PR protection per AGENTS.md § "Native macOS CI runner" (exit 5 before token minting/setup/verify).
+# Authority: fail-closed server-side fork-PR protection per operator ask (2026-11-18, #L16) and origin/main:AGENTS.md:246-247,257 (exit 5 before token minting/setup/verify).
 verify_server_fork_protection() {
   command -v "$GH_BIN" >/dev/null 2>&1 || {
     echo "ERROR: gh binary '$GH_BIN' not found (required for server-side fork-protection check)" >&2
@@ -614,11 +703,12 @@ verify_server_fork_protection() {
   fi
 }
 
-# Authority: live runner agentId/group/label binding per AGENTS.md § "Native macOS CI runner" (shared across setup and --verify).
+# Authority: live runner agentId/group/label binding per operator ask (2026-11-18, #L16) and origin/main:AGENTS.md:246-247,257 (shared across setup, post_config, and --verify).
 verify_live_runner_state() {
   local mode="${1:?missing mode}"
   local local_agent_id="" runners_pages="" runner_json=""
   local group_runners_pages="" in_group=0 live_labels_csv="" expected_sorted_csv=""
+  local max_attempts=1 attempt=1
 
   if [ "$mode" = "verify" ] || { [ -z "$RUNNER_REPO" ] && [ -z "$VERIFIED_RUNNER_GROUP_ID" ]; }; then
     verify_server_fork_protection
@@ -634,17 +724,27 @@ verify_live_runner_state() {
     return 1
   fi
 
-  if ! runners_pages="$("$GH_BIN" api --paginate "$RUNNERS_API" 9>&-)"; then
-    echo "ERROR: failed to query live runners from $RUNNERS_API" >&2
-    [ "$mode" = "setup" ] && exit 1
-    return 1
+  if [ "$mode" = "post_config" ]; then
+    max_attempts="$POST_CONFIG_VERIFY_ATTEMPTS"
   fi
-  runner_json="$(printf '%s\n' "$runners_pages" | jq -sc --arg name "$RUNNER_NAME" --arg id "$local_agent_id" '[.[].runners[]? | select(((.id | tostring) == $id) and (.name == $name))] | .[0] // empty')"
-  if [ -z "$runner_json" ]; then
-    if [ "$mode" = "post_config" ]; then
-      echo "WARN: newly configured runner '$RUNNER_NAME' (agentId=$local_agent_id) not yet visible in $RUNNERS_API; skipping immediate live group/label check" >&2
-      return 0
+
+  for ((attempt = 1; attempt <= max_attempts; attempt++)); do
+    if ! runners_pages="$("$GH_BIN" api --paginate "$RUNNERS_API" 9>&-)"; then
+      echo "ERROR: failed to query live runners from $RUNNERS_API" >&2
+      [ "$mode" = "setup" ] && exit 1
+      return 1
     fi
+    runner_json="$(printf '%s\n' "$runners_pages" | jq -sc --arg name "$RUNNER_NAME" --arg id "$local_agent_id" '[.[].runners[]? | select(((.id | tostring) == $id) and (.name == $name))] | .[0] // empty')"
+    if [ -n "$runner_json" ]; then
+      break
+    fi
+    if [ "$attempt" -lt "$max_attempts" ]; then
+      echo "INFO: newly configured runner '$RUNNER_NAME' (agentId=$local_agent_id) not yet visible in $RUNNERS_API (attempt ${attempt}/${max_attempts}); retrying in ${POST_CONFIG_VERIFY_SLEEP_SEC}s..." >&2
+      sleep "$POST_CONFIG_VERIFY_SLEEP_SEC"
+    fi
+  done
+
+  if [ -z "$runner_json" ]; then
     echo "FAIL: runner '$RUNNER_NAME' (agentId=$local_agent_id) not found in live $RUNNERS_API" >&2
     return 1
   fi
@@ -691,6 +791,10 @@ if [ "$VERIFY" -eq 1 ]; then
   [ -f "${RUNNER_DIR}/env.sh" ] || { echo "FAIL: missing ${RUNNER_DIR}/env.sh" >&2; exit 1; }
   if [ ! -d "${RUNNER_DIR}/externals" ] && ! compgen -G "${RUNNER_DIR}/externals.*" >/dev/null; then
     echo "FAIL: missing ${RUNNER_DIR}/externals" >&2
+    exit 1
+  fi
+  if ! runner_binaries_ready "$RUNNER_DIR"; then
+    echo "FAIL: runner binaries in ${RUNNER_DIR} are incomplete or contain symlink targets resolving outside ${RUNNER_DIR}" >&2
     exit 1
   fi
   [ -d "$WORK_DIR" ] || { echo "FAIL: missing work dir ${WORK_DIR}" >&2; exit 1; }
@@ -779,7 +883,10 @@ if [ "$DRY_RUN" -eq 1 ]; then
   else
     echo "BINARY_SOURCE=download:v${RUNNER_VERSION}"
   fi
-  dry_config_cmd="${RUNNER_DIR}/config.sh --unattended --url ${RUNNER_URL} --token <redacted-token> --name ${RUNNER_NAME} --work ${WORK_DIR} --labels ${LABELS} --no-default-labels --replace"
+  dry_config_cmd="ACTIONS_RUNNER_INPUT_TOKEN=<redacted> ${RUNNER_DIR}/config.sh --unattended --url ${RUNNER_URL} --name ${RUNNER_NAME} --work ${WORK_DIR} --labels ${LABELS} --no-default-labels"
+  if [ "$FORCE_REPLACE_NAME" -eq 1 ]; then
+    dry_config_cmd+=" --replace"
+  fi
   if [ -n "$RUNNER_GROUP" ]; then
     dry_config_cmd+=" --runnergroup ${RUNNER_GROUP}"
   fi
@@ -831,6 +938,51 @@ if ! runner_binaries_ready "$RUNNER_DIR"; then
       fi
     done
     shopt -u nullglob
+    py_bin="$(resolve_python3)" || { echo "ERROR: python3 not found" >&2; exit 1; }
+    "$py_bin" - "$STAGE_DIR" "$EXISTING_RUNNER_DIR_RAW" "$existing_canon" <<'PY'
+import os
+import shutil
+import sys
+
+stage_dir, existing_raw, existing_canon = sys.argv[1], sys.argv[2], sys.argv[3]
+stage_real = os.path.realpath(stage_dir)
+stage_prefix = stage_real.rstrip("/") + "/"
+prefixes = sorted({p.rstrip("/") + "/" for p in (existing_raw, existing_canon) if p}, key=len, reverse=True)
+
+def strip_prefix(path: str):
+    for pref in prefixes:
+        if path.startswith(pref):
+            return path[len(pref):]
+    return None
+
+def materialize(link_path: str, resolved: str):
+    if not os.path.exists(resolved):
+        return
+    os.unlink(link_path)
+    if os.path.isdir(resolved):
+        shutil.copytree(resolved, link_path, symlinks=False)
+    else:
+        shutil.copy2(resolved, link_path)
+
+for cur, dirnames, filenames in os.walk(stage_real, followlinks=False):
+    for name in dirnames + filenames:
+        p = os.path.join(cur, name)
+        if not os.path.islink(p):
+            continue
+        raw_link = os.readlink(p)
+        resolved = os.path.realpath(p)
+        rel = strip_prefix(raw_link) or strip_prefix(resolved)
+        if rel is not None:
+            candidate = os.path.join(stage_real, rel)
+            if os.path.lexists(candidate):
+                new_rel = os.path.relpath(candidate, start=os.path.dirname(os.path.abspath(p)))
+                os.unlink(p)
+                os.symlink(new_rel, p)
+            else:
+                materialize(p, resolved)
+        elif not resolved.startswith(stage_prefix) and resolved != stage_real:
+            materialize(p, resolved)
+PY
   else
     echo "Downloading actions-runner v${RUNNER_VERSION} (osx-arm64)..."
     TMP_TGZ="$(mktemp)"
@@ -885,6 +1037,32 @@ if [ "$needs_config" -eq 0 ]; then
 fi
 
 if [ "$needs_config" -eq 1 ]; then
+  prev_agent_id=""
+  if [ -f "${RUNNER_DIR}/.runner" ]; then
+    raw_prev_agent_id="$(jq -r '.agentId // empty' "${RUNNER_DIR}/.runner" 2>/dev/null || true)"
+    if [[ "$raw_prev_agent_id" =~ ^[0-9]+$ ]] && [ "$raw_prev_agent_id" -gt 0 ]; then
+      prev_agent_id="$raw_prev_agent_id"
+    fi
+  fi
+
+  # Authority: safe --replace collision guard per operator ask (2026-11-18, #L16) and origin/main:AGENTS.md:246-247 (self-outage prevention: never hijack another host's runner registration).
+  if ! pre_runners_pages="$("$GH_BIN" api --paginate "$RUNNERS_API" 9>&-)"; then
+    echo "ERROR: failed to query live runners from $RUNNERS_API before configuration" >&2
+    exit 1
+  fi
+  colliding_ids="$(printf '%s\n' "$pre_runners_pages" | jq -sr --arg name "$RUNNER_NAME" '[.[].runners[]? | select(.name == $name) | (.id | tostring)] | unique | join(",")')"
+  use_replace=0
+  if [ -n "$colliding_ids" ]; then
+    if [ "$FORCE_REPLACE_NAME" -eq 1 ]; then
+      use_replace=1
+    elif [ -n "$prev_agent_id" ] && [ "$colliding_ids" = "$prev_agent_id" ]; then
+      use_replace=1
+    else
+      echo "ERROR: live runner '${RUNNER_NAME}' (id=${colliding_ids}) already exists on GitHub (${RUNNERS_API}) while local .runner agentId is '${prev_agent_id:-<none>}'; refusing --replace to avoid colliding with another host's runner (pass --force-replace-name to override)" >&2
+      exit 6
+    fi
+  fi
+
   reg_token="$("$GH_BIN" api -X POST "$TOKEN_API" --jq '.token' 9>&-)"
   [ -n "$reg_token" ] || { echo "ERROR: failed to mint registration token from $TOKEN_API" >&2; exit 3; }
   if ! stop_launchagent; then
@@ -908,17 +1086,18 @@ if [ "$needs_config" -eq 1 ]; then
     config_args=(
       --unattended
       --url "$RUNNER_URL"
-      --token "$reg_token"
       --name "$RUNNER_NAME"
       --work "$WORK_DIR"
       --labels "$RUNNER_LABELS"
       --no-default-labels
-      --replace
     )
+    if [ "$use_replace" -eq 1 ]; then
+      config_args+=(--replace)
+    fi
     if [ -n "$RUNNER_GROUP" ]; then
       config_args+=(--runnergroup "$RUNNER_GROUP")
     fi
-    ./config.sh "${config_args[@]}" 9>&-
+    ACTIONS_RUNNER_INPUT_TOKEN="$reg_token" ./config.sh "${config_args[@]}" 9>&-
   ) || config_rc=$?
 
   if [ "$config_rc" -ne 0 ]; then
