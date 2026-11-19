@@ -66,7 +66,10 @@ STUB
 # (GitHub's ubuntu runner runs a real dockerd, this Mac has no /var/run/docker.pid).
 cat > "$W/bin/systemctl" <<'STUB'
 #!/usr/bin/env bash
-exit 1
+# Default: no bus, nothing to report. SYSTEMCTL_OUT/SYSTEMCTL_RC let a case
+# simulate a real unit verdict ("active"/"failed").
+printf '%s\n' "${SYSTEMCTL_OUT:-}"
+exit "${SYSTEMCTL_RC:-1}"
 STUB
 cat > "$W/bin/pgrep" <<'STUB'
 #!/usr/bin/env bash
@@ -297,21 +300,58 @@ run stale_disk_seq 25 DOCKER_INFO_RC=0 DOCKER_PS_N=20
 grep -q 'DISK DEGRADED 0m' "$W/err-stale_disk_seq" || { cat "$W/err-stale_disk_seq" >&2; fail "the new breach must report a fresh (0m) window"; }
 pass "a stale disk_breach_since is cleared by a disk-healthy poll"
 
-# ── 18. DOWN -> PROBE -> healthy still reports the fleet recovery ──────────
-# Review finding 3: persisting PROBE overwrote an outstanding DOWN and swallowed
-# its RECOVERED entry, so the fleet recovery was never reported.
+# ── 18. DOWN -> PROBE -> healthy: carry the recovery, then emit it once ────
+# Review finding: a RECOVERED entry on a poll that could not observe the fleet is
+# a false all-clear. The cause must be CARRIED through the probe poll and emitted
+# by the first known-healthy poll, exactly once.
 seed_state down_then_probe DOWN 0
 run down_then_probe 81 DOCKER_INFO_RC=1 HEALTH_ALERT_DOCKERD_ALIVE=1
-grep -q '"status":"RECOVERED", "cause":"fleet"' "$(log_of down_then_probe)" \
-  || { cat "$(log_of down_then_probe)" "$W/err-down_then_probe" >&2; fail "DOWN -> PROBE must emit the outstanding fleet RECOVERED entry"; }
-[ "$(errors down_then_probe)" = 0 ] || fail "the recovery of a fleet outage must not page"
-# And the healed probe still reports its own recovery, without duplicating fleet.
+[ "$(grep -c '"status":"RECOVERED"' "$(log_of down_then_probe)")" = 0 ] \
+  || { cat "$(log_of down_then_probe)" >&2; fail "an unobserved probe poll must not emit any RECOVERED entry"; }
+grep -q '"pending_recovery":"fleet"' "$(state_file down_then_probe)" \
+  || { cat "$(state_file down_then_probe)" >&2; fail "the fleet recovery must be carried in the state file, not emitted"; }
+# The healed poll is the first healthy observation: it settles the obligation.
 run down_then_probe 81 DOCKER_INFO_RC=0 DOCKER_PS_N=20
+grep -q '"status":"RECOVERED", "cause":"fleet"' "$(log_of down_then_probe)" \
+  || { cat "$(log_of down_then_probe)" "$W/err-down_then_probe" >&2; fail "the first known-healthy poll must emit the carried fleet RECOVERED entry"; }
 grep -q '"status":"RECOVERED", "cause":"probe"' "$(log_of down_then_probe)" \
   || { cat "$(log_of down_then_probe)" >&2; fail "PROBE -> healthy must still emit RECOVERED cause=probe"; }
-[ "$(grep -c '\"status\":\"RECOVERED\", \"cause\":\"fleet\"' "$(log_of down_then_probe)")" = 1 ] \
+[ "$(grep -c '"status":"RECOVERED", "cause":"fleet"' "$(log_of down_then_probe)")" = 1 ] \
   || { cat "$(log_of down_then_probe)" >&2; fail "the fleet recovery must be emitted exactly once"; }
-pass "DOWN -> PROBE -> healthy reports both recoveries exactly once"
+grep -q '"pending_recovery":""' "$(state_file down_then_probe)" \
+  || { cat "$(state_file down_then_probe)" >&2; fail "a settled obligation must be cleared from the state file"; }
+# And it must not be re-emitted by a later healthy poll.
+run down_then_probe 81 DOCKER_INFO_RC=0 DOCKER_PS_N=20
+[ "$(grep -c '"status":"RECOVERED"' "$(log_of down_then_probe)")" = 2 ] \
+  || { cat "$(log_of down_then_probe)" >&2; fail "a later healthy poll must not re-emit recoveries"; }
+pass "DOWN -> PROBE -> healthy carries the fleet recovery and emits it once"
+
+# ── 20. PID identity must be the daemon, not the CLI or a substring ───────
+# comm=docker is the CLI client; a cmdline that merely mentions dockerd is not
+# the daemon either. Both must be rejected (review finding: identity too weak).
+mkdir -p "$W/proc/5151"
+echo "docker" > "$W/proc/5151/comm"
+printf 'docker\0ps\0--filter\0label=dockerd\0' > "$W/proc/5151/cmdline"
+echo "5151" > "$W/pidfile-cli"
+run pid_cli 81 DOCKER_INFO_RC=1 HEALTH_ALERT_DOCKER_PIDFILE="$W/pidfile-cli" HEALTH_ALERT_PROC_ROOT="$W/proc"
+[ "$(probe_entries pid_cli)" = 0 ] || { cat "$(log_of pid_cli)" >&2; fail "the docker CLI client is not a daemon liveness signal"; }
+[ "$(errors pid_cli)" = 1 ] || { cat "$(log_of pid_cli)" >&2; fail "rejecting a CLI pid must stay fail-closed"; }
+pass "the docker CLI client and cmdline substrings are not accepted as daemon identity"
+
+# ── 21. A positive systemctl verdict is honoured as liveness ──────────────
+# Review finding: a bounded is-active that reports the unit active must count as
+# alive even when pgrep finds nothing; only an unreadable result falls through.
+run systemctl_active 81 DOCKER_INFO_RC=1 SYSTEMCTL_OUT=active SYSTEMCTL_RC=0
+[ "$(probe_entries systemctl_active)" = 1 ] || { cat "$(log_of systemctl_active)" "$W/err-systemctl_active" >&2; fail "an active docker unit must be honoured as a live daemon"; }
+[ "$(errors systemctl_active)" = 0 ] || fail "an active unit must not page"
+pass "a positive systemctl active verdict counts as liveness"
+
+# ── 22. ...and a failed unit still pages immediately ──────────────────────
+run systemctl_failed 81 DOCKER_INFO_RC=1 SYSTEMCTL_OUT=failed SYSTEMCTL_RC=3
+[ "$(errors systemctl_failed)" = 1 ] || { cat "$(log_of systemctl_failed)" >&2; fail "a failed docker unit must page"; }
+jq -e '.container_count == 0 and .container_count_known == true' "$(payload_of systemctl_failed)" > /dev/null \
+  || { jq . "$(payload_of systemctl_failed)" >&2; fail "a confirmed-dead daemon reports a known 0"; }
+pass "a failed docker unit keeps the immediate fail-closed page"
 
 # ── 19. Liveness calls are bounded (static) ────────────────────────────────
 # Review finding 5: an unbounded pgrep/systemctl would stall the script under

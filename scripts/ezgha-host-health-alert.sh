@@ -270,16 +270,18 @@ PROBE_NOTE=""
 # finding 1 - an unchecked /proc/<pid> is PID-reuse, not liveness). Require the
 # process identity to be dockerd before the pidfile counts as positive evidence.
 dockerd_pid_is_dockerd() { # pid
-  local p="$1" comm=""
+  local p="$1" comm="" argv0=""
   [ -r "$PROC_ROOT/$p/comm" ] || return 1
   read -r comm < "$PROC_ROOT/$p/comm" 2>/dev/null || return 1
-  case "$comm" in
-    dockerd|docker|dockerd-current) return 0 ;;
-  esac
-  # A daemon started from a renamed/execed path still carries `dockerd` in
-  # argv[0], so fall back to the command line before giving up.
+  # Exact daemon name only: `docker` is the CLI client, not the daemon.
+  [ "$comm" = "dockerd" ] && return 0
+  # Otherwise the executable identity must be dockerd: argv[0]'s basename, not a
+  # substring anywhere in the command line (a CLI invocation mentioning dockerd,
+  # or `sh -c 'echo dockerd'`, must not pass).
   [ -r "$PROC_ROOT/$p/cmdline" ] || return 1
-  tr '\0' ' ' < "$PROC_ROOT/$p/cmdline" 2>/dev/null | grep -q 'dockerd'
+  argv0=$(tr '\0' '\n' < "$PROC_ROOT/$p/cmdline" 2>/dev/null | head -1)
+  [ "${argv0##*/}" = "dockerd" ] && return 0
+  return 1
 }
 
 dockerd_probe_state() {
@@ -300,10 +302,14 @@ dockerd_probe_state() {
   # this change adds (review finding 5).
   if timeout "$LIVENESS_TIMEOUT_SEC" pgrep -x dockerd >/dev/null 2>&1; then echo alive; return 0; fi
   if command -v systemctl >/dev/null 2>&1; then
-    if timeout "$LIVENESS_TIMEOUT_SEC" systemctl is-active --quiet docker 2>/dev/null; then echo alive; return 0; fi
+    # ONE bounded call, and its TEXT is the verdict: a positive `active` result
+    # must be honoured as liveness. Asking `--quiet` first meant a timeout or an
+    # inconclusive exit could drop a genuinely active unit into `unknown` and page
+    # immediately (review finding 3). Only an unreadable result falls through.
     unit=$(timeout "$LIVENESS_TIMEOUT_SEC" systemctl is-active docker 2>/dev/null || true)
     case "$unit" in
-      inactive|failed) echo down; return 0 ;;
+      active|activating|reloading) echo alive; return 0 ;;
+      inactive|failed|deactivating) echo down; return 0 ;;
     esac
   fi
   # No source answered (no systemd bus, no pid, nothing): unknown. The caller
@@ -563,6 +569,7 @@ PREV_LAST_SENT_FLEET=0
 PREV_LAST_SENT_DISK=0
 PREV_DISK_SINCE=0
 PREV_PROBE_SINCE=0
+PREV_PENDING=""
 read_state() { # file
   local f="$1"
   [ -f "$f" ] || return 0
@@ -571,11 +578,13 @@ read_state() { # file
   PREV_LAST_SENT_DISK=$(sed -n 's/.*"last_sent_disk":[[:space:]]*\([0-9]*\).*/\1/p' "$f" 2>/dev/null | head -1)
   PREV_DISK_SINCE=$(sed -n 's/.*"disk_breach_since":[[:space:]]*\([0-9]*\).*/\1/p' "$f" 2>/dev/null | head -1)
   PREV_PROBE_SINCE=$(sed -n 's/.*"probe_indeterminate_since":[[:space:]]*\([0-9]*\).*/\1/p' "$f" 2>/dev/null | head -1)
+  PREV_PENDING=$(sed -n 's/.*"pending_recovery":[[:space:]]*"\([^"]*\)".*/\1/p' "$f" 2>/dev/null | head -1)
   PREV_STATUS="${PREV_STATUS:-OK}"
   PREV_LAST_SENT_FLEET="${PREV_LAST_SENT_FLEET:-0}"
   PREV_LAST_SENT_DISK="${PREV_LAST_SENT_DISK:-0}"
   PREV_DISK_SINCE="${PREV_DISK_SINCE:-0}"
   PREV_PROBE_SINCE="${PREV_PROBE_SINCE:-0}"
+  PREV_PENDING="${PREV_PENDING:-}"
 }
 read_state "$STATE_FILE"
 if [ ! -f "$STATE_FILE" ]; then
@@ -590,10 +599,10 @@ fi
 
 save_state() { # status last_sent_fleet last_sent_disk disk_since
   # probe_indeterminate_since is read from PROBE_SINCE (set in the escalation
-  # block below) rather than passed positionally, so the probe window survives
-  # every branch without touching seven existing call sites.
-  printf '{"status":"%s", "last_sent_fleet":%s, "last_sent_disk":%s, "disk_breach_since":%s, "probe_indeterminate_since":%s, "updated_at":"%s"}\n' \
-    "$1" "$2" "$3" "$4" "${PROBE_SINCE:-0}" "$NOW_ISO" > "$STATE_FILE"
+  # block below) and pending_recovery from PENDING_NEXT, rather than passed
+  # positionally, so both survive every branch without touching eight call sites.
+  printf '{"status":"%s", "last_sent_fleet":%s, "last_sent_disk":%s, "disk_breach_since":%s, "probe_indeterminate_since":%s, "pending_recovery":"%s", "updated_at":"%s"}\n' \
+    "$1" "$2" "$3" "$4" "${PROBE_SINCE:-0}" "${PENDING_NEXT:-}" "$NOW_ISO" > "$STATE_FILE"
 }
 
 emit() { # severity payload-json
@@ -632,6 +641,58 @@ if [ "$PROBE_INDETERMINATE" -eq 1 ]; then
 else
   PROBE_SINCE=0
 fi
+
+# ── Pending recovery obligations ────────────────────────────────────────────
+# A RECOVERED entry is only truthful for an OBSERVED healthy fleet. When a paged
+# state ends during a poll that could not observe the fleet (probe
+# indeterminate), emitting the recovery there is a false all-clear. Carry the
+# cause in the state file instead and recover on the first known-healthy poll,
+# exactly once.
+recovery_causes_for() { # previous status -> zero or more cause names
+  case "$1" in
+    DOWN|FAIL) echo fleet ;;
+  esac
+  case "$1" in
+    DISK|DEGRADED|FAIL) echo disk ;;
+  esac
+  case "$1" in
+    PEER) echo peer ;;
+  esac
+  case "$1" in
+    PROBE) echo probe ;;
+  esac
+}
+join_unique() { # de-duplicated space-separated list (bash 3.2 safe)
+  local out="" c
+  for c in "$@"; do
+    [ -n "$c" ] || continue
+    case " $out " in *" $c "*) continue ;; esac
+    out="${out:+$out }$c"
+  done
+  printf '%s' "$out"
+}
+PENDING_ITEMS=()
+if [ -n "$PREV_PENDING" ]; then
+  OLD_IFS="$IFS"
+  IFS=','
+  for c in $PREV_PENDING; do [ -n "$c" ] && PENDING_ITEMS+=("$c"); done
+  IFS="$OLD_IFS"
+fi
+while IFS= read -r c; do [ -n "$c" ] && PENDING_ITEMS+=("$c"); done < <(recovery_causes_for "$PREV_STATUS")
+PENDING_CARRY=$(join_unique ${PENDING_ITEMS[@]+"${PENDING_ITEMS[@]}"})
+# Default for every branch that did not observe a healthy fleet: the obligation
+# stays outstanding, so the state file carries it to the next poll.
+PENDING_NEXT="$PENDING_CARRY"
+
+emit_pending_recoveries() { # emit each outstanding cause exactly once
+  [ -n "$PENDING_CARRY" ] || return 0
+  local c
+  for c in $PENDING_CARRY; do
+    REC_PAYLOAD=$(printf '{"host":"%s", "platform":"%s", "status":"RECOVERED", "cause":"%s", "container_count":%d, "free_gb":%d, "ts":"%s"}' \
+      "$HOST" "$PLATFORM" "$c" "$CONTAINER_COUNT" "$FREE_GB" "$NOW_ISO")
+    emit INFO "$REC_PAYLOAD"
+  done
+}
 
 FLEET_COUNT=${#FLEET_FAILS[@]}
 DISK_COUNT=${#DISK_FAILS[@]}
@@ -779,28 +840,10 @@ if [ "$PROBE_INDETERMINATE" -eq 1 ]; then
   echo "[$NOW_ISO] PROBE INDETERMINATE ${PROBE_MIN}m on $HOST (dockerd active, container count unknown, ${FREE_GB}GB free): $PROBE_NOTE — WARNING cause=probe, not a fleet outage" >&2
   PROBE_CHECKS=("$PROBE_NOTE")
   if [ -n "${OPERATIONAL_NOTE:-}" ]; then PROBE_CHECKS+=("$OPERATIONAL_NOTE"); fi
-  # Outstanding recovery obligation. This poll saw no fleet/disk/peer failure, so
-  # a previously paged state has ENDED even though the docker probe is still
-  # indeterminate. Persisting PROBE used to overwrite an outstanding DOWN without
-  # emitting its RECOVERED entry, so DOWN -> PROBE -> healthy reported only
-  # cause=probe and the fleet recovery was lost (review finding 3). Emit the
-  # outstanding recoveries before recording PROBE; the next poll has
-  # PREV_STATUS=PROBE, so this cannot duplicate.
-  OUTSTANDING_RECOVERY=()
-  case "$PREV_STATUS" in
-    DOWN|FAIL) OUTSTANDING_RECOVERY+=("fleet") ;;
-  esac
-  case "$PREV_STATUS" in
-    DISK|DEGRADED|FAIL) OUTSTANDING_RECOVERY+=("disk") ;;
-  esac
-  case "$PREV_STATUS" in
-    PEER) OUTSTANDING_RECOVERY+=("peer") ;;
-  esac
-  for cause in ${OUTSTANDING_RECOVERY[@]+"${OUTSTANDING_RECOVERY[@]}"}; do
-    REC_PAYLOAD=$(printf '{"host":"%s", "platform":"%s", "status":"RECOVERED", "cause":"%s", "container_count":%d, "free_gb":%d, "ts":"%s"}' \
-      "$HOST" "$PLATFORM" "$cause" "$CONTAINER_COUNT" "$FREE_GB" "$NOW_ISO")
-    emit INFO "$REC_PAYLOAD"
-  done
+  # NO recovery is emitted here: this poll could not observe the fleet, so an
+  # all-clear would be unearned. Any outstanding cause stays in PENDING_NEXT
+  # (the default for this branch) and is recovered by the first known-healthy
+  # poll.
   if [ "$PREV_STATUS" != "PROBE" ]; then
     PAYLOAD=$(printf '{"host":"%s", "platform":"%s", "status":"DEGRADED", "cause":"probe", "severity":"WARNING", "failed_checks":%s, "container_count":%d, "container_count_known":false, "probe_indeterminate_min":%d, "probe_page_after_min":%d, "free_gb":%d, "ts":"%s"}' \
       "$HOST" "$PLATFORM" "$(json_checks "${PROBE_CHECKS[@]}")" "$CONTAINER_COUNT" "$PROBE_MIN" "$PROBE_PAGE_AFTER_MIN" "$FREE_GB" "$NOW_ISO")
@@ -822,21 +865,12 @@ if [ -n "${OPERATIONAL_NOTE:-}" ]; then
   # DOWN -> NOTE -> OK emitted no RECOVERED for either transition, so an outage
   # that cleared while a note was showing was never reported as recovered.
   # Emit the outstanding recovery first, then record the note state.
-  case "$PREV_STATUS" in
-    DOWN|FAIL|DISK|DEGRADED|PEER|PROBE)
-      echo "[$NOW_ISO] Host $HOST recovered (while noting an operational transient); emitting recovery log to GCP..."
-      RECOVERY_CAUSES=()
-      case "$PREV_STATUS" in DOWN|FAIL) RECOVERY_CAUSES+=("fleet") ;; esac
-      case "$PREV_STATUS" in DISK|DEGRADED|FAIL) RECOVERY_CAUSES+=("disk") ;; esac
-      case "$PREV_STATUS" in PEER) RECOVERY_CAUSES+=("peer") ;; esac
-      case "$PREV_STATUS" in PROBE) RECOVERY_CAUSES+=("probe") ;; esac
-      for cause in ${RECOVERY_CAUSES[@]+"${RECOVERY_CAUSES[@]}"}; do
-        REC_PAYLOAD=$(printf '{"host":"%s", "platform":"%s", "status":"RECOVERED", "cause":"%s", "container_count":%d, "free_gb":%d, "ts":"%s"}' \
-          "$HOST" "$PLATFORM" "$cause" "$CONTAINER_COUNT" "$FREE_GB" "$NOW_ISO")
-        emit INFO "$REC_PAYLOAD"
-      done
-      ;;
-  esac
+  if [ -n "$PENDING_CARRY" ]; then
+    echo "[$NOW_ISO] Host $HOST recovered (while noting an operational transient); emitting recovery log to GCP..."
+    emit_pending_recoveries
+  fi
+  # The fleet was observed healthy on this poll, so nothing stays outstanding.
+  PENDING_NEXT=""
   if [ "$PREV_STATUS" != "NOTE" ]; then
     PAYLOAD=$(printf '{"host":"%s", "platform":"%s", "status":"DEGRADED", "cause":"operational", "severity":"WARNING", "failed_checks":%s, "container_count":%d, "free_gb":%d, "ts":"%s"}' \
       "$HOST" "$PLATFORM" "$(json_checks "$OPERATIONAL_NOTE")" "$CONTAINER_COUNT" "$FREE_GB" "$NOW_ISO")
@@ -846,27 +880,14 @@ if [ -n "${OPERATIONAL_NOTE:-}" ]; then
   exit 0
 fi
 
-if [ "$PREV_STATUS" = "DOWN" ] || [ "$PREV_STATUS" = "FAIL" ] || [ "$PREV_STATUS" = "DISK" ] || [ "$PREV_STATUS" = "DEGRADED" ] || [ "$PREV_STATUS" = "PEER" ] || [ "$PREV_STATUS" = "PROBE" ]; then
+if [ -n "$PENDING_CARRY" ]; then
   echo "[$NOW_ISO] Host $HOST and peer have recovered! Emitting recovery log to GCP..."
-  RECOVERED_CAUSES=()
-  case "$PREV_STATUS" in
-    DOWN|FAIL) RECOVERED_CAUSES+=("fleet") ;;
-  esac
-  case "$PREV_STATUS" in
-    DISK|DEGRADED|FAIL) RECOVERED_CAUSES+=("disk") ;;
-  esac
-  case "$PREV_STATUS" in
-    PEER) RECOVERED_CAUSES+=("peer") ;;
-  esac
-  case "$PREV_STATUS" in
-    PROBE) RECOVERED_CAUSES+=("probe") ;;
-  esac
-  for cause in "${RECOVERED_CAUSES[@]}"; do
-    PAYLOAD=$(printf '{"host":"%s", "platform":"%s", "status":"RECOVERED", "cause":"%s", "container_count":%d, "free_gb":%d, "ts":"%s"}' \
-      "$HOST" "$PLATFORM" "$cause" "$CONTAINER_COUNT" "$FREE_GB" "$NOW_ISO")
-    emit INFO "$PAYLOAD"
-  done
+  # Emits every cause this host still owes (previous status plus anything carried
+  # through an unobserved poll), each exactly once.
+  emit_pending_recoveries
 fi
 
+# A known-healthy observation settles every outstanding obligation.
+PENDING_NEXT=""
 save_state "OK" 0 0 0
 exit 0
