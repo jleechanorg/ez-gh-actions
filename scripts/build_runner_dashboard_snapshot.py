@@ -277,9 +277,11 @@ def _public_cmux(payload):
     if not isinstance(payload, dict) or payload.get("ok") is not True:
         return _empty_cmux()
     try:
-        vms = []
         raw_vms = payload.get("vms")
-        for idx, vm in enumerate(raw_vms if isinstance(raw_vms, list) else [], start=1):
+        if not isinstance(raw_vms, list):
+            return _empty_cmux()
+        vms = []
+        for idx, vm in enumerate(raw_vms, start=1):
             if not isinstance(vm, dict):
                 continue
             anon_vm_id = f"cloud-vm-{idx}"

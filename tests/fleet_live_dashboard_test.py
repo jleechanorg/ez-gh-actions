@@ -1474,6 +1474,113 @@ class FleetLiveDashboardTest(unittest.TestCase):
         self.assertEqual([s["state"] for s in mac_slots], ["PARKED", "PARKED"])
         self.assertIn("MAC_RUNNER_DISABLED=1", mac_slots[0]["reason"])
 
+    def test_live_cmux_failure_and_local_ssh_disk_floor_pause(self):
+        import os
+        import subprocess
+        from types import SimpleNamespace
+        from unittest import mock
+
+        mod = load_module()
+        # 1) Live cmux probe returning {"ok": false} or invalid JSON/schema with SSH Linux present must set scope_note + hosts_partial
+        fake_linux_host = {
+            "display_name": "jeff-ubuntu (Remote Linux Host)",
+            "group": "jeff-ubuntu",
+            "admission_status": "active",
+            "admission_message": None,
+            "disk": {"avail": "80.0G", "total": "200.0G", "use_pct": "60%", "min_free_disk_gb_floor": 30},
+            "load_average": [1.0, 1.0, 1.0],
+            "configured_slots": 1,
+            "slots": [{"slot": 1, "name": "ez-runner-c-1", "state": "EXECUTING", "elapsed_minutes": 2.0, "active_child_commands": ["pytest"]}],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            tmp = Path(directory)
+            gh_p = tmp / "gh.json"
+            lat_p = tmp / "lat.json"
+            gh_p.write_text(json.dumps({"summary": {}}), encoding="utf-8")
+            lat_p.write_text(json.dumps({"ok": True, "overall": {}, "workflows": []}), encoding="utf-8")
+            for cmux_stdout in ('{"ok": false, "error": "unavailable"}', '{"unexpected": 1}'):
+                def fake_cmux_run(cmd, **kwargs):
+                    return subprocess.CompletedProcess(cmd, 0, stdout=cmux_stdout, stderr="")
+
+                with mock.patch.object(mod, "_collect_local_host_slots", return_value={"generated_at_utc": "2026-11-18T10:00:00Z", "hosts": {}}), \
+                     mock.patch.object(mod, "_collect_remote_linux_slot_payload", return_value=fake_linux_host), \
+                     mock.patch.object(mod.subprocess, "run", side_effect=fake_cmux_run):
+                    st = mod.build_operator_state(
+                        github_json=str(gh_p),
+                        latency_json=str(lat_p),
+                        linux_host="jeff-ubuntu",
+                        cmux_cmd="probe-cmux",
+                    )
+                self.assertTrue(st["reconciliation"]["hosts_partial"])
+                self.assertIn("cmux-cloud (probe failed", st["reconciliation"]["scope_note"])
+                self.assertTrue(any("cmux live probe failed" in e for e in st["reconciliation"]["gh_errors"]))
+
+        # 2) Both local and SSH Linux probes must emit PAUSED_DISK_FLOOR when disk < min_free_disk_gb (distinct from generic container missing)
+        low_usage = SimpleNamespace(total=200 * (1024 ** 3), used=188 * (1024 ** 3), free=12 * (1024 ** 3))
+        ok_usage = SimpleNamespace(total=200 * (1024 ** 3), used=80 * (1024 ** 3), free=120 * (1024 ** 3))
+
+        def fake_linux_docker(cmd, **kwargs):
+            if cmd[:2] == ["docker", "ps"]:
+                return subprocess.CompletedProcess(cmd, 0, stdout="ez-runner-c-1\tUp 4 minutes \xff\n", stderr="")
+            if cmd[:2] == ["docker", "top"]:
+                return subprocess.CompletedProcess(cmd, 0, stdout="PID ELAPSED COMMAND\n101 120 Runner.Worker /bin/Runner.Worker\n", stderr="")
+            if cmd[:2] == ["systemctl", "--user"]:
+                return subprocess.CompletedProcess(cmd, 0, stdout="active\n", stderr="")
+            raise AssertionError(f"unexpected cmd: {cmd}")
+
+        with mock.patch.object(mod.platform, "system", return_value="Linux"), \
+             mock.patch.object(mod, "_read_local_ezgha_config", return_value={"count": 2, "name_prefix": "ez-runner-c", "min_free_disk_gb": 30}), \
+             mock.patch.object(mod.shutil, "disk_usage", return_value=low_usage), \
+             mock.patch.object(mod.subprocess, "run", side_effect=fake_linux_docker):
+            paused_local = mod._collect_local_host_slots()
+        paused_host = next(iter(paused_local["hosts"].values()))
+        self.assertEqual(paused_host["admission_status"], "PAUSED_DISK_FLOOR")
+        self.assertIn("12.0G < 30G", paused_host["admission_message"])
+        self.assertEqual(paused_host["slots"][1]["state"], "DOWN")
+        self.assertIn("disk-floor admission pause", paused_host["slots"][1]["reason"])
+
+        with mock.patch.object(mod.platform, "system", return_value="Linux"), \
+             mock.patch.object(mod, "_read_local_ezgha_config", return_value={"count": 2, "name_prefix": "ez-runner-c", "min_free_disk_gb": 30}), \
+             mock.patch.object(mod.shutil, "disk_usage", return_value=ok_usage), \
+             mock.patch.object(mod.subprocess, "run", side_effect=fake_linux_docker):
+            healthy_local = mod._collect_local_host_slots()
+        healthy_host = next(iter(healthy_local["hosts"].values()))
+        self.assertEqual(healthy_host["admission_status"], "active")
+        self.assertEqual(healthy_host["slots"][1]["reason"], "container missing")
+
+        # SSH path: execute generated _REMOTE_PROBE_PY with low disk floor and feed into _collect_remote_linux_slot_payload
+        with tempfile.TemporaryDirectory() as directory:
+            tmp = Path(directory)
+            cfg_dir = tmp / ".config" / "ezgha"
+            cfg_dir.mkdir(parents=True)
+            (cfg_dir / "config.toml").write_text('[runner]\ncount = 2\nname_prefix = "ez-runner-c"\n', encoding="utf-8")
+            bin_dir = tmp / "bin"
+            bin_dir.mkdir()
+            fake_docker = bin_dir / "docker"
+            fake_docker.write_text(
+                "#!/usr/bin/env python3\nimport sys\nargs = sys.argv[1:]\n"
+                "if args[:1] == ['ps']: print('ez-runner-c-1\\tUp 4 minutes')\n"
+                "elif args[:1] == ['top']: print('PID ELAPSED COMMAND\\n101 120 Runner.Worker /bin/Runner.Worker')\n",
+                encoding="utf-8",
+            )
+            fake_docker.chmod(0o755)
+            ns = {}
+            # Patch shutil.disk_usage inside an in-process run of the exact _REMOTE_PROBE_PY source
+            env = dict(os.environ, HOME=str(tmp), PATH=f"{bin_dir}:{os.environ.get('PATH', '')}")
+            remote_script = mod._REMOTE_PROBE_PY.replace(
+                "print(json.dumps(_probe_docker_host_core(is_mac=False)))",
+                "print(json.dumps(_probe_docker_host_core(is_mac=False, disk_usage_fn=lambda _p: type('U', (), {'total': 200*(1024**3), 'used': 188*(1024**3), 'free': 12*(1024**3)})())))",
+            )
+            proc = subprocess.run(["python3", "-c", remote_script], capture_output=True, text=True, check=True, env=env)
+            with mock.patch.object(mod.subprocess, "run", return_value=subprocess.CompletedProcess(["ssh"], 0, stdout=proc.stdout, stderr="")):
+                remote_host = mod._collect_remote_linux_slot_payload("jeff-ubuntu")
+        self.assertEqual(remote_host["admission_status"], "PAUSED_DISK_FLOOR")
+        self.assertIn("12.0G < 30G", remote_host["admission_message"])
+        self.assertIn("disk-floor admission pause", remote_host["slots"][1]["reason"])
+        norm_hosts = mod._normalize_hosts({"hosts": {"jeff-ubuntu": remote_host}}, None, {"all_in_progress_jobs": []})
+        self.assertEqual(norm_hosts[0]["status"], "PAUSED_DISK_FLOOR")
+        self.assertEqual(norm_hosts[0]["slots"][1]["phase_badge"], "disk_floor_paused")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

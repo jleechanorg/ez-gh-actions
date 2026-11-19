@@ -12,6 +12,7 @@ import argparse
 import datetime
 import html as html_lib
 import http.server
+import inspect
 import json
 import math
 import os
@@ -36,6 +37,7 @@ import queue_probe  # noqa: E402
 _LIVE_LATENCY_CACHE = {"key": None, "ts": 0.0, "data": None}
 _LIVE_LATENCY_TTL_S = 300.0
 MAX_LIVE_REPOS = 3
+DEFAULT_MIN_FREE_DISK_GB = 30
 
 
 def _cap_live_repos(repos):
@@ -893,12 +895,12 @@ def _normalize_latency(latency_raw, errors=None):
 
 def _read_local_ezgha_config(config_path=None):
     path = Path(config_path) if config_path else (Path.home() / ".config" / "ezgha" / "config.toml")
+    out = {"count": None, "name_prefix": None, "min_free_disk_gb": DEFAULT_MIN_FREE_DISK_GB}
     if not path.is_file():
-        return {"count": None, "name_prefix": None, "min_free_disk_gb": None}
+        return out
     section = None
-    out = {"count": None, "name_prefix": None, "min_free_disk_gb": None}
     try:
-        for raw in path.read_text(encoding="utf-8").splitlines():
+        for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
             line = raw.split("#", 1)[0].strip()
             if not line:
                 continue
@@ -919,10 +921,11 @@ def _read_local_ezgha_config(config_path=None):
     return out
 
 
-def _probe_local_service_status(is_mac):
+def _probe_local_service_status(is_mac, run_fn=None):
+    run = run_fn or subprocess.run
     try:
         if is_mac:
-            proc = subprocess.run(["launchctl", "list"], capture_output=True, text=True, timeout=5)
+            proc = run(["launchctl", "list"], capture_output=True, text=True, timeout=5, errors="replace")
             if proc.returncode != 0:
                 return "unknown"
             for line in proc.stdout.splitlines():
@@ -932,9 +935,9 @@ def _probe_local_service_status(is_mac):
                         return "active"
                     return "failed" if parts[1].isdigit() and int(parts[1]) != 0 else "inactive"
             return "not-loaded"
-        proc = subprocess.run(
+        proc = run(
             ["systemctl", "--user", "is-active", "ezgha.service"],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True, text=True, timeout=5, errors="replace",
         )
         return proc.stdout.strip() or ("active" if proc.returncode == 0 else "inactive")
     except (OSError, subprocess.TimeoutExpired):
@@ -973,7 +976,7 @@ def _collect_local_native_runners():
     is_mac = platform.system().lower() == "darwin"
     cmd = ["ps", "-axo", "pid=,etime=,args="] if is_mac else ["ps", "-eo", "pid=,etimes=,args="]
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=5, errors="replace")
         if proc.returncode != 0:
             return native
         by_dir = {}
@@ -1002,22 +1005,23 @@ def _collect_local_native_runners():
     return native
 
 
-def _collect_local_host_slots():
-    """Collect real local ezgha runner slots via docker ps/top when no audit-dir is supplied."""
-    now_utc = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    hostname = socket.gethostname()
-    is_mac = platform.system().lower() == "darwin"
-    host_key = "mac" if is_mac else hostname
-    cfg = _read_local_ezgha_config()
-    service_status = _probe_local_service_status(is_mac)
-    mac_disabled = is_mac and (
-        os.environ.get("MAC_RUNNER_DISABLED") == "1"
-        or os.environ.get("EZGHA_DASHBOARD_MAC_DISABLED") == "1"
-    )
+def _probe_docker_host_core(*, is_mac=False, mac_disabled=False, cfg=None, service_status=None,
+                            hostname=None, run_fn=None, disk_usage_fn=None, loadavg_fn=None):
+    """Shared local/SSH Docker runner + disk-floor + load probe."""
+    run = run_fn or subprocess.run
+    disk_usage = disk_usage_fn or shutil.disk_usage
+    get_loadavg = loadavg_fn or os.getloadavg
+    cfg = cfg if isinstance(cfg, dict) else _read_local_ezgha_config()
+    if service_status is None:
+        service_status = _probe_local_service_status(is_mac, run_fn=run)
+    host_name = hostname or socket.gethostname()
 
+    raw_floor = cfg.get("min_free_disk_gb")
+    floor_gb = raw_floor if isinstance(raw_floor, int) and not isinstance(raw_floor, bool) else None
     disk_info = {}
+    free_gb = None
     try:
-        usage = shutil.disk_usage("/")
+        usage = disk_usage("/")
         free_gb = round(usage.free / (1024 ** 3), 1)
         total_gb = round(usage.total / (1024 ** 3), 1)
         use_pct = f"{round((usage.used / usage.total) * 100)}%" if usage.total else "?"
@@ -1025,7 +1029,7 @@ def _collect_local_host_slots():
             "avail": f"{free_gb}G",
             "total": f"{total_gb}G",
             "use_pct": use_pct,
-            "min_free_disk_gb_floor": cfg["min_free_disk_gb"] if cfg["min_free_disk_gb"] is not None else "unknown",
+            "min_free_disk_gb_floor": floor_gb if floor_gb is not None else "unknown",
         }
         if is_mac:
             disk_info["root_avail"] = f"{free_gb}G"
@@ -1034,17 +1038,25 @@ def _collect_local_host_slots():
 
     load_vals = []
     try:
-        load_vals = [round(x, 2) for x in os.getloadavg()]
+        load_vals = [round(x, 2) for x in get_loadavg()]
     except OSError:
         pass
+
+    disk_paused = (
+        not is_mac
+        and not mac_disabled
+        and isinstance(free_gb, (int, float))
+        and floor_gb is not None
+        and free_gb < floor_gb
+    )
 
     observed_by_name = {}
     ordered_names = []
     docker_ok = True
     try:
-        proc = subprocess.run(
+        proc = run(
             ["docker", "ps", "-a", "--filter", "label=ezgha=managed", "--format", "{{.Names}}\t{{.Status}}"],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True, text=True, timeout=10, errors="replace",
         )
         if proc.returncode == 0:
             for line in proc.stdout.splitlines():
@@ -1058,12 +1070,13 @@ def _collect_local_host_slots():
                 elapsed_min = None
                 reason = None
                 if cstatus.lower().startswith("up"):
+                    top = None
+                    top_timed_out = False
                     try:
-                        top = subprocess.run(
-                            ["docker", "top", cname, "-eo", "pid,etimes,comm,args"],
-                            capture_output=True, text=True, timeout=5,
-                        )
-                    except (OSError, subprocess.TimeoutExpired):
+                        top = run(["docker", "top", cname, "-eo", "pid,etimes,comm,args"], capture_output=True, text=True, timeout=10, errors="replace")
+                    except subprocess.TimeoutExpired:
+                        top_timed_out = True
+                    except OSError:
                         top = None
                     if top is not None and top.returncode == 0:
                         has_worker = False
@@ -1084,7 +1097,7 @@ def _collect_local_host_slots():
                         state = "EXECUTING" if has_worker else ("IDLE" if has_listener else "CYCLING")
                     else:
                         state = "UNKNOWN"
-                        reason = "docker top probe failed"
+                        reason = "docker top timeout" if top_timed_out else "docker top probe failed"
                 else:
                     if mac_disabled:
                         state = "PARKED"
@@ -1109,7 +1122,7 @@ def _collect_local_host_slots():
         docker_ok = False
 
     slots = []
-    if cfg["count"] and cfg["name_prefix"]:
+    if cfg.get("count") and cfg.get("name_prefix"):
         expected_names = [f"{cfg['name_prefix']}-{i}" for i in range(1, cfg["count"] + 1)]
         for idx, cname in enumerate(expected_names, start=1):
             if cname in observed_by_name:
@@ -1117,15 +1130,21 @@ def _collect_local_host_slots():
                 entry["slot"] = idx
                 slots.append(entry)
             else:
+                if mac_disabled:
+                    miss_reason = "operator disabled (MAC_RUNNER_DISABLED=1)"
+                elif disk_paused:
+                    miss_reason = f"respawn blocked by disk-floor admission pause ({free_gb}G free < {floor_gb}G floor)"
+                elif not docker_ok:
+                    miss_reason = "docker daemon unreachable"
+                else:
+                    miss_reason = "container missing"
                 slots.append({
                     "slot": idx,
                     "name": cname,
                     "state": "PARKED" if mac_disabled else "DOWN",
                     "elapsed_minutes": None,
                     "active_child_commands": [],
-                    "reason": "operator disabled (MAC_RUNNER_DISABLED=1)"
-                    if mac_disabled
-                    else ("docker daemon unreachable" if not docker_ok else "container missing"),
+                    "reason": miss_reason,
                 })
         for cname in ordered_names:
             if cname not in expected_names:
@@ -1138,7 +1157,52 @@ def _collect_local_host_slots():
             entry["slot"] = idx
             slots.append(entry)
 
-    configured_count = cfg["count"] if cfg["count"] is not None else len(slots)
+    configured_count = cfg.get("count") if cfg.get("count") is not None else len(slots)
+    if disk_paused:
+        admission_status = "PAUSED_DISK_FLOOR"
+        admission_message = f"runner admission paused: host free disk {free_gb}G < {floor_gb}G floor"
+    elif not docker_ok:
+        admission_status = f"service {service_status} / docker_unreachable"
+        admission_message = None
+    else:
+        admission_status = service_status
+        admission_message = None
+
+    return {
+        "ok": docker_ok,
+        "hostname": host_name,
+        "service_status": service_status,
+        "disk": disk_info,
+        "load_average": load_vals,
+        "admission_status": admission_status,
+        "admission_message": admission_message,
+        "configured_slots": configured_count,
+        "slots": slots,
+    }
+
+
+def _collect_local_host_slots():
+    """Collect real local ezgha runner slots via docker ps/top when no audit-dir is supplied."""
+    now_utc = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    hostname = socket.gethostname()
+    is_mac = platform.system().lower() == "darwin"
+    host_key = "mac" if is_mac else hostname
+    cfg = _read_local_ezgha_config()
+    service_status = _probe_local_service_status(is_mac)
+    mac_disabled = is_mac and (
+        os.environ.get("MAC_RUNNER_DISABLED") == "1"
+        or os.environ.get("EZGHA_DASHBOARD_MAC_DISABLED") == "1"
+    )
+    probed = _probe_docker_host_core(
+        is_mac=is_mac,
+        mac_disabled=mac_disabled,
+        cfg=cfg,
+        service_status=service_status,
+        hostname=hostname,
+        run_fn=subprocess.run,
+        disk_usage_fn=shutil.disk_usage,
+        loadavg_fn=os.getloadavg,
+    )
     if is_mac:
         effective_launchd = "disabled" if mac_disabled else service_status
         native_runners = _collect_local_native_runners()
@@ -1149,12 +1213,12 @@ def _collect_local_host_slots():
                     "hostname": hostname,
                     "parked": mac_disabled,
                     "ezgha_launchd_status": effective_launchd,
-                    "colima_status": "running" if docker_ok else "unreachable",
-                    "disk": disk_info,
-                    "load_average": load_vals,
-                    "configured_slots": configured_count,
-                    "configured_container_slots": configured_count,
-                    "container_slots": slots,
+                    "colima_status": "running" if probed["ok"] else "unreachable",
+                    "disk": probed["disk"],
+                    "load_average": probed["load_average"],
+                    "configured_slots": probed["configured_slots"],
+                    "configured_container_slots": probed["configured_slots"],
+                    "container_slots": probed["slots"],
                     "native_runners": native_runners,
                 }
             },
@@ -1165,15 +1229,12 @@ def _collect_local_host_slots():
             host_key: {
                 "display_name": f"{host_key} (Local Linux Host)",
                 "group": "jeff-ubuntu",
-                "admission_status": (
-                    f"service {service_status} / docker_unreachable"
-                    if not docker_ok
-                    else service_status
-                ),
-                "disk": disk_info,
-                "load_average": load_vals,
-                "configured_slots": configured_count,
-                "slots": slots,
+                "admission_status": probed["admission_status"],
+                "admission_message": probed["admission_message"],
+                "disk": probed["disk"],
+                "load_average": probed["load_average"],
+                "configured_slots": probed["configured_slots"],
+                "slots": probed["slots"],
             }
         },
     }
@@ -1303,70 +1364,15 @@ def _cached_live_latency(repos):
     return data
 
 
-_REMOTE_PROBE_PY = r"""
-import json, pathlib, subprocess
-cfg_path = pathlib.Path.home() / ".config" / "ezgha" / "config.toml"
-count = None
-prefix = None
-if cfg_path.is_file():
-    sec = None
-    for raw in cfg_path.read_text(encoding="utf-8").splitlines():
-        line = raw.split("#", 1)[0].strip()
-        if not line: continue
-        if line.startswith("[") and line.endswith("]"): sec = line[1:-1].strip(); continue
-        if "=" not in line: continue
-        k, v = [x.strip() for x in line.split("=", 1)]
-        if sec == "runner" and k == "count" and v.isdigit(): count = int(v)
-        elif sec == "runner" and k == "name_prefix": prefix = v.strip().strip('"').strip("'")
-ps = subprocess.run(["docker", "ps", "-a", "--filter", "label=ezgha=managed", "--format", "{{.Names}}\t{{.Status}}"], capture_output=True, text=True, timeout=10)
-if ps.returncode != 0:
-    print(json.dumps({"ok": False}))
-    raise SystemExit(0)
-obs = {}
-order = []
-for line in ps.stdout.splitlines():
-    if not line.strip(): continue
-    parts = line.split("\t", 1)
-    cname = parts[0].strip()
-    cstatus = parts[1].strip() if len(parts) > 1 else ""
-    st = "DOWN"; cmds = []; el = None; reason = None
-    if cstatus.lower().startswith("up"):
-        try:
-            top = subprocess.run(["docker", "top", cname, "-eo", "pid,etimes,comm,args"], capture_output=True, text=True, timeout=10)
-        except subprocess.TimeoutExpired:
-            top = None
-            st = "UNKNOWN"; reason = "docker top timeout"
-        if top is not None:
-            if top.returncode == 0:
-                hw = hl = False
-                for tl in top.stdout.splitlines()[1:]:
-                    tp = tl.strip().split(None, 3)
-                    if len(tp) < 3: continue
-                    proc_name = tp[2].rsplit("/", 1)[-1]
-                    if proc_name == "Runner.Worker":
-                        hw = True
-                        if tp[1].isdigit(): el = round(int(tp[1]) / 60.0, 1)
-                    elif proc_name == "Runner.Listener":
-                        hl = True
-                    cmds.append(tp[3] if len(tp) == 4 else tp[2])
-                st = "EXECUTING" if hw else ("IDLE" if hl else "CYCLING")
-            else:
-                st = "UNKNOWN"; reason = "docker top probe failed"
-    else:
-        reason = cstatus or "container not running"
-    order.append(cname)
-    obs[cname] = {"name": cname, "state": st, "elapsed_minutes": el, "active_child_commands": cmds, "reason": reason}
-slots = []
-if count and prefix:
-    exp = [f"{prefix}-{i}" for i in range(1, count + 1)]
-    for i, cname in enumerate(exp, 1):
-        slots.append({"slot": i, **(obs[cname] if cname in obs else {"name": cname, "state": "DOWN", "elapsed_minutes": None, "active_child_commands": [], "reason": "container missing"})})
-    for cname in order:
-        if cname not in exp: slots.append({"slot": len(slots) + 1, **obs[cname]})
-else:
-    for i, cname in enumerate(order, 1): slots.append({"slot": i, **obs[cname]})
-print(json.dumps({"ok": True, "configured_slots": count if count is not None else len(slots), "slots": slots}))
-"""
+_REMOTE_PROBE_PY = "\n".join([
+    "import json, os, re, shutil, socket, subprocess",
+    "from pathlib import Path",
+    f"DEFAULT_MIN_FREE_DISK_GB = {DEFAULT_MIN_FREE_DISK_GB}",
+    inspect.getsource(_read_local_ezgha_config),
+    inspect.getsource(_probe_local_service_status),
+    inspect.getsource(_probe_docker_host_core),
+    "print(json.dumps(_probe_docker_host_core(is_mac=False)))",
+])
 
 
 def _collect_remote_linux_slot_payload(ssh_host):
@@ -1376,20 +1382,30 @@ def _collect_remote_linux_slot_payload(ssh_host):
         proc = subprocess.run(
             ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", ssh_host, "python3", "-"],
             input=_REMOTE_PROBE_PY,
-            capture_output=True, text=True, timeout=25,
+            capture_output=True, text=True, timeout=25, errors="replace",
         )
         if proc.returncode == 0:
-            raw = json.loads(proc.stdout)
-            if raw.get("ok"):
-                slots = raw.get("slots") or []
+            raw = json.loads(
+                proc.stdout,
+                parse_constant=_reject_non_finite,
+                parse_float=_parse_finite_float,
+            )
+            if isinstance(raw, dict) and raw.get("ok"):
+                slots = raw.get("slots") if isinstance(raw.get("slots"), list) else []
+                cfg_slots = raw.get("configured_slots")
+                if not isinstance(cfg_slots, int) or isinstance(cfg_slots, bool):
+                    cfg_slots = len(slots)
                 return {
                     "display_name": f"{ssh_host} (Remote Linux Host)",
                     "group": "jeff-ubuntu",
-                    "admission_status": "ssh_probed",
-                    "configured_slots": raw.get("configured_slots") or len(slots),
+                    "admission_status": raw.get("admission_status") or "ssh_probed",
+                    "admission_message": raw.get("admission_message"),
+                    "disk": raw.get("disk") if isinstance(raw.get("disk"), dict) else None,
+                    "load_average": raw.get("load_average") if isinstance(raw.get("load_average"), list) else None,
+                    "configured_slots": cfg_slots,
                     "slots": slots,
                 }
-    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
+    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError, ValueError):
         pass
     return None
 
@@ -1398,13 +1414,25 @@ def _collect_live_cmux(cmux_cmd):
     if not cmux_cmd:
         return None
     try:
-        proc = subprocess.run(cmux_cmd, shell=True, capture_output=True, text=True, timeout=30)
-        if proc.returncode == 0:
-            data = json.loads(proc.stdout)
-            return data if isinstance(data, dict) else None
-    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
-        pass
-    return None
+        proc = subprocess.run(
+            cmux_cmd, shell=True, capture_output=True, text=True, timeout=30, errors="replace"
+        )
+        if proc.returncode != 0:
+            return {"ok": False, "error": f"exit {proc.returncode}"}
+        data = json.loads(
+            proc.stdout,
+            parse_constant=_reject_non_finite,
+            parse_float=_parse_finite_float,
+        )
+        if not isinstance(data, dict):
+            return {"ok": False, "error": f"expected JSON object, got {type(data).__name__}"}
+        if data.get("ok") is False:
+            return data
+        if not _is_valid_cmux_payload(data):
+            return {"ok": False, "error": "cmux payload missing vms list"}
+        return data
+    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError, ValueError) as exc:
+        return {"ok": False, "error": type(exc).__name__}
 
 
 def _uses_live_github(*, audit_dir=None, github_json=None, latency_json=None):
@@ -1485,6 +1513,7 @@ def build_operator_state(*, audit_dir=None, hosts_json=None, cmux_json=None, git
         latency_json=latency_json,
     )
     scope_note = None
+    live_probe_errors = []
     if base is None and hosts_json is None and hosts_data is None:
         hosts_data = _collect_local_host_slots()
         eff_linux = linux_host or os.environ.get("EZGHA_OPERATOR_LINUX_HOST")
@@ -1495,13 +1524,24 @@ def build_operator_state(*, audit_dir=None, hosts_json=None, cmux_json=None, git
             if remote_linux:
                 hosts_data.setdefault("hosts", {})[eff_linux] = remote_linux
             else:
+                hosts_partial = True
                 missing_pools.append(f"remote-linux ({eff_linux} unreachable)")
+                live_probe_errors.append(f"remote-linux SSH probe failed ({eff_linux})")
         else:
             missing_pools.append("remote-linux")
         if eff_cmux and cmux_json is None and cmux_data is None:
             cmux_data = _collect_live_cmux(eff_cmux)
-            if cmux_data is None:
-                missing_pools.append("cmux-cloud (probe failed)")
+            if not isinstance(cmux_data, dict) or cmux_data.get("ok") is False:
+                err_detail = (
+                    str(cmux_data.get("error") or "").strip()
+                    if isinstance(cmux_data, dict)
+                    else ""
+                )
+                label = f"cmux-cloud (probe failed: {err_detail})" if err_detail else "cmux-cloud (probe failed)"
+                missing_pools.append(label)
+                hosts_partial = True
+                live_probe_errors.append(f"cmux live probe failed ({err_detail or 'ok=false'})")
+                cmux_data = {"ok": False, "error": err_detail or "cmux live probe failed"}
         elif cmux_json is None and cmux_data is None:
             missing_pools.append("cmux-cloud")
         if missing_pools:
@@ -1512,6 +1552,14 @@ def build_operator_state(*, audit_dir=None, hosts_json=None, cmux_json=None, git
             )
     if base is None and github_json is None and gh_data is None:
         gh_data = _collect_live_github_snapshot(repos=repos)
+    if live_probe_errors:
+        if isinstance(gh_data, dict):
+            existing_errs = gh_data.get("errors")
+            merged_errs = list(existing_errs) if isinstance(existing_errs, list) else []
+            merged_errs.extend(live_probe_errors)
+            gh_data = {**gh_data, "errors": merged_errs}
+        else:
+            gh_data = {"errors": list(live_probe_errors)}
     if base is None and latency_json is None and latency_raw is None:
         latency_raw = _cached_live_latency(repos)
 

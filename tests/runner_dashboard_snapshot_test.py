@@ -379,7 +379,10 @@ class SnapshotTest(unittest.TestCase):
             cmux_payload={"ok": True, "configured": 1, "executing": 0, "idle": 1, "cycling": 0, "down": 0, "vms": 5},
             latency_payload={"ok": True, "generated_at": "2026-11-18T09:15:00Z", "workflows": 5},
         )
+        self.assertFalse(bad_types["cmux"]["ok"])
         self.assertEqual(bad_types["cmux"]["vms"], [])
+        self.assertEqual(bad_types["reconciliation"]["available_pools"], 2)
+        self.assertEqual(bad_types["reconciliation"]["configured_slots"], 24)
         self.assertEqual(bad_types["latency"]["workflows"], [])
 
         partial_snap = MODULE.build_snapshot(
@@ -495,6 +498,34 @@ class SnapshotTest(unittest.TestCase):
                 degraded_cmux = MODULE._public_cmux({"ok": True, "vms": [{"disk_free_gb": 10}]})
             self.assertFalse(degraded_cmux["ok"])
             self.assertEqual(degraded_cmux["vms"], [])
+
+            bad_vms_cmux = tmp / "cmux_bad_vms.json"
+            bad_vms_cmux.write_text(
+                '{"ok": true, "configured": 4, "executing": 0, "idle": 4, "cycling": 0, "down": 0, "vms": 5}',
+                encoding="utf-8",
+            )
+            out_bad_vms = tmp / "status_bad_vms.json"
+            proc_bad_vms = subprocess.run(
+                [
+                    sys.executable,
+                    str(MODULE_PATH),
+                    "--mac-host", str(mac_p),
+                    "--linux-host", str(linux_p),
+                    "--observed-at", "2026-11-18T09:15:00Z",
+                    "--published-at", "2026-11-18T09:15:05Z",
+                    "--cmux", str(bad_vms_cmux),
+                    "--output", str(out_bad_vms),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            self.assertEqual(proc_bad_vms.returncode, 0, msg=proc_bad_vms.stderr)
+            parsed_bad_vms = json.loads(out_bad_vms.read_text(encoding="utf-8"))
+            self.assertFalse(parsed_bad_vms["cmux"]["ok"])
+            self.assertEqual(parsed_bad_vms["cmux"]["vms"], [])
+            self.assertEqual(parsed_bad_vms["reconciliation"]["available_pools"], 2)
+            self.assertEqual(parsed_bad_vms["reconciliation"]["configured_slots"], 24)
 
 
 if __name__ == "__main__":
