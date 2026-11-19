@@ -205,6 +205,7 @@ class FleetLiveDashboardTest(unittest.TestCase):
         self._shared_cache_tmp = tempfile.TemporaryDirectory()
         self._orig_shared_cache = os.environ.get("EZGHA_OPERATOR_SHARED_CACHE_PATH")
         self._orig_linux_host = os.environ.pop("EZGHA_OPERATOR_LINUX_HOST", None)
+        self._orig_cmux_cmd = os.environ.pop("EZGHA_DASHBOARD_CMUX_PROBE_CMD", None)
         self._shared_cache_path = Path(self._shared_cache_tmp.name) / "state" / "shared_cache.json"
         os.environ["EZGHA_OPERATOR_SHARED_CACHE_PATH"] = str(self._shared_cache_path)
 
@@ -222,6 +223,10 @@ class FleetLiveDashboardTest(unittest.TestCase):
             os.environ["EZGHA_OPERATOR_LINUX_HOST"] = self._orig_linux_host
         else:
             os.environ.pop("EZGHA_OPERATOR_LINUX_HOST", None)
+        if self._orig_cmux_cmd is not None:
+            os.environ["EZGHA_DASHBOARD_CMUX_PROBE_CMD"] = self._orig_cmux_cmd
+        else:
+            os.environ.pop("EZGHA_DASHBOARD_CMUX_PROBE_CMD", None)
         self._shared_cache_tmp.cleanup()
 
     def test_build_state_and_render_html_with_clickable_links(self):
@@ -1732,22 +1737,25 @@ class FleetLiveDashboardTest(unittest.TestCase):
             cross_org_job = {"repo": "other-org/app", "age_minutes": 15.0, "labels": ["self-hosted", "linux"]}
             missing_labels_job = {"repo": "org/app", "age_minutes": 15.0}
             malformed_labels_job = {"repo": "org/app", "age_minutes": 15.0, "labels": "self-hosted"}
+            mixed_labels_job = {"repo": "org/app", "age_minutes": 15.0, "labels": ["self-hosted", None]}
             young_job = {"repo": "org/app", "age_minutes": 4.9, "labels": ["self-hosted", "linux"]}
             incompatible_os_job = {"repo": "org/app", "age_minutes": 15.0, "labels": ["ubuntu-latest"]}
             incompatible_label_job = {"repo": "org/app", "age_minutes": 15.0, "labels": ["self-hosted", "gpu"]}
             for gh_summary, expect_starved in (
-                ({"fresh_queued_runs": 0, "inert_ghosts": 2, "oldest_fresh_wait_minutes": 10, "q_partial": False, "q_unverified_runs": 0, "queued_jobs": []}, False),
-                ({"fresh_queued_runs": 2, "inert_ghosts": 0, "oldest_fresh_wait_minutes": 33.4, "q_partial": False, "q_unverified_runs": 0, "queued_jobs": []}, False),
-                ({"fresh_queued_runs": 2, "inert_ghosts": 0, "oldest_fresh_wait_minutes": 15.0, "q_partial": False, "q_unverified_runs": 0, "queued_jobs": [cross_org_job]}, False),
-                ({"fresh_queued_runs": 2, "inert_ghosts": 0, "oldest_fresh_wait_minutes": 15.0, "q_partial": False, "q_unverified_runs": 0, "queued_jobs": [missing_labels_job]}, False),
-                ({"fresh_queued_runs": 2, "inert_ghosts": 0, "oldest_fresh_wait_minutes": 15.0, "q_partial": False, "q_unverified_runs": 0, "queued_jobs": [malformed_labels_job]}, False),
+                ({"fresh_queued_runs": 0, "inert_ghosts": 2, "oldest_fresh_wait_minutes": 10, "q_partial": False, "q_unverified_runs": 0, "job_details_complete": True, "queued_jobs": []}, False),
+                ({"fresh_queued_runs": 2, "inert_ghosts": 0, "oldest_fresh_wait_minutes": 33.4, "q_partial": False, "q_unverified_runs": 0, "job_details_complete": True, "queued_jobs": []}, False),
+                ({"fresh_queued_runs": 2, "inert_ghosts": 0, "oldest_fresh_wait_minutes": 15.0, "q_partial": False, "q_unverified_runs": 0, "job_details_complete": True, "queued_jobs": [cross_org_job]}, False),
+                ({"fresh_queued_runs": 2, "inert_ghosts": 0, "oldest_fresh_wait_minutes": 15.0, "q_partial": False, "q_unverified_runs": 0, "job_details_complete": True, "queued_jobs": [missing_labels_job]}, False),
+                ({"fresh_queued_runs": 2, "inert_ghosts": 0, "oldest_fresh_wait_minutes": 15.0, "q_partial": False, "q_unverified_runs": 0, "job_details_complete": True, "queued_jobs": [malformed_labels_job]}, False),
+                ({"fresh_queued_runs": 2, "inert_ghosts": 0, "oldest_fresh_wait_minutes": 15.0, "q_partial": False, "q_unverified_runs": 0, "job_details_complete": True, "queued_jobs": [mixed_labels_job]}, False),
+                ({"fresh_queued_runs": 2, "inert_ghosts": 0, "oldest_fresh_wait_minutes": 15.0, "q_partial": False, "q_unverified_runs": 0, "queued_jobs": [old_job]}, False),
                 ({"fresh_queued_runs": 2, "inert_ghosts": 0, "oldest_fresh_wait_minutes": 15.0, "q_partial": False, "q_unverified_runs": 0, "job_details_complete": False, "queued_jobs": [old_job]}, False),
-                ({"fresh_queued_runs": 2, "inert_ghosts": 0, "oldest_fresh_wait_minutes": 33.4, "q_partial": False, "q_unverified_runs": 0, "queued_jobs": [young_job]}, False),
-                ({"fresh_queued_runs": 2, "inert_ghosts": 0, "oldest_fresh_wait_minutes": 15.0, "q_partial": False, "q_unverified_runs": 0, "queued_jobs": [incompatible_os_job]}, False),
-                ({"fresh_queued_runs": 2, "inert_ghosts": 0, "oldest_fresh_wait_minutes": 15.0, "q_partial": False, "q_unverified_runs": 0, "queued_jobs": [incompatible_label_job]}, False),
-                ({"fresh_queued_runs": 2, "inert_ghosts": 0, "oldest_fresh_wait_minutes": 6.0, "q_partial": True, "q_unverified_runs": 0, "queued_jobs": [old_job]}, False),
-                ({"fresh_queued_runs": 2, "inert_ghosts": 0, "oldest_fresh_wait_minutes": 6.0, "q_partial": False, "q_unverified_runs": 1, "queued_jobs": [old_job]}, False),
-                ({"fresh_queued_runs": 2, "inert_ghosts": 0, "oldest_fresh_wait_minutes": 5.0, "q_partial": False, "q_unverified_runs": 0, "queued_jobs": [old_job]}, True),
+                ({"fresh_queued_runs": 2, "inert_ghosts": 0, "oldest_fresh_wait_minutes": 33.4, "q_partial": False, "q_unverified_runs": 0, "job_details_complete": True, "queued_jobs": [young_job]}, False),
+                ({"fresh_queued_runs": 2, "inert_ghosts": 0, "oldest_fresh_wait_minutes": 15.0, "q_partial": False, "q_unverified_runs": 0, "job_details_complete": True, "queued_jobs": [incompatible_os_job]}, False),
+                ({"fresh_queued_runs": 2, "inert_ghosts": 0, "oldest_fresh_wait_minutes": 15.0, "q_partial": False, "q_unverified_runs": 0, "job_details_complete": True, "queued_jobs": [incompatible_label_job]}, False),
+                ({"fresh_queued_runs": 2, "inert_ghosts": 0, "oldest_fresh_wait_minutes": 6.0, "q_partial": True, "q_unverified_runs": 0, "job_details_complete": True, "queued_jobs": [old_job]}, False),
+                ({"fresh_queued_runs": 2, "inert_ghosts": 0, "oldest_fresh_wait_minutes": 6.0, "q_partial": False, "q_unverified_runs": 1, "job_details_complete": True, "queued_jobs": [old_job]}, False),
+                ({"fresh_queued_runs": 2, "inert_ghosts": 0, "oldest_fresh_wait_minutes": 5.0, "q_partial": False, "q_unverified_runs": 0, "job_details_complete": True, "queued_jobs": [old_job]}, True),
             ):
                 gh_f = tmp / "gh.json"
                 gh_f.write_text(json.dumps({"summary": gh_summary}), encoding="utf-8")
@@ -2175,6 +2183,34 @@ class FleetLiveDashboardTest(unittest.TestCase):
                     srv1.shutdown(); srv1.server_close()
                     srv2.shutdown(); srv2.server_close()
                     srv3_diff.shutdown(); srv3_diff.server_close()
+
+            # Near-limit worst-case reservation (23/repo GH, 9/repo latency) and failed cache persistence both fail closed with 0 probe calls
+            self._reset_shared_cache()
+            cache_file.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+            cache_file.write_text(json.dumps({"budget_events": [[py_time.time(), mod.HOST_LIVE_BUDGET_CAP_PER_HOUR - 5]]}), encoding="utf-8")
+            mod._LIVE_LATENCY_CACHE.update({"key": None, "ts": 0.0, "attempt_ts": None, "wall_ts": 0.0, "data": None, "error": None})
+            with mock.patch.object(mod.ci_latency_probe, "gh_json", side_effect=AssertionError("must not call gh near GH budget")), \
+                 mock.patch.object(mod.queue_probe, "probe_repo", side_effect=AssertionError("must not call queue_probe near GH budget")), \
+                 mock.patch.object(mod.ci_latency_probe, "probe_latency", side_effect=AssertionError("must not call latency near budget")):
+                near_gh = mod._collect_live_github_snapshot(repos=["org/near-limit"])
+                near_lat = mod._cached_live_latency(["org/near-limit"])
+            self.assertTrue(near_gh["summary"]["partial"])
+            self.assertIn("budget exhausted", " ".join(near_gh["errors"]))
+            self.assertFalse(near_lat["ok"])
+            self.assertIn("budget exhausted", near_lat["error"])
+
+            self._reset_shared_cache()
+            mod._LIVE_LATENCY_CACHE.update({"key": None, "ts": 0.0, "attempt_ts": None, "wall_ts": 0.0, "data": None, "error": None})
+            with mock.patch.object(mod, "_write_shared_doc_unlocked", side_effect=OSError("read-only cache fs")), \
+                 mock.patch.object(mod.ci_latency_probe, "gh_json", side_effect=AssertionError("must not call gh when cache unpersisted")), \
+                 mock.patch.object(mod.queue_probe, "probe_repo", side_effect=AssertionError("must not call queue_probe when cache unpersisted")), \
+                 mock.patch.object(mod.ci_latency_probe, "probe_latency", side_effect=AssertionError("must not call latency when cache unpersisted")):
+                ro_gh = mod._collect_live_github_snapshot(repos=["org/unwritable"])
+                ro_lat = mod._cached_live_latency(["org/unwritable"])
+            self.assertTrue(ro_gh["summary"]["partial"])
+            self.assertIn("fail-closed", " ".join(ro_gh["errors"]))
+            self.assertFalse(ro_lat["ok"])
+            self.assertIn("fail-closed", ro_lat["error"])
 
             # Warm refresh failure sets last_refresh_error / stale_refresh_error on /api/state instead of hiding failure
             warm_calls = {"n": 0}

@@ -167,57 +167,58 @@ def _prune_budget_events(events, now_wall):
     return kept
 
 
-def _shared_budget_reserve_check(needed_min_calls):
+def _shared_cache_reserve_upfront(bucket, ttl_s, *, max_cost, min_newer_than=0.0):
+    """Atomically verify cooldown + rolling hourly budget and persist worst-case reservation BEFORE probing."""
     path = _get_shared_cache_path()
     lock_path = path.with_suffix(".lock")
     now_wall = time.time()
+    reserved_cost = max(1, int(max_cost))
     try:
         with _SHARED_CACHE_LOCK:
             _ensure_private_dir(path.parent)
             fd = _open_private(lock_path, os.O_CREAT | os.O_RDWR)
             try:
-                fcntl.flock(fd, fcntl.LOCK_SH)
+                fcntl.flock(fd, fcntl.LOCK_EX)
                 try:
-                    doc = _load_shared_doc_unlocked(path)
+                    if path.is_file():
+                        doc = json.loads(path.read_text(encoding="utf-8"))
+                        if not isinstance(doc, dict):
+                            doc = {}
+                    else:
+                        doc = {}
+                    wall_ts = doc.get(f"last_{bucket}_wall_ts")
+                    if (
+                        isinstance(wall_ts, (int, float))
+                        and not isinstance(wall_ts, bool)
+                        and wall_ts > min_newer_than
+                        and (now_wall - wall_ts) < ttl_s
+                    ):
+                        rem = ttl_s - (now_wall - wall_ts)
+                        return False, None, (
+                            f"host-wide live {bucket} cooldown active ({int(math.ceil(rem))}s remaining); "
+                            "single ceiling shared across all --repo scopes"
+                        )
+                    events = _prune_budget_events(doc.get("budget_events"), now_wall)
+                    used = sum(item[1] for item in events)
+                    if (used + reserved_cost) > HOST_LIVE_BUDGET_CAP_PER_HOUR:
+                        return False, None, (
+                            f"host-wide live GitHub REST budget exhausted ({used}/{HOST_LIVE_BUDGET_CAP_PER_HOUR} req/hr; "
+                            f"need {reserved_cost} worst-case calls)"
+                        )
+                    doc[f"last_{bucket}_wall_ts"] = now_wall
+                    events.append([now_wall, reserved_cost])
+                    doc["budget_events"] = events
+                    _write_shared_doc_unlocked(path, doc)
                 finally:
                     fcntl.flock(fd, fcntl.LOCK_UN)
             finally:
                 os.close(fd)
-    except OSError:
-        return 0, True
-    events = _prune_budget_events(doc.get("budget_events"), now_wall)
-    used = sum(item[1] for item in events)
-    return used, (used + max(1, int(needed_min_calls))) <= HOST_LIVE_BUDGET_CAP_PER_HOUR
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
+        return False, None, f"host-wide live cache unavailable (fail-closed): {type(exc).__name__}: {str(exc)[:120]}"
+    return True, now_wall, None
 
 
-def _shared_global_cooldown_remaining(bucket, ttl_s, *, min_newer_than=0.0):
-    path = _get_shared_cache_path()
-    lock_path = path.with_suffix(".lock")
-    now_wall = time.time()
-    try:
-        with _SHARED_CACHE_LOCK:
-            _ensure_private_dir(path.parent)
-            fd = _open_private(lock_path, os.O_CREAT | os.O_RDWR)
-            try:
-                fcntl.flock(fd, fcntl.LOCK_SH)
-                try:
-                    doc = _load_shared_doc_unlocked(path)
-                finally:
-                    fcntl.flock(fd, fcntl.LOCK_UN)
-            finally:
-                os.close(fd)
-    except OSError:
-        return 0.0
-    wall_ts = doc.get(f"last_{bucket}_wall_ts")
-    if not isinstance(wall_ts, (int, float)) or isinstance(wall_ts, bool):
-        return 0.0
-    if wall_ts <= min_newer_than:
-        return 0.0
-    elapsed = now_wall - wall_ts
-    return (ttl_s - elapsed) if elapsed < ttl_s else 0.0
-
-
-def _shared_cache_write(bucket, key, *, data=None, error=None, budget_calls=0):
+def _shared_cache_write(bucket, key, *, data=None, error=None, reserve_ts=None, actual_calls=None):
     path = _get_shared_cache_path()
     lock_path = path.with_suffix(".lock")
     wall_ts = time.time()
@@ -236,8 +237,18 @@ def _shared_cache_write(bucket, key, *, data=None, error=None, budget_calls=0):
                     bkt[key] = {"wall_ts": wall_ts, "data": data, "error": error}
                     doc[f"last_{bucket}_wall_ts"] = wall_ts
                     events = _prune_budget_events(doc.get("budget_events"), wall_ts)
-                    if type(budget_calls) is int and budget_calls > 0:
-                        events.append([wall_ts, budget_calls])
+                    if reserve_ts is not None and type(actual_calls) is int and actual_calls >= 0:
+                        replaced = False
+                        for idx in range(len(events) - 1, -1, -1):
+                            if abs(events[idx][0] - reserve_ts) < 1e-6:
+                                if actual_calls == 0:
+                                    events.pop(idx)
+                                else:
+                                    events[idx][1] = actual_calls
+                                replaced = True
+                                break
+                        if not replaced and actual_calls > 0:
+                            events.append([wall_ts, actual_calls])
                     doc["budget_events"] = events
                     _write_shared_doc_unlocked(path, doc)
                 finally:
@@ -1083,15 +1094,13 @@ def _slot_can_serve_job(slot, job):
     else:
         return False
     raw_job_labels = job.get("labels")
-    if not isinstance(raw_job_labels, list):
+    if (
+        not isinstance(raw_job_labels, list)
+        or not raw_job_labels
+        or any(not isinstance(lb, str) or not lb.strip() for lb in raw_job_labels)
+    ):
         return False
-    job_labels = {
-        str(lb).strip().lower()
-        for lb in raw_job_labels
-        if isinstance(lb, str) and lb.strip()
-    }
-    if not job_labels:
-        return False
+    job_labels = {lb.strip().lower() for lb in raw_job_labels}
     raw_slot_labels = slot.get("labels")
     slot_labels = {
         str(lb).strip().lower()
@@ -1193,7 +1202,7 @@ def _normalize_reconciliation(hosts, cmux_data, gh_data, scope_note=None, hosts_
 
     raw_queued_jobs = gh_summary.get("queued_jobs")
     queued_jobs = [j for j in raw_queued_jobs if isinstance(j, dict)] if isinstance(raw_queued_jobs, list) else []
-    job_details_complete = gh_summary.get("job_details_complete") is not False
+    job_details_complete = gh_summary.get("job_details_complete") is True
     starving_jobs = []
     if not q_partial and q_unverified_runs == 0 and job_details_complete and queued_jobs:
         for job in queued_jobs:
@@ -1802,175 +1811,187 @@ def _collect_live_github_snapshot(repos=None):
     shared = _shared_cache_read("github", cache_key, _LIVE_GITHUB_TTL_S)
     if shared is not None and isinstance(shared.get("data"), dict):
         return shared["data"]
-    with _acquire_shared_probe_lock():
-        shared = _shared_cache_read("github", cache_key, _LIVE_GITHUB_TTL_S)
-        if shared is not None and isinstance(shared.get("data"), dict):
-            return shared["data"]
-        cooldown_rem = _shared_global_cooldown_remaining("github", _LIVE_GITHUB_TTL_S)
-        used_hr, budget_ok = _shared_budget_reserve_check(max(1, 3 * len(target_repos)))
-        if cooldown_rem > 0 or not budget_ok:
-            msg = (
-                f"host-wide live GitHub probe cooldown active ({int(math.ceil(cooldown_rem))}s remaining); single ceiling shared across all --repo scopes"
-                if cooldown_rem > 0
-                else f"host-wide live GitHub REST budget exhausted ({used_hr}/{HOST_LIVE_BUDGET_CAP_PER_HOUR} req/hr)"
-            )
-            errs = ([cap_note] if cap_note else []) + [msg]
-            return {
-                "captured_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                "all_in_progress_jobs": [],
-                "errors": errs,
-                "summary": {
-                    "partial": True,
-                    "ip_partial": True,
-                    "ip_expected_repos": len(target_repos),
-                    "ip_succeeded_repos": 0,
-                    "q_partial": True,
-                    "q_unverified_runs": 0,
-                    "q_expected_repos": len(target_repos),
-                    "q_succeeded_repos": 0,
-                    "total_in_progress_runs_by_repo": {},
-                    "in_progress_jobs_by_repo": {},
-                    "total_queued_runs_by_repo": {},
-                    "queued_jobs_by_repo": {},
-                    "queued_jobs": [],
-                    "job_details_complete": False,
-                    "fresh_queued_runs": None,
-                    "inert_ghosts": None,
-                    "oldest_fresh_wait_minutes": None,
-                    "queued_sample_note": None,
-                },
-            }
-        all_ip_jobs = []
-        ip_runs_by_repo = {}
-        ip_jobs_by_repo = {}
-        q_runs_by_repo = {}
-        total_fresh = 0
-        total_ghosts = 0
-        oldest_fresh_wait_min = None
-        fresh_complete = True
-        job_details_complete = True
-        queued_jobs = []
-        ip_failed_repos = set()
-        ip_capped = bool(cap_note)
-        q_failed_repos = set()
-        q_unverified_runs = 0
-        sample_notes = []
-        errors = [cap_note] if cap_note else []
-        calls_made = 0
-        for repo in target_repos:
-            short = _short_repo(repo)
-            try:
-                calls_made += 1
-                ip = ci_latency_probe.gh_json(["api", f"repos/{repo}/actions/runs?status=in_progress&per_page=50"], timeout=20)
-                ip_runs = (ip or {}).get("workflow_runs") or []
-                ip_count = (ip or {}).get("total_count") if isinstance((ip or {}).get("total_count"), int) else len(ip_runs)
-                ip_runs_by_repo[repo] = ip_count
-                if ip_count > len(ip_runs):
-                    ip_capped = True
-                    errors.append(f"{repo}: in-progress runs truncated ({len(ip_runs)} of {ip_count} returned)")
-                if len(ip_runs) > 10:
-                    ip_capped = True
-                    errors.append(f"{repo}: in-progress job attribution capped at 10 of {len(ip_runs)} runs")
-                job_cnt = 0
-                for run in ip_runs[:10]:
-                    calls_made += 1
-                    jdata = ci_latency_probe.gh_json(["api", f"repos/{repo}/actions/runs/{run['id']}/jobs?per_page=100"], timeout=20)
-                    j_list = (jdata or {}).get("jobs") or []
-                    j_total = (jdata or {}).get("total_count")
-                    if isinstance(j_total, int) and j_total > len(j_list):
-                        ip_capped = True
-                        errors.append(f"{repo}: run {run['id']} jobs truncated ({len(j_list)} of {j_total} returned)")
-                    for j in j_list:
-                        if j.get("status") == "in_progress":
-                            job_cnt += 1
-                            all_ip_jobs.append({
-                                "repo": repo,
-                                "run_id": run["id"],
-                                "run_name": run.get("name"),
-                                "run_html_url": run.get("html_url"),
-                                "head_branch": run.get("head_branch"),
-                                "job_id": j.get("id"),
-                                "job_name": j.get("name"),
-                                "runner_name": j.get("runner_name"),
-                                "html_url": j.get("html_url"),
-                            })
-                ip_jobs_by_repo[repo] = job_cnt
-            except Exception as exc:
-                ip_failed_repos.add(repo)
-                errors.append(f"{repo}: in_progress probe failed: {str(exc)[:120]}")
 
-            try:
-                q_probe = queue_probe.probe_repo(repo, max_job_checks=10)
-                calls_made += (
-                    q_probe.get("requests_used")
-                    if isinstance(q_probe.get("requests_used"), int)
-                    else (2 + min(10, (q_probe.get("sampled_fresh") or 0) + (q_probe.get("sampled_ghosts") or 0)))
-                )
-                if not q_probe.get("ok"):
+    def _fail_closed_gh(msg):
+        errs = ([cap_note] if cap_note else []) + [msg]
+        return {
+            "captured_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "all_in_progress_jobs": [],
+            "errors": errs,
+            "summary": {
+                "partial": True,
+                "ip_partial": True,
+                "ip_expected_repos": len(target_repos),
+                "ip_succeeded_repos": 0,
+                "q_partial": True,
+                "q_unverified_runs": 0,
+                "q_expected_repos": len(target_repos),
+                "q_succeeded_repos": 0,
+                "total_in_progress_runs_by_repo": {},
+                "in_progress_jobs_by_repo": {},
+                "total_queued_runs_by_repo": {},
+                "queued_jobs_by_repo": {},
+                "queued_jobs": [],
+                "job_details_complete": False,
+                "fresh_queued_runs": None,
+                "inert_ghosts": None,
+                "oldest_fresh_wait_minutes": None,
+                "queued_sample_note": None,
+            },
+        }
+
+    try:
+        probe_lock_ctx = _acquire_shared_probe_lock()
+    except OSError as exc:
+        return _fail_closed_gh(f"host-wide live probe lock unavailable (fail-closed): {type(exc).__name__}: {str(exc)[:120]}")
+    try:
+        with probe_lock_ctx:
+            shared = _shared_cache_read("github", cache_key, _LIVE_GITHUB_TTL_S)
+            if shared is not None and isinstance(shared.get("data"), dict):
+                return shared["data"]
+            max_cost = max(1, len(target_repos) * 23)
+            ok_res, reserve_ts, deny_msg = _shared_cache_reserve_upfront("github", _LIVE_GITHUB_TTL_S, max_cost=max_cost)
+            if not ok_res:
+                return _fail_closed_gh(deny_msg)
+            all_ip_jobs = []
+            ip_runs_by_repo = {}
+            ip_jobs_by_repo = {}
+            q_runs_by_repo = {}
+            total_fresh = 0
+            total_ghosts = 0
+            oldest_fresh_wait_min = None
+            fresh_complete = True
+            job_details_complete = True
+            queued_jobs = []
+            ip_failed_repos = set()
+            ip_capped = bool(cap_note)
+            q_failed_repos = set()
+            q_unverified_runs = 0
+            sample_notes = []
+            errors = [cap_note] if cap_note else []
+            calls_made = 0
+            for repo in target_repos:
+                short = _short_repo(repo)
+                try:
+                    calls_made += 1
+                    ip = ci_latency_probe.gh_json(["api", f"repos/{repo}/actions/runs?status=in_progress&per_page=50"], timeout=20)
+                    ip_runs = (ip or {}).get("workflow_runs") or []
+                    ip_count = (ip or {}).get("total_count") if isinstance((ip or {}).get("total_count"), int) else len(ip_runs)
+                    ip_runs_by_repo[repo] = ip_count
+                    if ip_count > len(ip_runs):
+                        ip_capped = True
+                        errors.append(f"{repo}: in-progress runs truncated ({len(ip_runs)} of {ip_count} returned)")
+                    if len(ip_runs) > 10:
+                        ip_capped = True
+                        errors.append(f"{repo}: in-progress job attribution capped at 10 of {len(ip_runs)} runs")
+                    job_cnt = 0
+                    for run in ip_runs[:10]:
+                        calls_made += 1
+                        jdata = ci_latency_probe.gh_json(["api", f"repos/{repo}/actions/runs/{run['id']}/jobs?per_page=100"], timeout=20)
+                        j_list = (jdata or {}).get("jobs") or []
+                        j_total = (jdata or {}).get("total_count")
+                        if isinstance(j_total, int) and j_total > len(j_list):
+                            ip_capped = True
+                            errors.append(f"{repo}: run {run['id']} jobs truncated ({len(j_list)} of {j_total} returned)")
+                        for j in j_list:
+                            if j.get("status") == "in_progress":
+                                job_cnt += 1
+                                all_ip_jobs.append({
+                                    "repo": repo,
+                                    "run_id": run["id"],
+                                    "run_name": run.get("name"),
+                                    "run_html_url": run.get("html_url"),
+                                    "head_branch": run.get("head_branch"),
+                                    "job_id": j.get("id"),
+                                    "job_name": j.get("name"),
+                                    "runner_name": j.get("runner_name"),
+                                    "html_url": j.get("html_url"),
+                                })
+                    ip_jobs_by_repo[repo] = job_cnt
+                except Exception as exc:
+                    ip_failed_repos.add(repo)
+                    errors.append(f"{repo}: in_progress probe failed: {str(exc)[:120]}")
+
+                try:
+                    q_probe = queue_probe.probe_repo(repo, max_job_checks=10)
+                    calls_made += (
+                        q_probe.get("requests_used")
+                        if isinstance(q_probe.get("requests_used"), int)
+                        else (2 + min(10, (q_probe.get("sampled_fresh") or 0) + (q_probe.get("sampled_ghosts") or 0)))
+                    )
+                    if not q_probe.get("ok"):
+                        fresh_complete = False
+                        job_details_complete = False
+                        q_failed_repos.add(repo)
+                        if q_probe.get("error"):
+                            errors.append(f"{repo}: {q_probe['error']}")
+                    else:
+                        if q_probe.get("queued_total") is not None:
+                            q_runs_by_repo[repo] = q_probe["queued_total"]
+                        q_unverified_runs += q_probe.get("unverified_runs") or 0
+                        if q_probe.get("unverified_runs"):
+                            sample_notes.append(
+                                f"{short}: {q_probe['unverified_runs']} of {q_probe.get('queued_total')} queued run(s) unverified"
+                            )
+                        if isinstance(q_probe.get("queued_jobs"), list):
+                            queued_jobs.extend(q_probe["queued_jobs"])
+                        if q_probe.get("job_details_complete") is False:
+                            job_details_complete = False
+                        if q_probe.get("sample_capped") or q_probe.get("fresh") is None or q_probe.get("ghosts") is None:
+                            fresh_complete = False
+                            job_details_complete = False
+                            if q_probe.get("sample_capped"):
+                                sample_notes.append(
+                                    f"{short}: sampled {q_probe['sampled_fresh']} fresh / {q_probe['sampled_ghosts']} ghosts of {q_probe['queued_total']} (>10 cap)"
+                                )
+                        else:
+                            total_fresh += q_probe["fresh"]
+                            total_ghosts += q_probe["ghosts"]
+                            ow_val = _opt_nonneg_number(q_probe.get("oldest_fresh_wait_minutes"), f"{repo}: oldest_fresh_wait_minutes", errors)
+                            if ow_val is not None:
+                                oldest_fresh_wait_min = ow_val if oldest_fresh_wait_min is None else max(oldest_fresh_wait_min, ow_val)
+                except Exception as exc:
+                    calls_made += 1
                     fresh_complete = False
                     job_details_complete = False
                     q_failed_repos.add(repo)
-                    if q_probe.get("error"):
-                        errors.append(f"{repo}: {q_probe['error']}")
-                else:
-                    if q_probe.get("queued_total") is not None:
-                        q_runs_by_repo[repo] = q_probe["queued_total"]
-                    q_unverified_runs += q_probe.get("unverified_runs") or 0
-                    if q_probe.get("unverified_runs"):
-                        sample_notes.append(
-                            f"{short}: {q_probe['unverified_runs']} of {q_probe.get('queued_total')} queued run(s) unverified"
-                        )
-                    if isinstance(q_probe.get("queued_jobs"), list):
-                        queued_jobs.extend(q_probe["queued_jobs"])
-                    if q_probe.get("job_details_complete") is False:
-                        job_details_complete = False
-                    if q_probe.get("sample_capped") or q_probe.get("fresh") is None or q_probe.get("ghosts") is None:
-                        fresh_complete = False
-                        job_details_complete = False
-                        if q_probe.get("sample_capped"):
-                            sample_notes.append(
-                                f"{short}: sampled {q_probe['sampled_fresh']} fresh / {q_probe['sampled_ghosts']} ghosts of {q_probe['queued_total']} (>10 cap)"
-                            )
-                    else:
-                        total_fresh += q_probe["fresh"]
-                        total_ghosts += q_probe["ghosts"]
-                        ow_val = _opt_nonneg_number(q_probe.get("oldest_fresh_wait_minutes"), f"{repo}: oldest_fresh_wait_minutes", errors)
-                        if ow_val is not None:
-                            oldest_fresh_wait_min = ow_val if oldest_fresh_wait_min is None else max(oldest_fresh_wait_min, ow_val)
-            except Exception as exc:
-                calls_made += 1
-                fresh_complete = False
-                job_details_complete = False
-                q_failed_repos.add(repo)
-                errors.append(f"{repo}: queue probe failed: {str(exc)[:120]}")
-        q_partial = bool(q_failed_repos or q_unverified_runs > 0 or not fresh_complete)
-        snap = {
-            "captured_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "all_in_progress_jobs": all_ip_jobs,
-            "errors": errors,
-            "summary": {
-                "partial": bool(errors or ip_failed_repos or q_partial),
-                "ip_partial": bool(ip_failed_repos or ip_capped),
-                "ip_expected_repos": len(target_repos),
-                "ip_succeeded_repos": len(target_repos) - len(ip_failed_repos),
-                "q_partial": q_partial,
-                "q_unverified_runs": q_unverified_runs,
-                "q_expected_repos": len(target_repos),
-                "q_succeeded_repos": len(target_repos) - len(q_failed_repos),
-                "total_in_progress_runs_by_repo": ip_runs_by_repo,
-                "in_progress_jobs_by_repo": ip_jobs_by_repo,
-                "total_queued_runs_by_repo": q_runs_by_repo,
-                "queued_jobs_by_repo": {},
-                "queued_jobs": queued_jobs,
-                "job_details_complete": bool(job_details_complete and not q_partial),
-                "fresh_queued_runs": total_fresh if fresh_complete else None,
-                "inert_ghosts": total_ghosts if fresh_complete else None,
-                "oldest_fresh_wait_minutes": oldest_fresh_wait_min if fresh_complete else None,
-                "queued_sample_note": "; ".join(sample_notes) if sample_notes else None,
-            },
-        }
-        _shared_cache_write("github", cache_key, data=snap, budget_calls=max(1, calls_made))
-        return snap
+                    errors.append(f"{repo}: queue probe failed: {str(exc)[:120]}")
+            q_partial = bool(q_failed_repos or q_unverified_runs > 0 or not fresh_complete)
+            snap = {
+                "captured_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "all_in_progress_jobs": all_ip_jobs,
+                "errors": errors,
+                "summary": {
+                    "partial": bool(errors or ip_failed_repos or q_partial),
+                    "ip_partial": bool(ip_failed_repos or ip_capped),
+                    "ip_expected_repos": len(target_repos),
+                    "ip_succeeded_repos": len(target_repos) - len(ip_failed_repos),
+                    "q_partial": q_partial,
+                    "q_unverified_runs": q_unverified_runs,
+                    "q_expected_repos": len(target_repos),
+                    "q_succeeded_repos": len(target_repos) - len(q_failed_repos),
+                    "total_in_progress_runs_by_repo": ip_runs_by_repo,
+                    "in_progress_jobs_by_repo": ip_jobs_by_repo,
+                    "total_queued_runs_by_repo": q_runs_by_repo,
+                    "queued_jobs_by_repo": {},
+                    "queued_jobs": queued_jobs,
+                    "job_details_complete": bool(job_details_complete and not q_partial),
+                    "fresh_queued_runs": total_fresh if fresh_complete else None,
+                    "inert_ghosts": total_ghosts if fresh_complete else None,
+                    "oldest_fresh_wait_minutes": oldest_fresh_wait_min if fresh_complete else None,
+                    "queued_sample_note": "; ".join(sample_notes) if sample_notes else None,
+                },
+            }
+            _shared_cache_write(
+                "github",
+                cache_key,
+                data=snap,
+                reserve_ts=reserve_ts,
+                actual_calls=min(max_cost, max(1, calls_made)),
+            )
+            return snap
+    except OSError as exc:
+        return _fail_closed_gh(f"host-wide live probe lock unavailable (fail-closed): {type(exc).__name__}: {str(exc)[:120]}")
 
 
 def _cached_live_latency(repos):
@@ -1985,81 +2006,83 @@ def _cached_live_latency(repos):
         if _LIVE_LATENCY_CACHE.get("error") is not None:
             return _LIVE_LATENCY_CACHE["error"]
     shared_key = json.dumps(list(target))
-    with _acquire_shared_probe_lock():
-        now = time.monotonic()
-        attempt_ts = _LIVE_LATENCY_CACHE.get("attempt_ts")
-        inproc_match = _LIVE_LATENCY_CACHE["key"] == target and attempt_ts is not None
-        if inproc_match and (now - attempt_ts) < _LIVE_LATENCY_TTL_S:
-            if _LIVE_LATENCY_CACHE["data"] is not None:
-                return _LIVE_LATENCY_CACHE["data"]
-            if _LIVE_LATENCY_CACHE.get("error") is not None:
-                return _LIVE_LATENCY_CACHE["error"]
-        min_newer = _LIVE_LATENCY_CACHE.get("wall_ts", 0.0) + 0.1 if inproc_match else 0.0
-        shared = _shared_cache_read("latency", shared_key, _LIVE_LATENCY_TTL_S, min_newer_than=min_newer)
-        if shared is not None:
-            s_data = shared.get("data")
-            s_err = shared.get("error")
-            if isinstance(s_data, dict) or isinstance(s_err, dict):
+
+    def _fail_closed_lat(msg):
+        return {
+            "schema_version": 1,
+            "ok": False,
+            "partial": True,
+            "error": msg,
+            "overall": {},
+            "cancellation": {},
+            "workflows": [],
+            "repos": [],
+        }
+
+    try:
+        probe_lock_ctx = _acquire_shared_probe_lock()
+    except OSError as exc:
+        return _fail_closed_lat(f"host-wide live probe lock unavailable (fail-closed): {type(exc).__name__}: {str(exc)[:120]}")
+    try:
+        with probe_lock_ctx:
+            now = time.monotonic()
+            attempt_ts = _LIVE_LATENCY_CACHE.get("attempt_ts")
+            inproc_match = _LIVE_LATENCY_CACHE["key"] == target and attempt_ts is not None
+            if inproc_match and (now - attempt_ts) < _LIVE_LATENCY_TTL_S:
+                if _LIVE_LATENCY_CACHE["data"] is not None:
+                    return _LIVE_LATENCY_CACHE["data"]
+                if _LIVE_LATENCY_CACHE.get("error") is not None:
+                    return _LIVE_LATENCY_CACHE["error"]
+            min_newer = _LIVE_LATENCY_CACHE.get("wall_ts", 0.0) + 0.1 if inproc_match else 0.0
+            shared = _shared_cache_read("latency", shared_key, _LIVE_LATENCY_TTL_S, min_newer_than=min_newer)
+            if shared is not None:
+                s_data = shared.get("data")
+                s_err = shared.get("error")
+                if isinstance(s_data, dict) or isinstance(s_err, dict):
+                    _LIVE_LATENCY_CACHE.update({
+                        "key": target,
+                        "ts": now,
+                        "attempt_ts": now,
+                        "wall_ts": shared.get("wall_ts") or time.time(),
+                        "data": s_data if isinstance(s_data, dict) else None,
+                        "error": s_err if isinstance(s_err, dict) else None,
+                    })
+                    return s_data if isinstance(s_data, dict) else s_err
+            max_cost = max(1, len(target) * 9)
+            ok_res, reserve_ts, deny_msg = _shared_cache_reserve_upfront(
+                "latency", _LIVE_LATENCY_TTL_S, max_cost=max_cost, min_newer_than=min_newer
+            )
+            if not ok_res:
+                return _fail_closed_lat(deny_msg)
+            data = None
+            err_payload = None
+            try:
+                data = ci_latency_probe.probe_latency(list(target), limit=15, job_run_limit=8)
+            except Exception as exc:
+                err_payload = _fail_closed_lat(
+                    f"live latency probe failed: {type(exc).__name__}: {str(exc)[:160]}"
+                )
+            finally:
+                done_ts = time.monotonic()
+                done_wall = _shared_cache_write(
+                    "latency",
+                    shared_key,
+                    data=data,
+                    error=err_payload,
+                    reserve_ts=reserve_ts,
+                    actual_calls=max_cost,
+                )
                 _LIVE_LATENCY_CACHE.update({
                     "key": target,
-                    "ts": now,
-                    "attempt_ts": now,
-                    "wall_ts": shared.get("wall_ts") or time.time(),
-                    "data": s_data if isinstance(s_data, dict) else None,
-                    "error": s_err if isinstance(s_err, dict) else None,
+                    "ts": done_ts,
+                    "attempt_ts": done_ts,
+                    "wall_ts": done_wall,
+                    "data": data,
+                    "error": err_payload,
                 })
-                return s_data if isinstance(s_data, dict) else s_err
-        cooldown_rem = _shared_global_cooldown_remaining("latency", _LIVE_LATENCY_TTL_S, min_newer_than=min_newer)
-        used_hr, budget_ok = _shared_budget_reserve_check(max(1, len(target)))
-        if cooldown_rem > 0 or not budget_ok:
-            msg = (
-                f"host-wide live latency cooldown active ({int(math.ceil(cooldown_rem))}s remaining); single ceiling shared across all --repo scopes"
-                if cooldown_rem > 0
-                else f"host-wide live GitHub REST budget exhausted ({used_hr}/{HOST_LIVE_BUDGET_CAP_PER_HOUR} req/hr)"
-            )
-            return {
-                "schema_version": 1,
-                "ok": False,
-                "partial": True,
-                "error": msg,
-                "overall": {},
-                "cancellation": {},
-                "workflows": [],
-                "repos": [],
-            }
-        data = None
-        err_payload = None
-        try:
-            data = ci_latency_probe.probe_latency(list(target), limit=15, job_run_limit=8)
-        except Exception as exc:
-            err_payload = {
-                "schema_version": 1,
-                "ok": False,
-                "partial": True,
-                "error": f"live latency probe failed: {type(exc).__name__}: {str(exc)[:160]}",
-                "overall": {},
-                "cancellation": {},
-                "workflows": [],
-                "repos": [],
-            }
-        finally:
-            done_ts = time.monotonic()
-            done_wall = _shared_cache_write(
-                "latency",
-                shared_key,
-                data=data,
-                error=err_payload,
-                budget_calls=max(1, len(target) * 9),
-            )
-            _LIVE_LATENCY_CACHE.update({
-                "key": target,
-                "ts": done_ts,
-                "attempt_ts": done_ts,
-                "wall_ts": done_wall,
-                "data": data,
-                "error": err_payload,
-            })
-        return data if data is not None else err_payload
+            return data if data is not None else err_payload
+    except OSError as exc:
+        return _fail_closed_lat(f"host-wide live probe lock unavailable (fail-closed): {type(exc).__name__}: {str(exc)[:120]}")
 
 
 _REMOTE_PROBE_PY = "\n".join([

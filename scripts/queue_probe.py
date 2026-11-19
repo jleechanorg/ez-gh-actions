@@ -200,11 +200,15 @@ def inspect_run_jobs(repo, run_id, *, budget=None, reserve=0):
             if not isinstance(job, dict) or job.get("status") != "queued":
                 continue
             raw_labels = job.get("labels")
-            labels = (
-                [lb.strip().lower() for lb in raw_labels if isinstance(lb, str) and lb.strip()]
-                if isinstance(raw_labels, list)
-                else []
-            )
+            if (
+                not isinstance(raw_labels, list)
+                or not raw_labels
+                or any(not isinstance(lb, str) or not lb.strip() for lb in raw_labels)
+            ):
+                labels = []
+                details_valid = False
+            else:
+                labels = [lb.strip().lower() for lb in raw_labels]
             created_at = job.get("created_at")
             if not labels or not isinstance(created_at, str) or not created_at.strip():
                 details_valid = False
@@ -347,6 +351,7 @@ def probe_repo(repo, *, max_job_checks=None, max_requests=None, _budget=None, _r
             "partial": bool(unverified_runs > 0 or incomplete), "unverified_runs": unverified_runs,
             "queued_jobs": queued_jobs_out,
             "job_details_complete": bool(job_details_complete and not incomplete and unreadable_jobs == 0),
+            "requests_used": budget["used"] if isinstance(budget, dict) else (2 + checked_runs),
             "error": budget_error[:200] if budget_error else None}
 
 

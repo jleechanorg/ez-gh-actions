@@ -241,7 +241,7 @@ def _public_queue(payload, repo_map):
 
     repos = []
     raw_repos = raw.get("repos")
-    if raw_repos is not None and (not isinstance(raw_repos, list) or any(not isinstance(entry, dict) for entry in raw_repos)):
+    if "repos" in raw and (not isinstance(raw_repos, list) or any(not isinstance(entry, dict) for entry in raw_repos)):
         return {
             "ok": False,
             "partial": True,

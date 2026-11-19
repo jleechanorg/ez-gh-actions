@@ -431,7 +431,20 @@ class OldestFreshWait(unittest.TestCase):
                 }
             raise AssertionError(args)
 
-        for stub in (fake_truncated, fake_missing_labels):
+        def fake_mixed_labels(args):
+            joined = " ".join(args)
+            if "status=queued" in joined:
+                return {"total_count": 1, "workflow_runs": [{"id": 704, "created_at": old_run_created}]}
+            if "status=in_progress" in joined:
+                return 0
+            if "/actions/runs/704/jobs" in joined:
+                return {
+                    "total_count": 1,
+                    "jobs": [{"id": 5, "status": "queued", "created_at": recent_job_created, "labels": ["self-hosted", None]}],
+                }
+            raise AssertionError(args)
+
+        for stub in (fake_truncated, fake_missing_labels, fake_mixed_labels):
             queue_probe.gh_json = stub
             try:
                 sub = queue_probe.probe_repo("org/repo")

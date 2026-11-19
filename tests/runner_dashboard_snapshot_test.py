@@ -535,6 +535,7 @@ class SnapshotTest(unittest.TestCase):
                     self.assertEqual(parsed_bad_vms["reconciliation"]["configured_slots"], 24)
 
             for q_label, bad_queue in (
+                ("null_repos", {"ok": True, "fresh": 1, "ghosts": 0, "repos": None}),
                 ("non_list_repos", {"ok": True, "fresh": 1, "ghosts": 0, "repos": "invalid"}),
                 ("mixed_list_repos", {"ok": True, "fresh": 1, "ghosts": 0, "repos": [{"repo": "org/a", "fresh": 1, "ghosts": 0}, "bad"]}),
             ):
