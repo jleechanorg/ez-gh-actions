@@ -468,9 +468,14 @@ test('renders reconciliation banner, slot chips, cmux pool, and latency panel', 
 
   const unavail = structuredClone(snapshot);
   unavail.sources.linux_host.ok = false;
-  unavail.reconciliation = {};
+  unavail.reconciliation = { active_workflow_runs: 31, fresh_queued_runs: 7, inert_ghosts: 2 };
+  unavail.queue = { ok: false, partial: true, fresh: 7, ghosts: 2, in_progress_runs: 31, repos: [] };
   unavail.cmux = { ok: false };
   render(unavail, NOW);
   assert.equal(elements.get('linux-state-badge').textContent, 'UNAVAILABLE');
+  assert.equal(elements.get('reconcile-runs').textContent, '—');
+  assert.equal(elements.get('reconcile-fresh').textContent, '—');
+  assert.equal(elements.get('reconcile-ghosts').textContent, '—');
+  assert.equal(elements.get('reconcile-slots').textContent, '0');
   delete globalThis.document;
 });

@@ -248,6 +248,13 @@ class UnknownHandling(unittest.TestCase):
         for payload in (
             {"total_count": 1, "jobs": [{}]},
             {"total_count": 0, "jobs": {"id": 123}},
+            {
+                "total_count": 1,
+                "jobs": [
+                    {"id": 1, "status": "queued", "created_at": "2026-11-18T00:00:00Z", "labels": ["self-hosted"]},
+                    {"id": 2, "status": "completed"},
+                ],
+            },
         ):
             with self.subTest(payload=payload):
                 def fake_gh(args, p=payload):
@@ -267,10 +274,10 @@ class UnknownHandling(unittest.TestCase):
                 finally:
                     queue_probe.gh_json = original
                 self.assertTrue(result["ok"])
+                self.assertTrue(result["partial"])
+                self.assertEqual(result["unverified_runs"], 1)
                 self.assertFalse(result["job_details_complete"])
                 if payload["total_count"] == 0:
-                    self.assertTrue(result["partial"])
-                    self.assertEqual(result["unverified_runs"], 1)
                     self.assertEqual(result["ghosts"], 0)
 
 

@@ -353,15 +353,26 @@
           (linuxValid ? snapshot.fleets?.linux?.parked_slots || 0 : 0)
         : null;
 
-    setText('reconcile-runs', count(data.active_workflow_runs));
+    const queueFailed = snapshot.queue && snapshot.queue.ok === false;
+    setText('reconcile-runs', queueFailed ? '—' : count(data.active_workflow_runs));
     setText('reconcile-slots', count(occupied));
     setText('reconcile-idle', count(idle));
     setText(
       'reconcile-unavailable',
       `${count(down)}D / ${count(parked)}P / ${count(cycling)}C`,
     );
-    setText('reconcile-fresh', count(data.fresh_queued_runs ?? snapshot.queue?.fresh));
-    setText('reconcile-ghosts', count(data.inert_ghosts ?? snapshot.queue?.ghosts));
+    setText(
+      'reconcile-fresh',
+      queueFailed
+        ? '—'
+        : count(data.fresh_queued_runs ?? snapshot.queue?.fresh),
+    );
+    setText(
+      'reconcile-ghosts',
+      queueFailed
+        ? '—'
+        : count(data.inert_ghosts ?? snapshot.queue?.ghosts),
+    );
     setText(
       'reconcile-summary',
       data.explanation ||

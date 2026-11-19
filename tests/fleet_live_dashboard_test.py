@@ -1817,10 +1817,20 @@ class FleetLiveDashboardTest(unittest.TestCase):
             self.assertEqual(rec_bad_zero["state_counts"]["IDLE-STARVED"], 0)
             self.assertFalse(rec_bad_zero["idle_starved"])
 
-            # Malformed /jobs with empty job dict ([{}]) or non-list jobs ({"id": 123}) must also block IDLE-STARVED.
+            # Malformed /jobs with empty job dict ([{}]), non-list jobs ({"id": 123}), or len(jobs) > total_count must block IDLE-STARVED.
             for bad_label, bad_payload in (
                 ("empty_job_dict", {"total_count": 1, "jobs": [{}]}),
                 ("non_list_jobs_dict", {"total_count": 0, "jobs": {"id": 123}}),
+                (
+                    "total_count_lt_len",
+                    {
+                        "total_count": 1,
+                        "jobs": [
+                            {"id": 1, "status": "queued", "created_at": old_iso, "labels": ["self-hosted", "linux", "x64"]},
+                            {"id": 2, "status": "completed"},
+                        ],
+                    },
+                ),
             ):
                 with self.subTest(bad_jobs=bad_label):
                     self._reset_shared_cache()

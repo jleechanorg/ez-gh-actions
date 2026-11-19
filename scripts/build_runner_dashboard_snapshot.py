@@ -250,7 +250,7 @@ def _public_queue(payload, repo_map):
             "fresh": None,
             "ghosts": None,
             "oldest_fresh_wait_minutes": None,
-            "in_progress_runs": num("in_progress_runs"),
+            "in_progress_runs": None,
             "repos": [],
         }
     for entry in (raw_repos if isinstance(raw_repos, list) else []):
@@ -259,8 +259,19 @@ def _public_queue(payload, repo_map):
             "fresh": num_in(entry, "fresh"),
             "ghosts": num_in(entry, "ghosts"),
         })
+    if raw.get("ok") is not True:
+        return {
+            "ok": False,
+            "partial": bool(raw.get("partial") is True or "ok" in raw),
+            "unverified_runs": num("unverified_runs"),
+            "fresh": None,
+            "ghosts": None,
+            "oldest_fresh_wait_minutes": None,
+            "in_progress_runs": None,
+            "repos": repos,
+        }
     return {
-        "ok": raw.get("ok") is True,
+        "ok": True,
         "partial": raw.get("partial") is True,
         "unverified_runs": num("unverified_runs"),
         "fresh": num("fresh"),

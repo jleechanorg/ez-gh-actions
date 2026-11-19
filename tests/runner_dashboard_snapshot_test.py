@@ -577,6 +577,24 @@ class SnapshotTest(unittest.TestCase):
             )
             self.assertFalse(snap_zero_unparked["sources"]["mac_host"]["ok"])
 
+            # Failed queue probe (ok=False) must null aggregate queue/reconciliation counts while keeping verified fleet counts.
+            failed_q_snap = MODULE.build_snapshot(
+                mac_payload=json.loads(mac_p.read_text(encoding="utf-8")),
+                linux_payload=json.loads(linux_p.read_text(encoding="utf-8")),
+                queue_payload={"ok": False, "partial": True, "in_progress_runs": 31, "fresh": 7, "ghosts": 2, "repos": []},
+                observed_at="2026-11-18T09:15:00Z",
+                published_at="2026-11-18T09:15:05Z",
+            )
+            self.assertFalse(failed_q_snap["queue"]["ok"])
+            self.assertTrue(failed_q_snap["queue"]["partial"])
+            self.assertIsNone(failed_q_snap["queue"]["in_progress_runs"])
+            self.assertIsNone(failed_q_snap["queue"]["fresh"])
+            self.assertIsNone(failed_q_snap["queue"]["ghosts"])
+            self.assertIsNone(failed_q_snap["reconciliation"]["active_workflow_runs"])
+            self.assertIsNone(failed_q_snap["reconciliation"]["fresh_queued_runs"])
+            self.assertIsNone(failed_q_snap["reconciliation"]["inert_ghosts"])
+            self.assertEqual(failed_q_snap["reconciliation"]["configured_slots"], 24)
+
 
 if __name__ == "__main__":
     unittest.main()

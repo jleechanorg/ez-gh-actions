@@ -196,17 +196,16 @@ def inspect_run_jobs(repo, run_id, *, budget=None, reserve=0):
         # Non-list jobs (e.g. {"total_count": 0, "jobs": {"id": 123}}) is malformed/unverified.
         return None, [], False
     if isinstance(raw_jobs, list):
-        if count == 0 and len(raw_jobs) > 0:
-            # Contradictory payload (total_count=0 alongside non-empty jobs list like [null]) is unverified.
+        if count is not None and len(raw_jobs) > count:
+            # Contradictory payload (e.g. total_count=0 with [null], or total_count=1 with 2 rows) is unverified.
             return None, [], False
         queued_jobs = []
         truncated = count is not None and len(raw_jobs) < count
         details_valid = not truncated
         for job in raw_jobs:
             if not isinstance(job, dict) or not isinstance(job.get("status"), str) or not job["status"].strip():
-                # A malformed row or missing status could hide a queued job; never call this complete.
-                details_valid = False
-                continue
+                # A malformed row or missing status makes the entire run's job count unverified.
+                return None, [], False
             if job.get("status") != "queued":
                 continue
             raw_labels = job.get("labels")
