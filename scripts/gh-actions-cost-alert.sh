@@ -171,7 +171,7 @@ if [ "$ENSURE_POLICY" -eq 1 ]; then
     {
       displayName: $display,
       documentation: {
-        content: "GitHub Actions daily/MTD gross spend, net spend, or hosted macOS minute spike detected (or cost monitor blind).",
+        content: "GitHub Actions cost alert (${log.extracted_label.status}): ${log.extracted_label.detail}",
         mimeType: "text/markdown"
       },
       combiner: "OR",
@@ -180,7 +180,11 @@ if [ "$ENSURE_POLICY" -eq 1 ]; then
         {
           displayName: "GitHub Actions cost or hosted macOS spike",
           conditionMatchedLog: {
-            filter: ("("+$common+" AND severity>=ERROR) OR ("+$common+" AND jsonPayload.status=\"BLIND\" AND severity>=WARNING)")
+            filter: ("("+$common+" AND severity>=ERROR) OR ("+$common+" AND jsonPayload.status=\"BLIND\" AND severity>=WARNING)"),
+            labelExtractors: {
+              status: "EXTRACT(jsonPayload.status)",
+              detail: "EXTRACT(jsonPayload.message)"
+            }
           }
         }
       ],
@@ -620,7 +624,7 @@ run_app_token_fallback() {
           def is_standard_macos:
             (is_self_hosted | not) and (any((.labels // [])[]; ascii_downcase | test("^macos-(latest|13|14|15|26)(-intel|-arm64)?$")) and (any((.labels // [])[]; ascii_downcase | test("(large|xlarge|[0-9]+-?core)")) | not));
           def is_any_hosted_macos:
-            (is_self_hosted | not) and any((.labels // [])[]; ascii_downcase | startswith("macos-"));
+            (is_self_hosted | not) and any((.labels // [])[]; ascii_downcase | (startswith("macos-") or startswith("xcode-")));
           def is_standard_ubuntu:
             (is_self_hosted | not) and (any((.labels // [])[]; ascii_downcase | test("^ubuntu-(latest|[0-9]{2}\\.[0-9]{2})$")) and (any((.labels // [])[]; ascii_downcase | test("(large|xlarge|[0-9]+-?core)")) | not));
           def is_standard_windows:
@@ -774,6 +778,9 @@ elif [ "$YEST_YEAR_MONTH" != "$YEAR_MONTH" ]; then
       and ((.grossAmount | type) == "number")
       and ((.netAmount | type) == "number")
       and ((.quantity | type) == "number")
+      and ((.sku == null) or ((.sku | type) == "string"))
+      and ((.unitType == null) or ((.unitType | type) == "string"))
+      and ((.repositoryName == null) or ((.repositoryName | type) == "string"))
       and ((.date | type) == "string")
       and (((.date[:10]) | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}$")))
       and ((try (((.date[:10]) + "T00:00:00Z") | fromdateiso8601) catch null) != null);
@@ -799,6 +806,9 @@ if [ -z "$fallback_reason" ]; then
       and ((.grossAmount | type) == "number")
       and ((.netAmount | type) == "number")
       and ((.quantity | type) == "number")
+      and ((.sku == null) or ((.sku | type) == "string"))
+      and ((.unitType == null) or ((.unitType | type) == "string"))
+      and ((.repositoryName == null) or ((.repositoryName | type) == "string"))
       and ((.date | type) == "string")
       and (((.date[:10]) | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}$")))
       and ((try (((.date[:10]) + "T00:00:00Z") | fromdateiso8601) catch null) != null);

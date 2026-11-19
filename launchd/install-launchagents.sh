@@ -47,6 +47,92 @@ COST_ALERT_SCRIPT_BACKUP=""
 COST_ALERT_HAD_PRIOR_SCRIPT=0
 COST_ALERT_HAD_PRIOR_PLIST=0
 COST_ALERT_PRIOR_LOADED=0
+INSTALL_LOCK_TIMEOUT_SEC="${INSTALL_LOCK_TIMEOUT_SEC:-30}"
+INSTALL_LOCK_FILE="${STATE_DIR}/install-launchagents.flock"
+INSTALL_LOCK_HELD=0
+
+case "${INSTALL_LOCK_TIMEOUT_SEC}" in
+  ''|*[!0-9]*)
+    echo "ERROR: invalid INSTALL_LOCK_TIMEOUT_SEC='${INSTALL_LOCK_TIMEOUT_SEC}' (expected non-negative integer)" >&2
+    exit 2
+    ;;
+esac
+
+# Authority: serialize launchd install/remove operations with kernel flock and prevent launchd/child processes from inheriting FD 9.
+launchctl() {
+  ( exec 9>&-; command launchctl "$@" )
+}
+
+resolve_python3() {
+  local cand=""
+  if [[ -n "${PYTHON3_BIN:-}" && -x "${PYTHON3_BIN}" ]]; then
+    printf '%s' "$PYTHON3_BIN"
+    return 0
+  fi
+  cand="$(command -v python3 2>/dev/null || true)"
+  if [[ -n "$cand" && -x "$cand" ]]; then
+    printf '%s' "$cand"
+    return 0
+  fi
+  for cand in /usr/bin/python3 /opt/homebrew/bin/python3; do
+    if [[ -x "$cand" ]]; then
+      printf '%s' "$cand"
+      return 0
+    fi
+  done
+  return 1
+}
+
+acquire_install_lock() {
+  local py_bin="" rc=0
+  if ! py_bin="$(resolve_python3)"; then
+    echo "ERROR: python3 not found; cannot acquire install lock ${INSTALL_LOCK_FILE}" >&2
+    return 1
+  fi
+  mkdir -p "${STATE_DIR}" || return 1
+  chmod 0700 "${STATE_DIR}" || return 1
+  if ! exec 9>>"${INSTALL_LOCK_FILE}"; then
+    echo "ERROR: failed to open install lock ${INSTALL_LOCK_FILE}" >&2
+    return 1
+  fi
+  chmod 0600 "${INSTALL_LOCK_FILE}" 2>/dev/null || true
+  "$py_bin" - "${INSTALL_LOCK_TIMEOUT_SEC}" <<'PY' || rc=$?
+import errno
+import fcntl
+import sys
+import time
+
+timeout = max(0.0, float(sys.argv[1]))
+deadline = time.monotonic() + timeout
+while True:
+    try:
+        fcntl.flock(9, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        sys.exit(0)
+    except OSError as exc:
+        if exc.errno not in (errno.EACCES, errno.EAGAIN):
+            print(f"ERROR: flock failed: {exc}", file=sys.stderr)
+            sys.exit(2)
+    if time.monotonic() >= deadline:
+        sys.exit(1)
+    time.sleep(0.1)
+PY
+  if [[ "$rc" -ne 0 ]]; then
+    exec 9>&-
+    if [[ "$rc" -eq 1 ]]; then
+      echo "ERROR: timed out waiting for install lock ${INSTALL_LOCK_FILE}" >&2
+    fi
+    return 1
+  fi
+  INSTALL_LOCK_HELD=1
+  return 0
+}
+
+release_install_lock() {
+  if [[ "${INSTALL_LOCK_HELD:-0}" -eq 1 ]]; then
+    exec 9>&-
+    INSTALL_LOCK_HELD=0
+  fi
+}
 
 should_install_cost_alert() {
   [[ -n "$label_filter" ]] || [[ "${EZGHA_INSTALL_COST_ALERT_BULK:-0}" == "1" ]] || [[ -f "${TARGET_DIR}/${COST_ALERT_LABEL}.plist" ]]
@@ -312,6 +398,7 @@ rollback_on_exit() {
   if [[ "${COST_ALERT_TRANSACTION_ACTIVE}" == true ]]; then
     restore_cost_alert_script
   fi
+  release_install_lock
   exit "${rc}"
 }
 
@@ -420,23 +507,19 @@ commit_dashboard_install() {
 
 case "$action" in
   install)
-    need_exit_trap=false
+    acquire_install_lock || exit 1
+    trap rollback_on_exit EXIT
     for tmpl in "${templates[@]}"; do
       [[ -f "$tmpl" ]] || continue
       tmpl_label="$(basename "$tmpl" .plist.template)"
       if [[ "$tmpl_label" == "${DASHBOARD_LABEL}" ]]; then
         backup_dashboard_payload
-        need_exit_trap=true
       elif [[ "$tmpl_label" == "${COST_ALERT_LABEL}" ]]; then
         if should_install_cost_alert; then
           INSTALLING_COST_ALERT=true
-          need_exit_trap=true
         fi
       fi
     done
-    if [[ "$need_exit_trap" == true ]]; then
-      trap rollback_on_exit EXIT
-    fi
     install_scripts
     for tmpl in "${templates[@]}"; do
       [[ -f "$tmpl" ]] || continue
@@ -483,7 +566,7 @@ case "$action" in
       sed -e "s|@HOME@|${HOME_SED}|g" -e "s|@SCRIPTS_DIR@|${SCRIPTS_DIR_SED}|g" \
           -e "s|@SCRATCH_ROOT@|${SCRATCH_ROOT_SED}|g" "$tmpl" > "$candidate"
       if [[ "${label}" == "${DASHBOARD_LABEL}" && -n "${DOCKER_HOST_OVERRIDE:-}" ]]; then
-        python3 - "$candidate" "$DOCKER_HOST_OVERRIDE" <<'PY'
+        python3 - "$candidate" "$DOCKER_HOST_OVERRIDE" 9>&- <<'PY'
 import plistlib
 import sys
 from pathlib import Path
@@ -591,6 +674,8 @@ PY
     done
     ;;
   remove)
+    acquire_install_lock || exit 1
+    trap rollback_on_exit EXIT
     for tmpl in "${templates[@]}"; do
       [[ -f "$tmpl" ]] || continue
       label="$(basename "$tmpl" .plist.template)"

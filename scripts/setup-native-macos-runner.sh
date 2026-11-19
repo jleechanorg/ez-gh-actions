@@ -59,14 +59,14 @@ usage() {
 Usage: setup-native-macos-runner.sh [OPTIONS]
   --dry-run                       Print planned setup, config.sh command, and LaunchAgent plist without mutating host
   --verify                        Verify existing runner dir, .runner, .ezgha-labels, live GitHub labels, fork protection, work dir, and LaunchAgent
-  --reconfigure                   Force unload, removal of local .runner/.credentials*, and fresh ./config.sh (passing --replace only when live runner matches local agentId)
+  --reconfigure                   Force unload, removal of local .runner/.credentials*, and fresh ./config.sh (ID-bound DELETE when live runner matches local agentId; never passes --replace)
   --offline                       Skip live GitHub API check during --verify (--dry-run never calls GitHub)
   --uninstall                     Unload and remove org.jleechanorg.ezgha-native-macos-runner LaunchAgent
   --org ORG                       GitHub org scope (default: jleechanorg)
   --repo OWNER/REPO               Optional repo scope (overrides --org)
   --runner-group GROUP            Optional GitHub org runner group name (passed as --runnergroup to config.sh)
-  --allow-public-fork-exposure    Explicitly allow setup/verify on a public-capable runner group or public --repo after operator workflow review
-  --force-replace-name            Allow --replace even when a live runner with the same name exists without matching local .runner agentId
+  --allow-public-fork-exposure    Explicitly allow setup/verify on a public-capable/unrestricted runner group or public/fork-enabled --repo after operator workflow review
+  --force-replace-name            Allow ID-bound DELETE even when a live runner with the same name exists without matching local .runner agentId (never passes --replace)
   --name NAME                     Runner name (default: mac-native-ci-1)
   --runner-dir DIR                Install directory (default: $HOME/actions-runner-macos-ci)
   --labels CSV                    Comma-separated labels (default: self-hosted-native-macos)
@@ -328,6 +328,20 @@ stop_launchagent() {
     return 0
   fi
   return 1
+}
+
+is_launchagent_loaded() {
+  local uid="" gui_target=""
+  uid="$(id -u)" || return 0
+  gui_target="gui/${uid}/${PLIST_LABEL}"
+  ! launchagent_confirmed_unloaded "$gui_target"
+}
+
+rollback_unverified_launchagent() {
+  if ! stop_launchagent || is_launchagent_loaded; then
+    echo "ERROR: failed to unload unverified LaunchAgent ${PLIST_LABEL}${BACKUP_DIR:+ (backup preserved at ${BACKUP_DIR})}" >&2
+    exit 7
+  fi
 }
 
 if [ "$UNINSTALL" -eq 1 ]; then
@@ -762,24 +776,39 @@ runner_configured() {
   [ -f "${dir}/.runner" ] && [ -f "${dir}/.credentials" ]
 }
 
-# Authority: fail-closed server-side fork-PR protection per operator ask (2026-11-18, #L16) and origin/main:AGENTS.md:246-247,257 (exit 5 before token minting/setup/verify).
+# Authority: fail-closed server-side fork-PR & workflow-restriction protection per operator ask (2026-11-18, #L16) and origin/main:AGENTS.md:246-247,257 (exit 5 before token minting/setup/verify).
 verify_server_fork_protection() {
   command -v "$GH_BIN" >/dev/null 2>&1 || {
     echo "ERROR: gh binary '$GH_BIN' not found (required for server-side fork-protection check)" >&2
     exit 5
   }
   VERIFIED_RUNNER_GROUP_ID=""
-  local is_priv="" groups_json="" group_json="" allows_pub="" restricted_wf="" selected_wf_count=""
+  local is_priv="" repo_fork_wf_json="" repo_fork_wf=""
+  local groups_json="" group_json="" group_detail_json=""
+  local allows_pub="" restricted_wf="" selected_wf_count="" selected_wf_valid=""
+  local org_fork_wf_json="" org_fork_wf=""
   if [ -n "$RUNNER_REPO" ]; then
     if ! is_priv="$(run_gh_api api "repos/${RUNNER_REPO}" --jq '.private')"; then
       echo "ERROR: failed to query visibility for repo '${RUNNER_REPO}'" >&2
       exit 5
     fi
-    if [ "$is_priv" != "true" ]; then
+    if repo_fork_wf_json="$(run_gh_api api "repos/${RUNNER_REPO}/actions/permissions/fork-pr-workflows-private-repos")"; then
+      if ! repo_fork_wf="$(printf '%s\n' "$repo_fork_wf_json" | jq -r 'if has("run_workflows_from_fork_pull_requests") and (.run_workflows_from_fork_pull_requests | type == "boolean") then (.run_workflows_from_fork_pull_requests | tostring) else "" end')"; then
+        repo_fork_wf=""
+      fi
+    else
       if [ "$ALLOW_PUBLIC_FORK_EXPOSURE" = "1" ]; then
-        echo "WARNING: non-private repo '${RUNNER_REPO}' (private=${is_priv:-<unset>}) allowed via --allow-public-fork-exposure; pull_request_target bypasses GitHub fork-approval settings, so public access requires explicit operator workflow review" >&2
+        repo_fork_wf="<api-error>"
       else
-        echo "ERROR: repo '${RUNNER_REPO}' has private='${is_priv:-<unset>}' (non-private); pull_request_target bypasses GitHub fork-approval settings so public access requires explicit operator workflow review + --allow-public-fork-exposure (or moving the runner to a private-only repo/runner group)" >&2
+        echo "ERROR: failed to query fork-pr-workflows-private-repos for repo '${RUNNER_REPO}'" >&2
+        exit 5
+      fi
+    fi
+    if [ "$is_priv" != "true" ] || [ "$repo_fork_wf" != "false" ]; then
+      if [ "$ALLOW_PUBLIC_FORK_EXPOSURE" = "1" ]; then
+        echo "WARNING: repo '${RUNNER_REPO}' (private=${is_priv:-<unset>}, run_workflows_from_fork_pull_requests=${repo_fork_wf:-<unset>}) allowed via --allow-public-fork-exposure; pull_request_target and private-fork workflows bypass fork-approval protection and require explicit operator workflow review" >&2
+      else
+        echo "ERROR: repo '${RUNNER_REPO}' failed server-side fork protection (private='${is_priv:-<unset>}', run_workflows_from_fork_pull_requests='${repo_fork_wf:-<unset>}'); requires private=true and run_workflows_from_fork_pull_requests=false (pull_request_target bypasses GitHub fork-approval settings; pass --allow-public-fork-exposure only after explicit operator workflow review)" >&2
         exit 5
       fi
     fi
@@ -804,17 +833,38 @@ verify_server_fork_protection() {
       echo "ERROR: runner group '${RUNNER_GROUP:-<default>}' missing id in org '${RUNNER_ORG}'" >&2
       exit 5
     }
-    if ! allows_pub="$(printf '%s\n' "$group_json" | jq -r 'if has("allows_public_repositories") then (.allows_public_repositories | tostring) else "" end')" || \
-       ! restricted_wf="$(printf '%s\n' "$group_json" | jq -r 'if has("restricted_to_workflows") then (.restricted_to_workflows | tostring) else "unknown" end')" || \
-       ! selected_wf_count="$(printf '%s\n' "$group_json" | jq -r '(.selected_workflows // []) | length')"; then
+    if ! group_detail_json="$(run_gh_api api "orgs/${RUNNER_ORG}/actions/runner-groups/${VERIFIED_RUNNER_GROUP_ID}")"; then
+      echo "ERROR: failed to query runner group '${RUNNER_GROUP:-<default>}' (id=${VERIFIED_RUNNER_GROUP_ID}) in org '${RUNNER_ORG}'" >&2
+      exit 5
+    fi
+    if [ -z "$group_detail_json" ]; then
+      echo "ERROR: empty runner group detail response for '${RUNNER_GROUP:-<default>}' (id=${VERIFIED_RUNNER_GROUP_ID}) in org '${RUNNER_ORG}'" >&2
+      exit 5
+    fi
+    if ! allows_pub="$(printf '%s\n' "$group_detail_json" | jq -r 'if has("allows_public_repositories") and (.allows_public_repositories | type == "boolean") then (.allows_public_repositories | tostring) else "" end')" || \
+       ! restricted_wf="$(printf '%s\n' "$group_detail_json" | jq -r 'if has("restricted_to_workflows") and (.restricted_to_workflows | type == "boolean") then (.restricted_to_workflows | tostring) else "unknown" end')" || \
+       ! selected_wf_count="$(printf '%s\n' "$group_detail_json" | jq -r 'if (.selected_workflows | type) == "array" then (.selected_workflows | length) else 0 end')" || \
+       ! selected_wf_valid="$(printf '%s\n' "$group_detail_json" | jq -r 'if ((.selected_workflows | type) == "array") and ((.selected_workflows | length) > 0) and (.selected_workflows | all((type == "string") and (length > 0) and test("^[^\\s@]+@[^\\s]+$"))) then "true" else "false" end')"; then
       echo "ERROR: failed to parse runner group policy fields in org '${RUNNER_ORG}'" >&2
       exit 5
     fi
-    if [ "$allows_pub" != "false" ]; then
+    if org_fork_wf_json="$(run_gh_api api "orgs/${RUNNER_ORG}/actions/permissions/fork-pr-workflows-private-repos")"; then
+      if ! org_fork_wf="$(printf '%s\n' "$org_fork_wf_json" | jq -r 'if has("run_workflows_from_fork_pull_requests") and (.run_workflows_from_fork_pull_requests | type == "boolean") then (.run_workflows_from_fork_pull_requests | tostring) else "" end')"; then
+        org_fork_wf=""
+      fi
+    else
       if [ "$ALLOW_PUBLIC_FORK_EXPOSURE" = "1" ]; then
-        echo "WARNING: org '${RUNNER_ORG}' runner group '${RUNNER_GROUP:-<default>}' (id=${VERIFIED_RUNNER_GROUP_ID}, allows_public_repositories=${allows_pub:-<unset>}, restricted_to_workflows=${restricted_wf}, selected_workflows=${selected_wf_count}) allowed via --allow-public-fork-exposure; pull_request_target bypasses GitHub fork-approval settings, so public access requires explicit operator workflow review" >&2
+        org_fork_wf="<api-error>"
       else
-        echo "ERROR: org '${RUNNER_ORG}' runner group '${RUNNER_GROUP:-<default>}' (id=${VERIFIED_RUNNER_GROUP_ID}) has allows_public_repositories='${allows_pub:-<unset>}' (restricted_to_workflows=${restricted_wf}, selected_workflows=${selected_wf_count}); pull_request_target bypasses GitHub fork-approval settings so public access requires explicit operator workflow review + --allow-public-fork-exposure (or moving the runner to a private-only runner group with allows_public_repositories=false)" >&2
+        echo "ERROR: failed to query fork-pr-workflows-private-repos for org '${RUNNER_ORG}'" >&2
+        exit 5
+      fi
+    fi
+    if [ "$allows_pub" != "false" ] || [ "$restricted_wf" != "true" ] || [ "$selected_wf_valid" != "true" ] || [ "$org_fork_wf" != "false" ]; then
+      if [ "$ALLOW_PUBLIC_FORK_EXPOSURE" = "1" ]; then
+        echo "WARNING: org '${RUNNER_ORG}' runner group '${RUNNER_GROUP:-<default>}' (id=${VERIFIED_RUNNER_GROUP_ID}, allows_public_repositories=${allows_pub:-<unset>}, restricted_to_workflows=${restricted_wf}, selected_workflows=${selected_wf_count}, selected_workflows_pinned=${selected_wf_valid}, run_workflows_from_fork_pull_requests=${org_fork_wf:-<unset>}) allowed via --allow-public-fork-exposure; pull_request_target bypasses GitHub fork-approval settings, so exposed/unrestricted access requires explicit operator workflow review" >&2
+      else
+        echo "ERROR: org '${RUNNER_ORG}' runner group '${RUNNER_GROUP:-<default>}' (id=${VERIFIED_RUNNER_GROUP_ID}) has allows_public_repositories='${allows_pub:-<unset>}' (restricted_to_workflows=${restricted_wf}, selected_workflows=${selected_wf_count}, selected_workflows_pinned=${selected_wf_valid}, run_workflows_from_fork_pull_requests=${org_fork_wf:-<unset>}); requires allows_public_repositories=false, restricted_to_workflows=true, non-empty @-pinned selected_workflows, and run_workflows_from_fork_pull_requests=false (pull_request_target bypasses GitHub fork-approval settings; pass --allow-public-fork-exposure only after explicit operator workflow review)" >&2
         exit 5
       fi
     fi
@@ -1080,9 +1130,6 @@ if [ "$DRY_RUN" -eq 1 ]; then
     echo "BINARY_SOURCE=download:v${RUNNER_VERSION}"
   fi
   dry_config_cmd="ACTIONS_RUNNER_INPUT_TOKEN=<redacted> ${RUNNER_DIR}/config.sh --unattended --url ${RUNNER_URL} --name ${RUNNER_NAME} --work ${WORK_DIR} --labels ${LABELS} --no-default-labels"
-  if [ "$FORCE_REPLACE_NAME" -eq 1 ]; then
-    dry_config_cmd+=" --replace"
-  fi
   if [ -n "$RUNNER_GROUP" ]; then
     dry_config_cmd+=" --runnergroup ${RUNNER_GROUP}"
   fi
@@ -1094,24 +1141,50 @@ fi
 acquire_setup_lock || exit 1
 verify_server_fork_protection
 
-# Authority: safe --replace collision guard per operator ask (2026-11-18, #L16) and origin/main:AGENTS.md:246-247 (self-outage prevention: never hijack another host's runner registration).
+# Authority: ID-bound replacement guard per operator ask (2026-11-18, #L16) and origin/main:AGENTS.md:246-247 (self-outage prevention: never hijack or --replace another host's runner registration).
 resolve_replace_collision_policy() {
-  local prev_id="${1:-}" pre_runners_pages="" colliding_ids=""
-  use_replace=0
+  local prev_id="${1:-}" pre_runners_pages="" matching_json="" match_count=0 colliding_id="" colliding_busy="false"
+  VERIFIED_DELETE_AGENT_ID=""
   if ! pre_runners_pages="$(run_gh_api api --paginate "$RUNNERS_API")"; then
     echo "ERROR: failed to query live runners from $RUNNERS_API before configuration" >&2
     exit 1
   fi
-  colliding_ids="$(printf '%s\n' "$pre_runners_pages" | jq -sr --arg name "$RUNNER_NAME" '[.[].runners[]? | select(.name == $name) | (.id | tostring)] | unique | join(",")')"
-  if [ -n "$colliding_ids" ]; then
-    if [ "$FORCE_REPLACE_NAME" -eq 1 ]; then
-      use_replace=1
-    elif [ -n "$prev_id" ] && [ "$colliding_ids" = "$prev_id" ]; then
-      use_replace=1
-    else
-      echo "ERROR: live runner '${RUNNER_NAME}' (id=${colliding_ids}) already exists on GitHub (${RUNNERS_API}) while local .runner agentId is '${prev_id:-<none>}'; refusing --replace to avoid colliding with another host's runner (pass --force-replace-name to override)" >&2
+  if ! matching_json="$(printf '%s\n' "$pre_runners_pages" | jq -sc --arg name "$RUNNER_NAME" '[.[].runners[]? | select(.name == $name) | {id: (if (.id | type) == "number" then (.id | tostring) else (.id // "" | tostring) end), busy: (.busy == true)}]')"; then
+    echo "ERROR: failed to parse live runners JSON from $RUNNERS_API before configuration" >&2
+    exit 1
+  fi
+  if ! match_count="$(printf '%s\n' "$matching_json" | jq -r 'length')" || [[ ! "$match_count" =~ ^[0-9]+$ ]]; then
+    echo "ERROR: failed to count matching runners from $RUNNERS_API" >&2
+    exit 1
+  fi
+  if [ "$match_count" -eq 0 ]; then
+    return 0
+  fi
+  if [ "$match_count" -gt 1 ]; then
+    echo "ERROR: multiple live runners named '${RUNNER_NAME}' exist on GitHub (${RUNNERS_API}); refusing replacement to avoid colliding with another host's runner" >&2
+    exit 6
+  fi
+  colliding_id="$(printf '%s\n' "$matching_json" | jq -r '.[0].id // empty')"
+  colliding_busy="$(printf '%s\n' "$matching_json" | jq -r 'if .[0].busy == true then "true" else "false" end')"
+  if [[ ! "$colliding_id" =~ ^[0-9]+$ ]] || [ "$colliding_id" -le 0 ]; then
+    echo "ERROR: live runner '${RUNNER_NAME}' returned invalid numeric id '${colliding_id}' on GitHub (${RUNNERS_API})" >&2
+    exit 6
+  fi
+  if [ -n "$prev_id" ] && [ "$colliding_id" = "$prev_id" ]; then
+    if [ "$colliding_busy" = "true" ]; then
+      echo "ERROR: live runner '${RUNNER_NAME}' (id=${colliding_id}) is currently busy executing a job; refusing replacement" >&2
       exit 6
     fi
+    VERIFIED_DELETE_AGENT_ID="$prev_id"
+  elif [ "$FORCE_REPLACE_NAME" -eq 1 ]; then
+    if [ "$colliding_busy" = "true" ]; then
+      echo "ERROR: live runner '${RUNNER_NAME}' (id=${colliding_id}) is currently busy executing a job; refusing forced replacement" >&2
+      exit 6
+    fi
+    VERIFIED_DELETE_AGENT_ID="$colliding_id"
+  else
+    echo "ERROR: live runner '${RUNNER_NAME}' (id=${colliding_id}) already exists on GitHub (${RUNNERS_API}) while local .runner agentId is '${prev_id:-<none>}'; refusing replacement to avoid colliding with another host's runner (pass --force-replace-name to override)" >&2
+    exit 6
   fi
 }
 
@@ -1140,7 +1213,7 @@ if [ "$needs_config" -eq 0 ]; then
   fi
 fi
 
-use_replace=0
+VERIFIED_DELETE_AGENT_ID=""
 prev_agent_id=""
 if [ "$needs_config" -eq 1 ]; then
   if [ -f "${RUNNER_DIR}/.runner" ]; then
@@ -1341,6 +1414,18 @@ if [ "$needs_config" -eq 1 ]; then
     fi
   done
 
+  if [ -n "${VERIFIED_DELETE_AGENT_ID:-}" ]; then
+    del_out=""
+    del_rc=0
+    del_out="$(run_gh_api api --method DELETE "${RUNNERS_API}/${VERIFIED_DELETE_AGENT_ID}" 2>&1)" || del_rc=$?
+    if [ "$del_rc" -ne 0 ]; then
+      if ! printf '%s' "$del_out" | grep -qiE 'HTTP 404|404 Not Found|Not Found'; then
+        echo "ERROR: failed to delete verified runner registration '${RUNNER_NAME}' (id=${VERIFIED_DELETE_AGENT_ID}) via ${RUNNERS_API}/${VERIFIED_DELETE_AGENT_ID} (rc=${del_rc}): ${del_out}; service ${PLIST_LABEL} remains stopped. Backup preserved at ${BACKUP_DIR}." >&2
+        exit 4
+      fi
+    fi
+  fi
+
   rm -f "${RUNNER_DIR}/.runner" "${RUNNER_DIR}/.credentials" "${RUNNER_DIR}/.credentials_rsaparams" "${RUNNER_DIR}/.runner_migrated" "${RUNNER_DIR}/.credentials_migrated"
   if [ ! -d "$RUNNER_DIR" ] || [ ! -x "${RUNNER_DIR}/config.sh" ]; then
     echo "ERROR: missing executable ${RUNNER_DIR}/config.sh; service ${PLIST_LABEL} remains stopped. Backup preserved at ${BACKUP_DIR}." >&2
@@ -1357,9 +1442,6 @@ if [ "$needs_config" -eq 1 ]; then
       --labels "$RUNNER_LABELS"
       --no-default-labels
     )
-    if [ "$use_replace" -eq 1 ]; then
-      config_args+=(--replace)
-    fi
     if [ -n "$RUNNER_GROUP" ]; then
       config_args+=(--runnergroup "$RUNNER_GROUP")
     fi
@@ -1422,7 +1504,7 @@ if [ "$needs_config" -eq 0 ] && [ "$RECONFIGURE" -eq 0 ] && [ "$plist_matches" -
     fi
     if ! verify_runner_online "$POST_CONFIG_VERIFY_ATTEMPTS"; then
       if [ "$needs_config" -eq 1 ] || [ "$service_started_by_setup" -eq 1 ]; then
-        stop_launchagent || true
+        rollback_unverified_launchagent
       fi
       exit 1
     fi
@@ -1453,7 +1535,7 @@ else
   fi
   if ! verify_runner_online "$POST_CONFIG_VERIFY_ATTEMPTS"; then
     if [ "$needs_config" -eq 1 ] || [ "$service_started_by_setup" -eq 1 ]; then
-      stop_launchagent || true
+      rollback_unverified_launchagent
     fi
     if [ "$needs_config" -eq 1 ]; then
       exit 4

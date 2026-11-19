@@ -271,6 +271,31 @@ lookup_repo_map() {
   return 1
 }
 case "$*" in
+  *"--method DELETE"*"actions/runners/"*)
+    del_id="$(printf '%s' "$*" | sed -E 's#.*actions/runners/([0-9]+).*#\1#')"
+    if [ -n "${GH_DELETE_LOG:-}" ]; then
+      printf '%s\n' "$del_id" >> "$GH_DELETE_LOG"
+    fi
+    if [ "${GH_DELETE_RUNNER_404:-0}" = "1" ]; then
+      echo "gh: Not Found (HTTP 404)" >&2
+      exit 1
+    fi
+    if [ "${GH_DELETE_RUNNER_FAIL:-0}" = "1" ]; then
+      echo "gh: HTTP 500: simulated runner delete error" >&2
+      exit 1
+    fi
+    if [ -n "${GH_DELETED_MARKER_FILE:-}" ]; then
+      : > "$GH_DELETED_MARKER_FILE"
+    fi
+    ;;
+  *"actions/permissions/fork-pr-workflows-private-repos"*)
+    if [ "${FORK_PR_WORKFLOWS_PRIVATE_REPOS_FAIL:-0}" = "1" ]; then
+      echo "gh: HTTP 500: fork-pr-workflows-private-repos error" >&2
+      exit 1
+    fi
+    default_fork_pr_wf='{"run_workflows_from_fork_pull_requests":false}'
+    emit_json "${FORK_PR_WORKFLOWS_PRIVATE_REPOS_JSON:-$default_fork_pr_wf}"
+    ;;
   *"actions/runners/registration-token"*)
     if [ -n "${GH_FAIL_REG_TOKEN:-}" ]; then
       echo "gh: HTTP 500: registration-token error" >&2
@@ -301,8 +326,22 @@ case "$*" in
     default_group_repos='{"total_count":0,"repositories":[]}'
     emit_json "${GROUP_REPOS_JSON:-$default_group_repos}"
     ;;
+  *"actions/runner-groups/"*[0-9])
+    default_groups='{"total_count":1,"runner_groups":[{"id":1,"name":"Default","default":true,"allows_public_repositories":false,"restricted_to_workflows":true,"selected_workflows":["jleechanorg/ez-gh-actions/.github/workflows/ci.yml@refs/heads/main"]}]}'
+    if [ -n "${RUNNER_GROUP_DETAIL_JSON:-}" ]; then
+      emit_json "$RUNNER_GROUP_DETAIL_JSON"
+    else
+      gid="$(printf '%s' "$*" | sed -E 's#.*actions/runner-groups/([0-9]+).*#\1#')"
+      detail="$(printf '%s\n' "${RUNNER_GROUPS_JSON:-$default_groups}" | jq -c --arg gid "$gid" '.runner_groups[]? | select((.id | tostring) == $gid)' | head -n1)"
+      if [ -z "$detail" ]; then
+        echo "gh: Not Found (HTTP 404)" >&2
+        exit 1
+      fi
+      emit_json "$detail"
+    fi
+    ;;
   *"actions/runner-groups"*)
-    default_groups='{"total_count":1,"runner_groups":[{"id":1,"name":"Default","default":true,"allows_public_repositories":false}]}'
+    default_groups='{"total_count":1,"runner_groups":[{"id":1,"name":"Default","default":true,"allows_public_repositories":false,"restricted_to_workflows":true,"selected_workflows":["jleechanorg/ez-gh-actions/.github/workflows/ci.yml@refs/heads/main"]}]}'
     emit_json "${RUNNER_GROUPS_JSON:-$default_groups}"
     ;;
   *"orgs/"*"/repos"*)
@@ -389,13 +428,18 @@ HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-v
 
 # --verify fails if live GitHub runner has forbidden 'self-hosted' or 'worldai-testflight-native-mac' or mismatched labels.
 for bad_live in \
-  '{"runners":[{"id":101,"name":"mac-native-ci-1","labels":[{"name":"self-hosted-native-macos"},{"name":"self-hosted"}]}]}' \
-  '{"runners":[{"id":101,"name":"mac-native-ci-1","labels":[{"name":"worldai-testflight-native-mac"}]}]}' \
-  '{"runners":[{"id":101,"name":"mac-native-ci-1","labels":[{"name":"other-label"}]}]}'; do
-  if LIVE_RUNNERS_JSON="$bad_live" HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
-      "$SETUP_SCRIPT" --verify >/dev/null 2>&1; then
+  '{"runners":[{"id":101,"name":"mac-native-ci-1","status":"online","labels":[{"name":"self-hosted-native-macos"},{"name":"self-hosted"}]}]}' \
+  '{"runners":[{"id":101,"name":"mac-native-ci-1","status":"online","labels":[{"name":"worldai-testflight-native-mac"}]}]}' \
+  '{"runners":[{"id":101,"name":"mac-native-ci-1","status":"online","labels":[{"name":"other-label"}]}]}'; do
+  bad_live_err=""
+  if bad_live_err="$(
+    LIVE_RUNNERS_JSON="$bad_live" HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
+      "$SETUP_SCRIPT" --verify 2>&1 >/dev/null
+  )"; then
     fail "--verify must fail when live GitHub labels mismatch or include forbidden label: $bad_live"
   fi
+  grep -qiE 'forbidden label|missing required label|live labels .* != expected' <<<"$bad_live_err" || \
+    fail "--verify negative label check must fail at label enforcement (got: $bad_live_err)"
 done
 
 # --verify --offline skips gh call and succeeds locally.
@@ -1099,7 +1143,7 @@ PUB_OPEN_GROUPS='{"total_count":1,"runner_groups":[{"id":1,"name":"Default","def
 PUB_WF_EMPTY_GROUPS='{"total_count":1,"runner_groups":[{"id":1,"name":"Default","default":true,"allows_public_repositories":true,"restricted_to_workflows":true,"selected_workflows":[]}]}'
 PUB_WF_RESTRICTED_GROUPS='{"total_count":1,"runner_groups":[{"id":1,"name":"Default","default":true,"allows_public_repositories":true,"restricted_to_workflows":true,"selected_workflows":["jleechanorg/disk_magician/.github/workflows/ci.yml@refs/heads/main"]}]}'
 PUB_UNKNOWN_GROUPS='{"total_count":1,"runner_groups":[{"id":1,"name":"Default","default":true,"restricted_to_workflows":true,"selected_workflows":["jleechanorg/disk_magician/.github/workflows/ci.yml@refs/heads/main"]}]}'
-MIXED_GROUPS='{"total_count":2,"runner_groups":[{"id":1,"name":"Default","default":true,"allows_public_repositories":true},{"id":2,"name":"macos-restricted","default":false,"allows_public_repositories":false}]}'
+MIXED_GROUPS='{"total_count":2,"runner_groups":[{"id":1,"name":"Default","default":true,"allows_public_repositories":true,"restricted_to_workflows":false,"selected_workflows":[]},{"id":2,"name":"macos-restricted","default":false,"allows_public_repositories":false,"restricted_to_workflows":true,"selected_workflows":["jleechanorg/ez-gh-actions/.github/workflows/ci.yml@refs/heads/main"]}]}'
 : > "$TMP/gh-fork.log"
 fork_rc=0
 GH_RUNNER_CALL_LOG="$TMP/gh-fork.log" RUNNER_GROUPS_JSON="$PUB_OPEN_GROUPS" FORK_APPROVAL_JSON='{"approval_policy":"first_time_contributors"}' \
@@ -1476,14 +1520,17 @@ grep -q 'config.sh ' "$TMP/config.log" || fail "fresh setup without live collisi
 ! grep -q -- '--token' "$TMP/config.log" || fail "config.sh must never receive --token in argv"
 
 : > "$TMP/config.log"
-RUNNER_GROUPS_JSON="$MIXED_GROUPS" FORK_APPROVAL_JSON='{"approval_policy":"first_time_contributors"}' \
+: > "$TMP/gh-delete-20.log"
+GH_DELETE_LOG="$TMP/gh-delete-20.log" \
+  RUNNER_GROUPS_JSON="$MIXED_GROUPS" FORK_APPROVAL_JSON='{"approval_policy":"first_time_contributors"}' \
   LIVE_RUNNERS_JSON='{"runners":[{"id":101,"name":"mac-native-ci-1","status":"online","labels":[{"name":"self-hosted-native-macos"}]}]}' \
   HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
   EXISTING_RUNNER_DIR="$EXISTING_SYM" \
   "$SETUP_SCRIPT" --runner-dir "$FRESH_COLLIDE" --reconfigure --runner-group macos-restricted >/dev/null
-grep -q -- '--replace' "$TMP/config.log" || fail "--reconfigure with matching local agentId=101 must pass --replace"
+! grep -q -- '--replace' "$TMP/config.log" || fail "--reconfigure must NEVER pass --replace to config.sh"
+[ "$(tr -d '\r\n' < "$TMP/gh-delete-20.log")" = "101" ] || fail "--reconfigure with matching local agentId=101 must DELETE only id=101 (got: $(cat "$TMP/gh-delete-20.log"))"
 ! grep -q -- '--token' "$TMP/config.log" || fail "--reconfigure must never pass --token in argv"
-pass "safe --replace collision guard and ACTIONS_RUNNER_INPUT_TOKEN handling hold"
+pass "ID-bound DELETE replacement guard and ACTIONS_RUNNER_INPUT_TOKEN handling hold"
 
 # 21. Realpath containment: existing RUNNER_DIR with bin/Runner.Listener symlinked into EXISTING_RUNNER_DIR
 #     fails --verify and gets repaired into an isolated copy (including nested symlinks rewritten relatively).
@@ -1588,18 +1635,21 @@ retry_backups=("$RETRY_RUNNER"/.backup-pre-reconfigure.*)
 
 cp "$EXISTING_SYM/config.sh" "$RETRY_RUNNER/config.sh"
 : > "$TMP/config.log"
+: > "$TMP/gh-delete-23.log"
 rm -f "$TMP/launchctl.loaded"
-RUNNER_GROUPS_JSON="$MIXED_GROUPS" FORK_APPROVAL_JSON='{"approval_policy":"first_time_contributors"}' \
+GH_DELETE_LOG="$TMP/gh-delete-23.log" \
+  RUNNER_GROUPS_JSON="$MIXED_GROUPS" FORK_APPROVAL_JSON='{"approval_policy":"first_time_contributors"}' \
   LIVE_RUNNERS_JSON='{"runners":[{"id":101,"name":"mac-native-ci-1","status":"online","labels":[{"name":"self-hosted-native-macos"}]}]}' \
   HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
   "$SETUP_SCRIPT" --runner-dir "$RETRY_RUNNER" --reconfigure --runner-group macos-restricted >/dev/null
-grep -q -- '--replace' "$TMP/config.log" || fail "retry --reconfigure without --force-replace-name must derive prev_agent_id=101 from backup and pass --replace"
+! grep -q -- '--replace' "$TMP/config.log" || fail "retry --reconfigure must NEVER pass --replace to config.sh"
+[ "$(tr -d '\r\n' < "$TMP/gh-delete-23.log")" = "101" ] || fail "retry --reconfigure must derive prev_agent_id=101 from backup and DELETE only id=101"
 [ -f "$TMP/launchctl.loaded" ] || fail "retry --reconfigure must reload LaunchAgent"
 shopt -s nullglob
 leftover_retry_backups=("$RETRY_RUNNER"/.backup-pre-reconfigure.*)
 shopt -u nullglob
 [ "${#leftover_retry_backups[@]}" -eq 0 ] || fail "successful retry --reconfigure must remove all .backup-pre-reconfigure.* directories (found: ${leftover_retry_backups[*]})"
-pass "failed --reconfigure preserves agentId ownership proof in backup .runner for --replace retry and cleans all backups on success"
+pass "failed --reconfigure preserves agentId ownership proof in backup .runner for ID-bound DELETE retry and cleans all backups on success"
 
 # 24. Round-18 P1 hardening:
 #     a) conflicting action flags & --offline --dry-run fail closed (exit 2) before executing any branch
@@ -2017,3 +2067,250 @@ POST_CONFIG_VERIFY_ATTEMPTS=1 POST_CONFIG_VERIFY_SLEEP_SEC=0 \
 [ "$plist_offline_rc" -ne 0 ] || fail "plist-replaced runner failing verify_runner_online must fail closed"
 [ ! -e "$TMP/launchctl.loaded" ] || fail "plist-replaced runner failing post-launch verify_runner_online must stop LaunchAgent"
 pass "Round-21 regressions: malformed group JSON fails closed, backups survive until online, post-launch offline unloads service, and bin*/externals* symlinks clean cleanly"
+
+# 28. Round-22 regressions:
+#     a) P0 #1: ID-bound DELETE (never --replace), .busy == true refusal, 404-as-absent, 500 fail-closed,
+#        and concurrent foreign runner claiming RUNNER_NAME after DELETE is NEVER deleted or replaced
+#     b) P0 #2: Private --repo with run_workflows_from_fork_pull_requests=true and private runner group with
+#        restricted_to_workflows=false / unpinned selected_workflows / org fork-pr-workflows=true fail closed (exit 5)
+#     c) P0 #3: launchd/install-launchagents.sh fcntl.flock serializes concurrent cost-alert installs (closing FD 9 inside launchctl)
+#     d) P1-4: Post-launch offline rollback checks ! is_launchagent_loaded and exits 7 when LaunchAgent refuses to unload
+
+# P0 #1: --dry-run --force-replace-name never prints --replace.
+force_dry_out="$(
+  HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh" \
+    "$SETUP_SCRIPT" --dry-run --force-replace-name
+)"
+! grep -q -- '--replace' <<<"$force_dry_out" || fail "--dry-run --force-replace-name must NEVER emit --replace"
+
+# P0 #1: .busy == true matching prev_agent_id=101 fails closed with exit 6 BEFORE stopping LaunchAgent or calling DELETE.
+: > "$TMP/launchctl.loaded"
+: > "$TMP/launchctl.log"
+: > "$TMP/gh-delete-busy.log"
+busy_rc=0
+GH_DELETE_LOG="$TMP/gh-delete-busy.log" \
+  RUNNER_GROUPS_JSON="$MIXED_GROUPS" FORK_APPROVAL_JSON='{"approval_policy":"first_time_contributors"}' \
+  LIVE_RUNNERS_JSON='{"runners":[{"id":101,"name":"mac-native-ci-1","status":"online","busy":true,"labels":[{"name":"self-hosted-native-macos"}]}]}' \
+  HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
+  "$SETUP_SCRIPT" --runner-dir "$CRED_RUNNER" --reconfigure --runner-group macos-restricted >/dev/null 2>&1 || busy_rc=$?
+[ "$busy_rc" -eq 6 ] || fail "busy runner id=101 must fail closed with exit 6 (got $busy_rc)"
+[ -f "$TMP/launchctl.loaded" ] || fail "busy runner refusal must leave LaunchAgent loaded"
+! grep -Eq 'launchctl (unload|bootout)' "$TMP/launchctl.log" || fail "busy runner refusal must abort BEFORE stop_launchagent"
+[ ! -s "$TMP/gh-delete-busy.log" ] || fail "busy runner refusal must abort BEFORE calling DELETE"
+
+# P0 #1: Concurrent foreign runner (id=999) claiming RUNNER_NAME after DELETE of id=101 is NEVER deleted or replaced.
+R22_RACE_RUNNER="$TMP/home/r22-race-runner"
+mkdir -p "$R22_RACE_RUNNER/bin" "$R22_RACE_RUNNER/externals"
+cp "$EXISTING_SYM/bin.2.338.2/Runner.Listener" "$R22_RACE_RUNNER/bin/Runner.Listener"
+cp "$EXISTING_SYM/run.sh" "$R22_RACE_RUNNER/run.sh"
+: > "$R22_RACE_RUNNER/run-helper.sh.template"
+: > "$R22_RACE_RUNNER/env.sh"
+cat > "$R22_RACE_RUNNER/config.sh" <<STUB
+#!/usr/bin/env bash
+printf 'config.sh %s\n' "\$*" >> "$TMP/r22-race-config.log"
+echo "A runner exists with the same name 'mac-native-ci-1' (id=999)" >&2
+exit 1
+STUB
+chmod +x "$R22_RACE_RUNNER/config.sh"
+printf '{"agentId":101,"agentName":"mac-native-ci-1","workFolder":"%s","gitHubUrl":"https://github.com/jleechanorg"}\n' "$TMP/scratch/native-macos-ci-work" > "$R22_RACE_RUNNER/.runner"
+printf 'race-creds\n' > "$R22_RACE_RUNNER/.credentials"
+printf 'self-hosted-native-macos\n' > "$R22_RACE_RUNNER/.ezgha-labels"
+printf 'macos-restricted\n' > "$R22_RACE_RUNNER/.ezgha-group"
+: > "$TMP/launchctl.loaded"
+: > "$TMP/r22-race-config.log"
+: > "$TMP/gh-delete-race.log"
+race_collide_rc=0
+GH_DELETE_LOG="$TMP/gh-delete-race.log" \
+  RUNNER_GROUPS_JSON="$MIXED_GROUPS" FORK_APPROVAL_JSON='{"approval_policy":"first_time_contributors"}' \
+  LIVE_RUNNERS_JSON='{"runners":[{"id":101,"name":"mac-native-ci-1","status":"online","busy":false,"labels":[{"name":"self-hosted-native-macos"}]}]}' \
+  HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
+  "$SETUP_SCRIPT" --runner-dir "$R22_RACE_RUNNER" --reconfigure --runner-group macos-restricted >/dev/null 2>&1 || race_collide_rc=$?
+[ "$race_collide_rc" -eq 4 ] || fail "concurrent foreign runner collision during config.sh must exit 4 (got $race_collide_rc)"
+! grep -q -- '--replace' "$TMP/r22-race-config.log" || fail "config.sh must NEVER receive --replace during concurrent foreign race"
+[ "$(tr -d '\r\n' < "$TMP/gh-delete-race.log")" = "101" ] || fail "DELETE must target ONLY verified id=101, never foreign id=999 (got: $(cat "$TMP/gh-delete-race.log"))"
+! grep -q '999' "$TMP/gh-delete-race.log" || fail "concurrent foreign runner id=999 must NEVER be deleted"
+for b in "$R22_RACE_RUNNER"/.backup-pre-reconfigure.*; do rm -rf "${b:?}"; done
+
+# P0 #1: DELETE HTTP 500 fails closed (exit 4) preserving backup; DELETE HTTP 404 proceeds to config.sh.
+cp "$EXISTING_SYM/config.sh" "$R22_RACE_RUNNER/config.sh"
+printf '{"agentId":101,"agentName":"mac-native-ci-1","workFolder":"%s","gitHubUrl":"https://github.com/jleechanorg"}\n' "$TMP/scratch/native-macos-ci-work" > "$R22_RACE_RUNNER/.runner"
+printf 'race-creds\n' > "$R22_RACE_RUNNER/.credentials"
+del500_rc=0
+GH_DELETE_RUNNER_FAIL=1 \
+  RUNNER_GROUPS_JSON="$MIXED_GROUPS" FORK_APPROVAL_JSON='{"approval_policy":"first_time_contributors"}' \
+  LIVE_RUNNERS_JSON='{"runners":[{"id":101,"name":"mac-native-ci-1","status":"online","labels":[{"name":"self-hosted-native-macos"}]}]}' \
+  HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
+  "$SETUP_SCRIPT" --runner-dir "$R22_RACE_RUNNER" --reconfigure --runner-group macos-restricted >/dev/null 2>&1 || del500_rc=$?
+[ "$del500_rc" -eq 4 ] || fail "DELETE HTTP 500 must fail closed with exit 4 (got $del500_rc)"
+[ -f "$R22_RACE_RUNNER/.runner" ] || fail "DELETE HTTP 500 must fail before removing local .runner"
+for b in "$R22_RACE_RUNNER"/.backup-pre-reconfigure.*; do rm -rf "${b:?}"; done
+
+GH_DELETE_RUNNER_404=1 \
+  RUNNER_GROUPS_JSON="$MIXED_GROUPS" FORK_APPROVAL_JSON='{"approval_policy":"first_time_contributors"}' \
+  LIVE_RUNNERS_JSON='{"runners":[{"id":101,"name":"mac-native-ci-1","status":"online","labels":[{"name":"self-hosted-native-macos"}]}]}' \
+  HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
+  "$SETUP_SCRIPT" --runner-dir "$R22_RACE_RUNNER" --reconfigure --runner-group macos-restricted >/dev/null || \
+  fail "DELETE HTTP 404 (already absent) must proceed cleanly to config.sh"
+
+# P0 #2: Private --repo with run_workflows_from_fork_pull_requests=true (or API error) fails with exit 5 (both --reconfigure and --verify).
+priv_repo_fork_reconfig_rc=0
+REPO_META_JSON='{"private":true}' FORK_PR_WORKFLOWS_PRIVATE_REPOS_JSON='{"run_workflows_from_fork_pull_requests":true}' \
+  HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
+  "$SETUP_SCRIPT" --reconfigure --repo jleechanorg/priv >/dev/null 2>&1 || priv_repo_fork_reconfig_rc=$?
+[ "$priv_repo_fork_reconfig_rc" -eq 5 ] || fail "private --repo --reconfigure with run_workflows_from_fork_pull_requests=true must exit 5 (got $priv_repo_fork_reconfig_rc)"
+
+cat > "$R22_RACE_RUNNER/config.sh" <<STUB
+#!/usr/bin/env bash
+printf '{"agentId":101,"agentName":"mac-native-ci-1","workFolder":"%s","gitHubUrl":"https://github.com/jleechanorg/priv"}\n' "$TMP/scratch/native-macos-ci-work" > "\$(pwd)/.runner"
+printf 'creds\n' > "\$(pwd)/.credentials"
+printf 'rsa\n' > "\$(pwd)/.credentials_rsaparams"
+STUB
+chmod +x "$R22_RACE_RUNNER/config.sh"
+REPO_META_JSON='{"private":true}' FORK_PR_WORKFLOWS_PRIVATE_REPOS_JSON='{"run_workflows_from_fork_pull_requests":false}' \
+  LIVE_RUNNERS_JSON='{"runners":[{"id":101,"name":"mac-native-ci-1","status":"online","labels":[{"name":"self-hosted-native-macos"}]}]}' \
+  HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
+  "$SETUP_SCRIPT" --runner-dir "$R22_RACE_RUNNER" --reconfigure --repo jleechanorg/priv >/dev/null || \
+  fail "private --repo with run_workflows_from_fork_pull_requests=false must succeed"
+
+priv_repo_fork_rc=0
+REPO_META_JSON='{"private":true}' FORK_PR_WORKFLOWS_PRIVATE_REPOS_JSON='{"run_workflows_from_fork_pull_requests":true}' \
+  LIVE_RUNNERS_JSON='{"runners":[{"id":101,"name":"mac-native-ci-1","status":"online","labels":[{"name":"self-hosted-native-macos"}]}]}' \
+  HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
+  "$SETUP_SCRIPT" --runner-dir "$R22_RACE_RUNNER" --verify --repo jleechanorg/priv >/dev/null 2>&1 || priv_repo_fork_rc=$?
+[ "$priv_repo_fork_rc" -eq 5 ] || fail "private --repo --verify with run_workflows_from_fork_pull_requests=true must exit 5 (got $priv_repo_fork_rc)"
+
+priv_repo_err_rc=0
+REPO_META_JSON='{"private":true}' FORK_PR_WORKFLOWS_PRIVATE_REPOS_FAIL=1 \
+  LIVE_RUNNERS_JSON='{"runners":[{"id":101,"name":"mac-native-ci-1","status":"online","labels":[{"name":"self-hosted-native-macos"}]}]}' \
+  HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
+  "$SETUP_SCRIPT" --runner-dir "$R22_RACE_RUNNER" --verify --repo jleechanorg/priv >/dev/null 2>&1 || priv_repo_err_rc=$?
+[ "$priv_repo_err_rc" -eq 5 ] || fail "private --repo when fork-pr-workflows-private-repos API fails must exit 5 (got $priv_repo_err_rc)"
+
+# P0 #2: Private runner group with restricted_to_workflows=false, unpinned selected_workflows, or org run_workflows_from_fork_pull_requests=true fails with exit 5.
+python3 - "$TMP/plist.ok" "$PLIST_T" "$ESC_RUNNER" <<'PY'
+import plistlib, sys
+from pathlib import Path
+d = plistlib.loads(Path(sys.argv[1]).read_bytes())
+r = sys.argv[3]
+d["WorkingDirectory"] = r
+d["ProgramArguments"] = ["/bin/bash", f"{r}/run.sh"]
+Path(sys.argv[2]).write_bytes(plistlib.dumps(d))
+PY
+PRIV_UNRESTRICTED_GROUPS='{"total_count":1,"runner_groups":[{"id":2,"name":"macos-restricted","default":false,"allows_public_repositories":false,"restricted_to_workflows":false,"selected_workflows":[]}]}'
+PRIV_UNPINNED_GROUPS='{"total_count":1,"runner_groups":[{"id":2,"name":"macos-restricted","default":false,"allows_public_repositories":false,"restricted_to_workflows":true,"selected_workflows":["jleechanorg/ez-gh-actions/.github/workflows/ci.yml"]}]}'
+for bad_rg_json in "$PRIV_UNRESTRICTED_GROUPS" "$PRIV_UNPINNED_GROUPS"; do
+  bad_rg_rc=0
+  RUNNER_GROUPS_JSON="$bad_rg_json" \
+    HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
+    "$SETUP_SCRIPT" --verify --runner-dir "$ESC_RUNNER" --runner-group macos-restricted >/dev/null 2>&1 || bad_rg_rc=$?
+  [ "$bad_rg_rc" -eq 5 ] || fail "private runner group failing workflow-restriction check must exit 5 (got $bad_rg_rc for $bad_rg_json)"
+done
+
+org_priv_fork_rc=0
+RUNNER_GROUPS_JSON="$MIXED_GROUPS" FORK_PR_WORKFLOWS_PRIVATE_REPOS_JSON='{"run_workflows_from_fork_pull_requests":true}' \
+  HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
+  "$SETUP_SCRIPT" --verify --runner-dir "$ESC_RUNNER" --runner-group macos-restricted >/dev/null 2>&1 || org_priv_fork_rc=$?
+[ "$org_priv_fork_rc" -eq 5 ] || fail "private runner group with org run_workflows_from_fork_pull_requests=true must exit 5 (got $org_priv_fork_rc)"
+
+# P0 #3: Concurrent launchd/install-launchagents.sh cost-alert installs serialize via fcntl.flock,
+#        close FD 9 inside launchctl, and failing Install B rolls back to Install A's working script + plist + loaded state.
+CONC_HOME="$TMP/conc-cost-home"
+CONC_BIN="$TMP/conc-cost-bin"
+mkdir -p "$CONC_HOME/Library/LaunchAgents" "$CONC_HOME/.local/libexec/ezgha" "$CONC_BIN"
+: > "$CONC_HOME/trace.log"
+printf '0\n' > "$CONC_HOME/load-b-count.txt"
+cat > "$CONC_BIN/launchctl" <<STUB
+#!/usr/bin/env bash
+if { true >&9; } 2>/dev/null; then
+  echo "FD 9 leaked into launchctl (\$CONC_TAG): \$*" >&2
+  exit 98
+fi
+case "\${1:-}" in
+  print)
+    printf 'PRINT %s\n' "\${CONC_TAG:-?}" >> "$CONC_HOME/trace.log"
+    if [ -f "$CONC_HOME/loaded" ]; then
+      exit 0
+    fi
+    echo "Could not find service \"\${2:-}\" in domain" >&2
+    exit 113
+    ;;
+  unload|bootout)
+    rm -f "$CONC_HOME/loaded"
+    exit 0
+    ;;
+  load)
+    printf 'LOAD_START %s\n' "\${CONC_TAG:-?}" >> "$CONC_HOME/trace.log"
+    if [ "\${CONC_TAG:-}" = "A" ]; then
+      : > "$CONC_HOME/a-in-load"
+      sleep 1.0
+      : > "$CONC_HOME/loaded"
+      printf 'LOAD_END A\n' >> "$CONC_HOME/trace.log"
+      exit 0
+    fi
+    if [ "\${CONC_TAG:-}" = "B" ]; then
+      cnt="\$(cat "$CONC_HOME/load-b-count.txt")"
+      cnt=\$((cnt + 1))
+      printf '%s\n' "\$cnt" > "$CONC_HOME/load-b-count.txt"
+      if [ "\$cnt" -eq 1 ]; then
+        printf 'LOAD_FAIL B\n' >> "$CONC_HOME/trace.log"
+        exit 42
+      fi
+      : > "$CONC_HOME/loaded"
+      printf 'LOAD_ROLLBACK_OK B\n' >> "$CONC_HOME/trace.log"
+      exit 0
+    fi
+    exit 0
+    ;;
+esac
+exit 0
+STUB
+chmod +x "$CONC_BIN/launchctl"
+
+CONC_TAG=A INSTALL_LOCK_TIMEOUT_SEC=15 BASH_ENV=/dev/null HOME="$CONC_HOME" PATH="$CONC_BIN:$PATH" \
+  bash "$INSTALL_LAUNCHAGENTS" install org.jleechanorg.ezgha-gh-actions-cost-alert >/dev/null &
+conc_pid_a=$!
+while [ ! -f "$CONC_HOME/a-in-load" ]; do sleep 0.05; done
+
+CONC_TAG=B INSTALL_LOCK_TIMEOUT_SEC=15 BASH_ENV=/dev/null HOME="$CONC_HOME" PATH="$CONC_BIN:$PATH" \
+  bash "$INSTALL_LAUNCHAGENTS" install org.jleechanorg.ezgha-gh-actions-cost-alert >/dev/null 2>&1 &
+conc_pid_b=$!
+
+conc_rc_a=0; wait "$conc_pid_a" || conc_rc_a=$?
+conc_rc_b=0; wait "$conc_pid_b" || conc_rc_b=$?
+[ "$conc_rc_a" -eq 0 ] || fail "concurrent Install A must succeed (got $conc_rc_a)"
+[ "$conc_rc_b" -eq 42 ] || fail "concurrent Install B with failing first load must exit 42 (got $conc_rc_b)"
+[ -f "$CONC_HOME/loaded" ] || fail "failing Install B must roll back and leave Install A's service loaded"
+[ -x "$CONC_HOME/.local/libexec/ezgha/gh-actions-cost-alert.sh" ] || fail "failing Install B must preserve Install A's gh-actions-cost-alert.sh"
+[ -f "$CONC_HOME/Library/LaunchAgents/org.jleechanorg.ezgha-gh-actions-cost-alert.plist" ] || fail "failing Install B must preserve Install A's plist"
+CONC_TRACE="$CONC_HOME/trace.log" python3 - <<'PY' || fail "concurrent install flock ordering violated"
+import os
+from pathlib import Path
+lines = [l.strip() for l in Path(os.environ["CONC_TRACE"]).read_text().splitlines() if l.strip()]
+assert "LOAD_END A" in lines and "PRINT B" in lines, f"missing expected trace markers: {lines!r}"
+assert lines.index("LOAD_END A") < lines.index("PRINT B"), f"Install B entered critical section before A finished: {lines!r}"
+assert "LOAD_ROLLBACK_OK B" in lines, f"Install B did not reload A's prior plist on rollback: {lines!r}"
+PY
+
+# P1-4: Post-launch offline rollback checks ! is_launchagent_loaded and exits 7 when LaunchAgent refuses to unload.
+python3 - "$TMP/plist.ok" "$PLIST_T" "$ESC_RUNNER" <<'PY'
+import plistlib, sys
+from pathlib import Path
+d = plistlib.loads(Path(sys.argv[1]).read_bytes())
+r = sys.argv[3]
+d["WorkingDirectory"] = r
+d["ProgramArguments"] = ["/bin/bash", f"{r}/run.sh"]
+Path(sys.argv[2]).write_bytes(plistlib.dumps(d))
+PY
+rm -f "$TMP/launchctl.loaded"
+p14_rc=0
+p14_err="$(
+  LAUNCHCTL_REFUSE_STOP=1 POST_CONFIG_VERIFY_ATTEMPTS=1 POST_CONFIG_VERIFY_SLEEP_SEC=0 \
+  RUNNER_GROUPS_JSON="$MIXED_GROUPS" FORK_APPROVAL_JSON='{"approval_policy":"first_time_contributors"}' \
+  LIVE_RUNNERS_JSON='{"runners":[{"id":101,"name":"mac-native-ci-1","status":"offline","labels":[{"name":"self-hosted-native-macos"}]}]}' \
+  HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
+  "$SETUP_SCRIPT" --runner-dir "$ESC_RUNNER" --runner-group macos-restricted 2>&1 >/dev/null
+)" || p14_rc=$?
+[ "$p14_rc" -eq 7 ] || fail "post-launch offline rollback when LaunchAgent refuses unload must exit 7 (got $p14_rc)"
+grep -q 'ERROR: failed to unload unverified LaunchAgent' <<<"$p14_err" || \
+  fail "post-launch offline unload failure must print explicit error (got: $p14_err)"
+pass "Round-22 regressions: ID-bound DELETE (no --replace), workflow/private-fork gates, launchd install flock, and exit 7 unload guard hold"

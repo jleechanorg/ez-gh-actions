@@ -244,6 +244,8 @@ jq -e '
   and .notificationChannels == ["projects/worldarchitecture-ai/notificationChannels/14071650426226468737"]
   and .enabled == true
   and .severity == "CRITICAL"
+  and (.documentation.content | contains("${log.extracted_label.status}") and contains("${log.extracted_label.detail}"))
+  and .conditions[0].conditionMatchedLog.labelExtractors == {"status":"EXTRACT(jsonPayload.status)","detail":"EXTRACT(jsonPayload.message)"}
   and (.conditions[0].conditionMatchedLog.filter | contains("jsonPayload.source=\"gh-actions-cost-alert\"") and contains("severity>=ERROR") and contains("jsonPayload.status=\"BLIND\"") and contains("severity>=WARNING") and (contains("cause=\"fleet\"") | not))
 ' <<<"$policy_json" >/dev/null || fail "--ensure-gcp-policy --dry-run emitted invalid or fleet-coupled policy JSON"
 POLICY_JSON="$policy_json" python3 - <<'PY' || fail "--ensure-gcp-policy filter semantics failed"
@@ -1349,3 +1351,60 @@ leftover_tmp_files="$(find "$ISOLATED_TMPDIR" -mindepth 1)"
 [ -z "$leftover_tmp_files" ] || \
   fail "App-token fallback must leave zero temp files in TMPDIR (found: $leftover_tmp_files)"
 pass "Round-21 fixes: prior-month rollover schema isolation and fallback temp-file cleanup hold"
+
+# 27. Round-22 fixes:
+#     a) P1-1: Rollover prior-month row with object-valued sku/unitType/repositoryName fails prior-month validation
+#        and preserves valid current-month net/MTD breach in billing_api_partial mode
+#     b) P1-3: App-token fallback recognizes xcode-* labels (e.g. xcode-27) as hosted macOS (macos_minutes + unpriced partial)
+cat > "$TMP/billing-prev-badsku.json" <<'JSON'
+{
+  "usageItems": [
+    {"date":"2026-11-30T12:00:00Z","product":"actions","sku":{"bad":1},"quantity":10.0,"unitType":"Minutes","grossAmount":99.00,"netAmount":99.00,"repositoryName":"worldarchitect.ai"}
+  ]
+}
+JSON
+printf '{"sent":{},"last_sent":0,"api_failures":0,"last_blind":0,"pending_corrupt_reset":false}\n' > "$TMP/state-prev-badsku.json"
+prev_badsku_out="$(
+  TARGET_DATE_UTC=2026-12-01 \
+  BILLING_FIXTURE="$TMP/billing-dec-valid.json" \
+  BILLING_PREV_FIXTURE="$TMP/billing-prev-badsku.json" \
+  REPOS_FIXTURE="$TMP/repos.json" RUNS_FIXTURE="$TMP/runs.json" JOBS_FIXTURE_DIR="$TMP/jobs" \
+  run_alert "$TMP/state-prev-badsku.json" "$TMP/gcloud-prev-badsku.log" "$TMP/gh-prev-badsku.log"
+)"
+grep -q 'mode=billing_api_partial' <<<"$prev_badsku_out" || \
+  fail "object-valued sku in prior-month rollover row must stay mode=billing_api_partial (got: $prev_badsku_out)"
+! grep -q 'app_token_fallback' <<<"$prev_badsku_out" || \
+  fail "object-valued sku in prior-month rollover row must NOT discard valid current-month data into fallback"
+grep -q 'mtd_gross=60.00 mtd_net=50.00' <<<"$prev_badsku_out" || \
+  fail "object-valued sku in prior-month rollover row must preserve current-month MTD gross/net (got: $prev_badsku_out)"
+grep -q '"net_usd":50' "$TMP/gcloud-prev-badsku.log" || \
+  fail "object-valued sku in prior-month rollover row must preserve current-month daily net_usd=50 alert"
+
+cat > "$TMP/runs-xcode.json" <<'JSON'
+{
+  "workflow_runs": [
+    {"id":9501,"status":"completed","conclusion":"success","created_at":"2026-11-18T01:00:00Z","updated_at":"2026-11-18T02:15:00Z"}
+  ]
+}
+JSON
+cat > "$TMP/jobs/9501.json" <<'JSON'
+{
+  "total_count": 1,
+  "jobs": [
+    {"id":51,"labels":["xcode-27"],"started_at":"2026-11-18T01:00:00Z","completed_at":"2026-11-18T02:15:00Z"}
+  ]
+}
+JSON
+xcode_out="$(
+  BILLING_STUB_FAIL=1 REPOS_FIXTURE="$TMP/repos.json" RUNS_FIXTURE="$TMP/runs-xcode.json" JOBS_FIXTURE_DIR="$TMP/jobs" \
+  run_alert "$TMP/state-xcode.json" "$TMP/gcloud-xcode.log" "$TMP/gh-xcode.log"
+)"
+grep -q 'mode=app_token_fallback_partial' <<<"$xcode_out" || \
+  fail "xcode-27 unpriced hosted macOS label must mark mode=app_token_fallback_partial (got: $xcode_out)"
+[ "$(error_count "$TMP/gcloud-xcode.log")" = 1 ] || \
+  fail "75m xcode-27 must trip DAILY_MACOS_MIN_WARN COST_SPIKE"
+grep -q '"macos_minutes":75' "$TMP/gcloud-xcode.log" || \
+  fail "xcode-27 must report macos_minutes=75"
+grep -q '"gross_usd":0' "$TMP/gcloud-xcode.log" || \
+  fail "xcode-27 unpriced hosted label must keep gross_usd=0"
+pass "Round-22 fixes: prior-month sku/unitType/repositoryName validation and xcode-* fallback macOS detection hold"
