@@ -94,7 +94,12 @@ pass "behavioral: unset defaults to the owning bead"
 # P1 from review: the reporting was inside the LOCAL_DISABLED branch only, so a
 # Linux doctor checking a parked Mac printed neither the pointer nor the warning,
 # contradicting the "every parked run" promise in AGENTS.md.
-REMOTE_BLOCK="$(sed -n '1452,1471p' "$D")"
+# Anchor on the branch body by CONTENT, not line numbers: a hardcoded range
+# silently pointed at the wrong lines as soon as upstream shifted, and a
+# line-pinned test is a false green waiting to happen.
+REMOTE_START=$(grep -n 'REMOTE_DISABLED" -eq 1 \]; then' "$D" | head -1 | cut -d: -f1)
+[ -n "$REMOTE_START" ] || fail "could not locate the remote parked-leg branch"
+REMOTE_BLOCK="$(sed -n "${REMOTE_START},$((REMOTE_START + 30))p" "$D")"
 grep -q 'suspension record' <<<"$REMOTE_BLOCK" \
   || fail "the REMOTE parked-leg branch does not report the suspension record"
 grep -q 'no suspension record declared for the parked' <<<"$REMOTE_BLOCK" \
@@ -115,7 +120,7 @@ remote_harness() { # value | "unset"
     echo 'REMOTE_LABEL="macos(macbook)"'
     # Strip the leading `if [ "$REMOTE_DISABLED" -eq 1 ]; then` guard and the
     # trailing `fi`/elif so the branch body runs standalone.
-    sed -n '1452,1471p' "$D"
+    sed -n "${REMOTE_START},$((REMOTE_START + 30))p" "$D" | sed '1d' | sed '/^elif/,$d'
   } > "$WORK/remote.sh"
   bash "$WORK/remote.sh"
 }

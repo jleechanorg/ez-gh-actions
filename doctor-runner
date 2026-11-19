@@ -657,32 +657,155 @@ fi
 # jobs API and confirming the runner_name that handled it belongs to our
 # fleet. A completed run whose runner_name does not match RUNNER_NAME_PREFIX
 # means the job went to a retired fleet / GitHub-hosted / somewhere else.
+# Which leg is PARKED, decided here rather than in section 10.
+# Section 7 (execution proof) and the --prove canary both attribute runs to a
+# leg and must exclude a known-parked one. The authoritative assignment lives in
+# section 10, which runs AFTER both -- reading it there was the ordering defect
+# behind bead jleechan-p9uq. Only the DECLARATION moves here; the per-slot remote
+# inventory (and its SSH config read) stays in section 10.
+#
+# Explicit `if` blocks, never `[ .. ] && VAR=1`: a false test returns 1 and under
+# `set -o errexit` that can abort the whole script.
+PARKED_LOCAL=0
+PARKED_REMOTE=0
+if [ "${LOCAL_DISABLED:-0}" -eq 1 ]; then PARKED_LOCAL=1; fi
+if [ "$PLATFORM" = "macos" ]; then
+  if [ "${REMOTE_LINUX_DISABLED:-0}" = "1" ]; then PARKED_REMOTE=1; fi
+else
+  if [ "${MAC_RUNNER_DISABLED:-0}" = "1" ]; then PARKED_REMOTE=1; fi
+fi
+# Leg attribution for the proof gates below (bead jleechan-p9uq).
+#
+# The parked-leg exclusion is only as good as the prefix it matches. A GUESSED
+# default is not sufficient: a host configured with a historical or custom
+# prefix (e.g. ez-mac-runner-g-*) would miss the exclusion and then satisfy the
+# broad `ez-*` fleet fallback -- so a parked leg would still count as proof.
+# Read the real configured prefix over SSH instead, and ALSO remember the
+# default, so either spelling is recognised as the parked leg.
+#
+# An explicit override still wins, and section 10 re-reads authoritatively.
+if [ "$PLATFORM" = "macos" ]; then
+  REMOTE_HOST_EARLY="${REMOTE_LINUX_HOST:-jeff-ubuntu}"
+  _rcfg_files='~/.config/ezgha/config.toml'
+  DEFAULT_REMOTE_PREFIX="ez-runner-c"
+  EXPLICIT_REMOTE_PREFIX="${REMOTE_LINUX_PREFIX:-}"
+else
+  REMOTE_HOST_EARLY="${EXPLICIT_WORK_HOST:-macbook}"
+  _rcfg_files='~/Library/Application\ Support/org.jleechanorg.ezgha/config.toml ~/.config/ezgha/config.toml'
+  DEFAULT_REMOTE_PREFIX="ez-mac-runner-h"
+  EXPLICIT_REMOTE_PREFIX="${MAC_RUNNER_NAME_PREFIX:-}"
+fi
+_early_remote_cfg_get() {  # $1 = grep pattern
+  local _t _v
+  for _t in 4 10; do
+    _v=$(timeout "$_t" ssh -o ConnectTimeout=$((_t - 1)) -o BatchMode=yes "$REMOTE_HOST_EARLY" "grep -hE '$1' $_rcfg_files 2>/dev/null | head -1 | cut -d= -f2 | sed -E 's/#.*//; s/[^A-Za-z0-9_.-]//g'" 2>/dev/null) || _v=""
+    if [ -n "$_v" ]; then printf '%s' "$_v"; return 0; fi
+  done
+  return 0
+}
+# EARLY attribution prefix. This must NOT populate REMOTE_PREFIX itself: section
+# 10 owns that variable and its own config read, and pre-setting it made section
+# 10 skip its authoritative lookup, which changed contract/underprovisioned
+# behaviour tested elsewhere. So the early value lives in its own variable and
+# REMOTE_PREFIX is left exactly as this script found it.
+
+# Mirrors src/docker_backend.rs::runner_name_matches_prefix: a name belongs to a
+# prefix only when it is exactly `prefix-<digits>`. Glob matching is not identity
+# — `ez-runner-c` is a prefix of `ez-runner-custom-mac`.
+# Single attribution decision shared by section 7 and the --prove canary.
+# Echoes: fleet | parked | unattributed  (fleet = counts as execution proof).
+_classify_run_leg() {  # $1 = runner name
+  local _n="$1" _lh=0 _rh=0
+  _runner_matches_prefix "$_n" "${RUNNER_NAME_PREFIX:-}" && _lh=1
+  _runner_matches_prefix "$_n" "${EARLY_REMOTE_PREFIX:-${REMOTE_PREFIX:-}}" && _rh=1
+  if [ "$_lh" -eq 1 ]; then
+    if [ "$PARKED_LOCAL" -eq 1 ]; then printf 'parked'; else printf 'fleet'; fi
+  elif [ "$_rh" -eq 1 ]; then
+    if [ "$PARKED_REMOTE" -eq 1 ]; then printf 'parked'; else printf 'fleet'; fi
+  else
+    printf 'unattributed'
+  fi
+}
+
+_runner_matches_prefix() {  # $1 = runner name, $2 = configured prefix
+  local _n="$1" _p="$2" _rest
+  [ -n "$_p" ] || return 1
+  case "$_n" in
+    "${_p}-"*) _rest="${_n#"${_p}"-}" ;;
+    *) return 1 ;;
+  esac
+  [ -n "$_rest" ] || return 1
+  case "$_rest" in
+    *[!0-9]*) return 1 ;;
+  esac
+  return 0
+}
+# Attribution prefix for the proof gates. Unknown stays UNKNOWN: an unreadable
+# remote config must never become a guessed identity, because a guess lets a
+# default-named historical runner be credited to a leg that actually uses some
+# other prefix (review: "a guessed remote default can count as positive
+# execution proof"). REMOTE_PREFIX_UNKNOWN is reported as INCONCLUSIVE instead.
+EARLY_REMOTE_PREFIX="${REMOTE_PREFIX:-${EXPLICIT_REMOTE_PREFIX:-}}"
+if [ -z "$EARLY_REMOTE_PREFIX" ]; then EARLY_REMOTE_PREFIX="$(_early_remote_cfg_get '^name_prefix')"; fi
+REMOTE_PREFIX_UNKNOWN=0
+if [ -z "$EARLY_REMOTE_PREFIX" ]; then REMOTE_PREFIX_UNKNOWN=1; fi
+
 section "7. real job-execution proof (last ${ROUTING_N:-6} ezgha-selftest runs)"
 ROUTING_N="${ROUTING_N:-6}"
 REAL_ON_FLEET=0
 REAL_TOTAL=0
+# The loop ALWAYS runs. It covers both fleets and each run is attributed to a
+# leg, so it is the proof for whichever leg is ENABLED. Skipping it when this
+# host is parked let a parked Mac pass while the enabled Linux leg had no
+# successful selftest at all -- idle remote capacity passed without proof
+# (review P0). Only the VERDICT gate is exempted for a parked leg, and only
+# because a parked leg cannot contribute a registration of its own.
 if [ "$LOCAL_DISABLED" -eq 1 ]; then
-  # A parked leg has no registrations by definition, so no run can ever be
-  # attributed to it. Requiring execution proof from a deliberately empty fleet
-  # is the same defect as requiring it from a DOWN slot: state the truth instead.
-  ok "real job-execution proof NOT REQUIRED — $PLATFORM leg intentionally DISABLED (operator opt-out), so it has no runners to execute on; unset the opt-out to require proof"
-else
+  info "this $PLATFORM leg is intentionally DISABLED and contributes no executions; the count below covers the enabled leg(s)"
+fi
+# The loop runs even when a leg is parked: it covers BOTH fleets, so it is the
+# proof for whichever leg is still ENABLED. Skipping it entirely would report a
+# parked Mac as fine while Linux had no successful selftest at all.
+_LP="${RUNNER_NAME_PREFIX:-}"
+_RP="${EARLY_REMOTE_PREFIX:-${REMOTE_PREFIX:-}}"
+if [ "${REMOTE_PREFIX_UNKNOWN:-0}" -eq 1 ]; then
+  # Unknown remote identity cannot attribute a remote run. Say so instead of
+  # guessing, and let the enabled leg's own successes carry the proof.
+  warn "remote runner prefix UNKNOWN (config unreadable) — remote-leg runs cannot be attributed this tick; INCONCLUSIVE, not proof"
+fi
 while read -r rid; do
   [ -z "$rid" ] && continue
   REAL_TOTAL=$((REAL_TOTAL+1))
   jobs=$($(command -v gh) api "repos/$EZGHA_REPO/actions/runs/$rid/jobs" 2>/dev/null)
   rn=$(echo "$jobs" | jq -r '.jobs[0].runner_name // "?"' 2>/dev/null)
   conc=$(echo "$jobs" | jq -r '.jobs[0].conclusion // "?"' 2>/dev/null)
-  if [[ "$rn" == "${RUNNER_NAME_PREFIX}"* ]] || [[ "$rn" == "${RUNNER_NAME_PREFIX}-"* ]] || [[ "$rn" == "${REMOTE_PREFIX:-ez}"* ]] || [[ "$rn" == "ez-"* ]]; then
+  # Positive attribution: a success counts only if it matches an ENABLED leg's
+  # exact prefix. Anything else is INCONCLUSIVE, never proof.
+  _any_parked=0
+  if [ "$PARKED_LOCAL" -eq 1 ] || [ "$PARKED_REMOTE" -eq 1 ]; then _any_parked=1; fi
+
+  _leg=$(_classify_run_leg "$rn")
+  _is_fleet=0; _parked_leg=0; _unattributed=0
+  case "$_leg" in
+    fleet)        _is_fleet=1 ;;
+    parked)       _parked_leg=1 ;;
+    unattributed) _unattributed=1 ;;
+  esac
+  if [ "$_is_fleet" -eq 1 ] && [ "$_parked_leg" -eq 0 ]; then
     ok "run $rid: $conc on $rn (our fleet)"
     [ "$conc" = "success" ] && REAL_ON_FLEET=$((REAL_ON_FLEET+1))
+  elif [ "$_parked_leg" -eq 1 ]; then
+    warn "run $rid: $conc on $rn (fleet member, but that leg is parked — NOT execution proof)"
+  elif [ "$_unattributed" -eq 1 ]; then
+    warn "run $rid: $conc on $rn (not attributable to an ENABLED leg — INCONCLUSIVE, not proof)"
   else
     warn "run $rid: $conc on $rn (NOT ${RUNNER_NAME_PREFIX}-* / ez-*)"
   fi
 done < <($(command -v gh) run list -R "$EZGHA_REPO" -w ezgha-selftest -L "$ROUTING_N" --json databaseId --jq '.[].databaseId' 2>/dev/null)
 info "real jobs succeeded on our fleet: $REAL_ON_FLEET / $REAL_TOTAL"
-fi
-# end of the parked-host gate for section 7 (bead jleechan-hxz0)
+# Section 7 no longer skips the loop for a parked leg: the per-run attribution
+# above is what excludes it. The verdict gate still exempts a parked leg, because
+# a parked leg cannot contribute a registration of its own (bead jleechan-hxz0).
 
 # --- E2. optional live canary: dispatch a job and prove it runs NOW ------
 # `--prove` dispatches a fresh ezgha-selftest and blocks until it completes,
@@ -711,7 +834,19 @@ if [ "$PROVE" = "1" ]; then
     jobs=$($(command -v gh) api "repos/$EZGHA_REPO/actions/runs/$cid/jobs" 2>/dev/null)
     rn=$(echo "$jobs" | jq -r '.jobs[0].runner_name // "?"')
     conc=$(echo "$jobs" | jq -r '.jobs[0].conclusion // "?"')
-    if { [[ "$rn" == "${RUNNER_NAME_PREFIX}"* ]] || [[ "$rn" == "${RUNNER_NAME_PREFIX}-"* ]] || [[ "$rn" == "${REMOTE_PREFIX:-ez}"* ]] || [[ "$rn" == "ez-"* ]]; } && [ "$conc" = "success" ]; then
+    # Same exact attribution as section 7, so the two proof paths cannot
+    # disagree about which leg a run belongs to.
+    _cn_leg=$(_classify_run_leg "$rn")
+    _cn_parked=0; _cn_enabled=0
+    case "$_cn_leg" in
+      fleet)  _cn_enabled=1 ;;
+      parked) _cn_parked=1 ;;
+    esac
+    if [ "$_cn_parked" -eq 1 ]; then
+      bad "canary run $cid: $conc on $rn — that leg is intentionally DISABLED, so it cannot prove the enabled fleet is handling jobs"
+    elif [ "$_cn_enabled" -ne 1 ]; then
+      bad "canary run $cid: $conc on $rn — not attributable to an ENABLED leg, so it cannot prove the enabled fleet is handling jobs"
+    elif [ "$conc" = "success" ]; then
       ok "canary run $cid: success on $rn — fleet is handling real jobs NOW"
       CANARY_OK=1
     else
@@ -1472,6 +1607,8 @@ if [ "$REMOTE_DISABLED" -eq 1 ]; then
 elif timeout 5 ssh -o ConnectTimeout=4 -o BatchMode=yes "$REMOTE_HOST" true >/dev/null 2>&1; then
   # Config lookup: one retry with a longer timeout. A failed read leaves the
   # value EMPTY (never a hardcoded guess) -> remote fleet marked UNPROVEN below.
+  # Section 10 owns _rcfg_files/_remote_cfg_get; an EARLY, separately-named
+  # reader above section 7 supplies attribution without shadowing these.
   if [ "$PLATFORM" = "macos" ]; then
     _rcfg_files='~/.config/ezgha/config.toml'
   else
@@ -1486,6 +1623,20 @@ elif timeout 5 ssh -o ConnectTimeout=4 -o BatchMode=yes "$REMOTE_HOST" true >/de
     return 0
   }
   [ -n "$REMOTE_PREFIX" ] || REMOTE_PREFIX=$(_remote_cfg_get '^name_prefix')
+  # Section 7 ran EARLIER and could not attribute the remote leg if the early
+  # lookup failed; its observations are not replayed. Now that the authoritative
+  # prefix is known, adopt it so the final execution gate does not fail on a
+  # recovered identity, and clear the stale UNKNOWN marker. (Review note: the
+  # later-recovery case could otherwise produce a false red.)
+  if [ "${REMOTE_PREFIX_UNKNOWN:-0}" -eq 1 ] && [ -n "$REMOTE_PREFIX" ]; then
+    EARLY_REMOTE_PREFIX="$REMOTE_PREFIX"
+    REMOTE_PREFIX_UNKNOWN=0
+    # Do NOT silently claim the earlier pass proved anything: its remote runs were
+    # never attributed. Say so, and let the gate report UNPROVEN rather than RED
+    # when this is the only reason it would fail.
+    REMOTE_PROOF_NOT_RECOUNTED=1
+    info "remote runner prefix resolved on retry ($REMOTE_PREFIX); section 7 did not recount remote runs, so remote-side proof is UNPROVEN this tick"
+  fi
   _remote_count_src="config"
   if [ -z "$REMOTE_COUNT" ]; then REMOTE_COUNT=$(_remote_cfg_get '^count[[:space:]]*='); else _remote_count_src="override"; fi
   if [ -z "$REMOTE_PREFIX" ] || [ -z "$REMOTE_COUNT" ]; then
@@ -1790,10 +1941,27 @@ if [ "$LOOP_FAILS" -gt 3 ]; then
     warn "ensure_count failed $LOOP_FAILS times in last ${LOOP_WINDOW}m (transient reconcile miss; $HEALTHY_RUNNERS healthy runners online)"
   fi
 fi
-# real-execution gate: at least one recent job must have succeeded on our fleet
-if [ "${REAL_ON_FLEET:-0}" -lt 1 ] && [ "$LOCAL_DISABLED" -ne 1 ]; then
-  bad "verdict: real-execution gate FAILED (observed REAL_ON_FLEET=${REAL_ON_FLEET:-0} of REAL_TOTAL=${REAL_TOTAL:-0} recent runs, expected>=1 successful run on our fleet)"
-  CRITICAL=$((CRITICAL+1))
+# real-execution gate: at least one recent job must have succeeded on our fleet.
+#
+# The exemption is for a ZERO-LEG contract only. Exempting merely because THIS
+# host is parked let a parked Mac pass with twenty enabled-but-idle Linux slots
+# and zero successful selftests: "fleet healthy: 20/20 healthy: 0 executing ...
+# 20 idle-ok" (review P0). Section 7 now attributes per leg, so when any leg is
+# ENABLED this gate must be enforced -- the parked leg simply cannot supply the
+# success, which is exactly what the gate is meant to detect.
+# Use the EARLY parked flags, not REMOTE_DISABLED: that variable is assigned in
+# section 10, long after this gate.
+_ENABLED_LEG_EXISTS=1
+if [ "$PARKED_LOCAL" -eq 1 ] && [ "$PARKED_REMOTE" -eq 1 ]; then _ENABLED_LEG_EXISTS=0; fi
+if [ "${REAL_ON_FLEET:-0}" -lt 1 ] && [ "$_ENABLED_LEG_EXISTS" -eq 1 ]; then
+  if [ "${REMOTE_PROOF_NOT_RECOUNTED:-0}" -eq 1 ]; then
+    # The only missing proof is remote-side, and the prefix was resolved too late
+    # to attribute it. Report UNPROVEN, not a red gate.
+    warn "verdict: real-execution gate UNPROVEN (remote prefix resolved after section 7; remote runs were not recounted — not counted as a failure)"
+  else
+    bad "verdict: real-execution gate FAILED (observed REAL_ON_FLEET=${REAL_ON_FLEET:-0} of REAL_TOTAL=${REAL_TOTAL:-0} recent runs, expected>=1 successful run on an ENABLED leg)"
+    CRITICAL=$((CRITICAL+1))
+  fi
 fi
 # canary gate (only when --prove): the live job must have run on our fleet
 if [ "$PROVE" = "1" ] && [ -z "$CANARY_OK" ]; then
