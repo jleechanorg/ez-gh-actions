@@ -2,15 +2,15 @@
   "fleets": {
     "linux": {
       "disk": {
-        "status": "critical"
+        "status": "healthy"
       },
       "fleet": {
         "configured": 20,
-        "cycling": 3,
-        "down": 0,
-        "executing": 13,
-        "idle": 4,
-        "reserved": 18
+        "cycling": 11,
+        "down": 1,
+        "executing": 8,
+        "idle": 0,
+        "reserved": 8
       },
       "sources": {
         "config": {
@@ -47,7 +47,7 @@
         "down": 1,
         "executing": 3,
         "idle": 0,
-        "reserved": 1
+        "reserved": 4
       },
       "sources": {
         "config": {
@@ -75,16 +75,16 @@
       }
     }
   },
-  "observed_at": "2026-11-19T00:42:04Z",
-  "published_at": "2026-11-19T00:43:08Z",
+  "observed_at": "2026-11-19T00:54:49Z",
+  "published_at": "2026-11-19T00:55:55Z",
   "queue": {
-    "fresh": 1,
+    "fresh": 5,
     "ghosts": 164,
     "ok": true,
-    "oldest_fresh_wait_minutes": 48,
+    "oldest_fresh_wait_minutes": 49,
     "repos": [
       {
-        "fresh": 1,
+        "fresh": 5,
         "ghosts": 149,
         "repo": "jleechanorg/worldarchitect.ai"
       },
