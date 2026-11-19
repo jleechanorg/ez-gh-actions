@@ -10,7 +10,12 @@ target = "jleechanorg"
 
 [runner]
 labels = ["self-hosted", "self-hosted-mikey", "ezgha", "macOS", "ARM64"]
-count = 4
+# DISABLED 2026-11-18: Mac docker fleet suspended by operator instruction - the four
+# runner containers were consuming ~200% CPU on the host (Colima VM at 233%, load avg 546,
+# 20k threads) while competing with active cmux agent lanes. Suspension record: bead
+# jleechan-hxz0 (the DISABLED-not-DOWN declaration) - set count = 4 and re-declare with
+# EZGHA_SUSPENSION_RECORD to restore. Do NOT infer this opt-out from live docker state.
+count = 0
 image = "ezgha-runner:latest"
 name_prefix = "ez-mac-runner-h"
 guest_reserve_mb = 2048
