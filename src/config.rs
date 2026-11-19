@@ -766,9 +766,9 @@ impl Config {
             validate_cgroup_parent(parent)?;
         }
         require_at_least_one("limits.min_free_disk_gb", self.limits.min_free_disk_gb)?;
-        if self.runner.count < 1 {
+        if self.runner.count == 0 && self.limits.cgroup_parent.is_some() {
             anyhow::bail!(
-                "runner.count must be at least 1 (got {})",
+                "runner.count must be at least 1 when limits.cgroup_parent is set (got {})",
                 self.runner.count
             );
         }
@@ -1608,6 +1608,11 @@ host_containment = "bare-metal"
     fn reject_zero_count() {
         let mut cfg = valid_config();
         cfg.runner.count = 0;
+        // Deliberately parked configs without a cgroup slice (e.g. macOS) allow count = 0.
+        cfg.limits.cgroup_parent = None;
+        assert!(cfg.validate().is_ok());
+
+        cfg.limits.cgroup_parent = Some("actions.slice".into());
         assert!(cfg.validate().is_err());
     }
 

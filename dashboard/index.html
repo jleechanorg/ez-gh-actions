@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="color-scheme" content="dark" />
-    <title>Runner Local Capacity Status</title>
+    <title>Runner Local Capacity &amp; CI Latency Status</title>
     <link rel="stylesheet" href="style.css" />
     <script src="dashboard.js" defer></script>
   </head>
@@ -51,14 +51,55 @@
         Checking runner local capacity.
       </p>
 
+      <section class="systems-panel reconcile-panel" aria-labelledby="reconcile-heading">
+        <header>
+          <div>
+            <p class="panel-code">RUN-VS-SLOT RECONCILIATION</p>
+            <h2 id="reconcile-heading">Why Does GitHub Show N Runs In Progress?</h2>
+          </div>
+        </header>
+        <p id="reconcile-summary" class="queue-summary">
+          Run-vs-slot reconciliation unavailable this snapshot.
+        </p>
+        <dl class="reconcile-grid">
+          <div class="reconcile-card">
+            <dt>Active Workflow Runs</dt>
+            <dd id="reconcile-runs">—</dd>
+          </div>
+          <div class="reconcile-card">
+            <dt>Active Job Slots Occupied</dt>
+            <dd id="reconcile-slots">—</dd>
+          </div>
+          <div class="reconcile-card">
+            <dt>Idle Slots</dt>
+            <dd id="reconcile-idle">—</dd>
+          </div>
+          <div class="reconcile-card">
+            <dt>Down / Parked / Cycling</dt>
+            <dd id="reconcile-unavailable">—</dd>
+          </div>
+          <div class="reconcile-card">
+            <dt>Fresh Queued Runs</dt>
+            <dd id="reconcile-fresh">—</dd>
+          </div>
+          <div class="reconcile-card">
+            <dt>Inert Ghosts (0 Jobs)</dt>
+            <dd id="reconcile-ghosts">—</dd>
+          </div>
+        </dl>
+      </section>
+
       <div
         class="fleet-grid"
         aria-label="Runner local capacity aggregate counts"
       >
         <section class="fleet-panel" aria-labelledby="mac-heading">
           <header>
-            <p class="panel-code">FLEET 01</p>
-            <h2 id="mac-heading">macOS / ARM64</h2>
+            <div>
+              <p class="panel-code">FLEET 01</p>
+              <h2 id="mac-heading">macOS / ARM64</h2>
+            </div>
+            <span id="mac-state-badge" class="host-badge">UNKNOWN</span>
           </header>
           <dl class="metric-grid">
             <div>
@@ -82,6 +123,10 @@
               <dd id="mac-down">—</dd>
             </div>
             <div>
+              <dt>Parked</dt>
+              <dd id="mac-parked">—</dd>
+            </div>
+            <div>
               <dt>Reserved slots</dt>
               <dd id="mac-reserved">—</dd>
             </div>
@@ -91,15 +136,23 @@
             <strong id="mac-disk">UNKNOWN</strong>
           </div>
           <div class="verification-row">
+            <span>Health / opt-out</span>
+            <strong id="mac-pause-reason">—</strong>
+          </div>
+          <div class="verification-row">
             <span>Watchdog misses</span>
             <strong id="mac-watchdog">—</strong>
           </div>
+          <div id="mac-slots" class="slot-grid" aria-label="Mac runner slots"></div>
         </section>
 
         <section class="fleet-panel" aria-labelledby="linux-heading">
           <header>
-            <p class="panel-code">FLEET 02</p>
-            <h2 id="linux-heading">Linux / X64</h2>
+            <div>
+              <p class="panel-code">FLEET 02</p>
+              <h2 id="linux-heading">Linux / X64</h2>
+            </div>
+            <span id="linux-state-badge" class="host-badge">UNKNOWN</span>
           </header>
           <dl class="metric-grid">
             <div>
@@ -132,16 +185,102 @@
             <strong id="linux-disk">UNKNOWN</strong>
           </div>
           <div class="verification-row">
+            <span>Admission status</span>
+            <strong id="linux-pause-reason">—</strong>
+          </div>
+          <div class="verification-row">
             <span>Watchdog misses</span>
             <strong id="linux-watchdog">—</strong>
           </div>
+          <div id="linux-slots" class="slot-grid" aria-label="Linux runner slots"></div>
         </section>
       </div>
 
+      <section class="systems-panel" aria-labelledby="cmux-heading">
+        <header>
+          <div>
+            <p class="panel-code">FLEET 03 // CLOUD VMs</p>
+            <h2 id="cmux-heading">cmux Cloud Runner Pool</h2>
+          </div>
+          <span id="cmux-state-badge" class="host-badge">UNAVAILABLE</span>
+        </header>
+        <p id="cmux-summary" class="queue-summary">
+          cmux Cloud VM pool telemetry unavailable this snapshot.
+        </p>
+        <dl class="metric-grid metric-grid--five">
+          <div>
+            <dt>Configured</dt>
+            <dd id="cmux-target">—</dd>
+          </div>
+          <div>
+            <dt>Executing</dt>
+            <dd id="cmux-executing">—</dd>
+          </div>
+          <div>
+            <dt>Idle</dt>
+            <dd id="cmux-idle">—</dd>
+          </div>
+          <div>
+            <dt>Cycling</dt>
+            <dd id="cmux-cycling">—</dd>
+          </div>
+          <div>
+            <dt>Down</dt>
+            <dd id="cmux-down">—</dd>
+          </div>
+        </dl>
+        <div id="cmux-slots" class="cmux-vm-grid" aria-label="cmux Cloud VM runner slots"></div>
+      </section>
+
+      <section class="systems-panel latency-panel" aria-labelledby="latency-heading">
+        <header>
+          <div>
+            <p class="panel-code">CI LATENCY TELEMETRY</p>
+            <h2 id="latency-heading">Queue Wait, Execution &amp; E2E (avg / p50 / p90 / p99)</h2>
+          </div>
+          <span id="latency-cancel-rate" class="host-badge">CANCELLED: —</span>
+        </header>
+        <p id="latency-summary" class="queue-summary">
+          CI latency percentiles unavailable this snapshot.
+        </p>
+        <div class="latency-grid">
+          <div class="latency-card">
+            <p class="queue-kicker">QUEUE WAIT (CREATED → STARTED)</p>
+            <dl class="percentile-row">
+              <div><dt>AVG</dt><dd id="latency-queue-avg">—</dd></div>
+              <div><dt>P50</dt><dd id="latency-queue-p50">—</dd></div>
+              <div><dt>P90</dt><dd id="latency-queue-p90">—</dd></div>
+              <div><dt>P99</dt><dd id="latency-queue-p99">—</dd></div>
+            </dl>
+          </div>
+          <div class="latency-card">
+            <p class="queue-kicker">JOB EXECUTION (STARTED → COMPLETED)</p>
+            <dl class="percentile-row">
+              <div><dt>AVG</dt><dd id="latency-exec-avg">—</dd></div>
+              <div><dt>P50</dt><dd id="latency-exec-p50">—</dd></div>
+              <div><dt>P90</dt><dd id="latency-exec-p90">—</dd></div>
+              <div><dt>P99</dt><dd id="latency-exec-p99">—</dd></div>
+            </dl>
+          </div>
+          <div class="latency-card">
+            <p class="queue-kicker">END-TO-END RUN WALL</p>
+            <dl class="percentile-row">
+              <div><dt>AVG</dt><dd id="latency-e2e-avg">—</dd></div>
+              <div><dt>P50</dt><dd id="latency-e2e-p50">—</dd></div>
+              <div><dt>P90</dt><dd id="latency-e2e-p90">—</dd></div>
+              <div><dt>P99</dt><dd id="latency-e2e-p99">—</dd></div>
+            </dl>
+          </div>
+        </div>
+        <div id="latency-workflows" class="latency-workflows"></div>
+      </section>
+
       <section class="systems-panel" aria-labelledby="systems-heading">
         <header>
-          <p class="panel-code">SUPPORT SYSTEMS</p>
-          <h2 id="systems-heading">Guardrails</h2>
+          <div>
+            <p class="panel-code">SUPPORT SYSTEMS</p>
+            <h2 id="systems-heading">Guardrails</h2>
+          </div>
         </header>
         <dl class="systems-grid">
           <div>
@@ -158,19 +297,22 @@
           </div>
         </dl>
       </section>
+
       <section class="systems-panel queue-panel" aria-labelledby="queue-heading">
         <header>
-          <p class="panel-code">WORK QUEUE</p>
-          <h2 id="queue-heading">Waiting work vs GitHub ghosts</h2>
+          <div>
+            <p class="panel-code">WORK QUEUE</p>
+            <h2 id="queue-heading">Waiting work vs GitHub ghosts</h2>
+          </div>
         </header>
         <p id="queue-summary" class="queue-summary">
           Queue breakdown unavailable this snapshot.
         </p>
         <div class="queue-grid">
           <div class="queue-card queue-fresh">
-            <p class="queue-kicker">FRESH — ACTUALLY WAITING</p>
+            <p id="queue-fresh-label" class="queue-kicker">FRESH — ACTUALLY WAITING</p>
             <p id="queue-fresh" class="queue-value">—</p>
-            <p class="queue-note">Queued runs that own at least one job.</p>
+            <p id="queue-fresh-note" class="queue-note">Queued runs that own at least one job.</p>
           </div>
           <div class="queue-card queue-ghost">
             <p class="queue-kicker">GHOSTS — INERT</p>
@@ -184,7 +326,7 @@
           <div class="queue-card">
             <p class="queue-kicker">OLDEST FRESH WAIT</p>
             <p id="queue-oldest" class="queue-value">—</p>
-            <p class="queue-note">Age of the longest-waiting run that has real work.</p>
+            <p id="queue-oldest-note" class="queue-note">Age of the longest-waiting run that has real work.</p>
           </div>
         </div>
         <div id="queue-repos" class="queue-repos"></div>
@@ -195,8 +337,9 @@
       <p>
         Local capacity comes from each host. The queue block separates runs that are
         genuinely waiting from zero-job ghosts GitHub will not release; it does not
-        assert queue health or job pickup latency. Snapshots refresh every ten
-        minutes, and unknown values are never treated as zero.
+        assert queue health, while the latency block summarizes queue-wait, execution,
+        and end-to-end percentiles from recent completed runs. Snapshots refresh every
+        ten minutes, and unknown values are never treated as zero.
       </p>
     </footer>
   </body>

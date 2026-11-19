@@ -8,6 +8,7 @@
   --live: #b7f36b;
   --stale: #ff704d;
   --signal: #f4c95d;
+  --parked: #7ca7d9;
   font-family: 'SFMono-Regular', 'Cascadia Mono', 'Liberation Mono', monospace;
   background: var(--base);
   color: var(--ink);
@@ -178,6 +179,36 @@ footer {
   text-align: right;
 }
 
+.host-badge {
+  padding: 0.3rem 0.6rem;
+  border: 1px solid var(--line);
+  font-size: 0.72rem;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.host-badge[data-state='live'] {
+  color: var(--live);
+  border-color: var(--live);
+}
+
+.host-badge[data-state='parked'] {
+  color: var(--parked);
+  border-color: var(--parked);
+}
+
+.host-badge[data-state='degraded'] {
+  color: var(--signal);
+  border-color: var(--signal);
+}
+
+.host-badge[data-state='critical'] {
+  color: var(--stale);
+  border-color: var(--stale);
+}
+
 .fleet-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -192,11 +223,13 @@ footer {
 .fleet-panel > header,
 .systems-panel > header {
   padding-bottom: 1rem;
+  margin-bottom: 0.85rem;
   border-bottom: 1px solid var(--line);
 }
 
 .metric-grid,
-.systems-grid {
+.systems-grid,
+.reconcile-grid {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 1px;
@@ -209,18 +242,35 @@ footer {
   grid-template-columns: repeat(3, minmax(0, 1fr));
 }
 
+.metric-grid--five {
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+}
+
+.reconcile-grid {
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  margin-bottom: 0;
+}
+
 .metric-grid div,
-.systems-grid div {
+.systems-grid div,
+.reconcile-grid div {
   min-width: 0;
-  padding: clamp(0.8rem, 2vw, 1.4rem);
+  padding: clamp(0.7rem, 1.5vw, 1.15rem);
   background: var(--panel);
 }
 
 .metric-grid dd {
   margin-top: 0.5rem;
-  font-size: clamp(2rem, 5vw, 4.5rem);
+  font-size: clamp(1.8rem, 4vw, 3.4rem);
   font-weight: 800;
   line-height: 1;
+}
+
+.reconcile-grid dd {
+  margin-top: 0.45rem;
+  font-size: clamp(1.2rem, 2.5vw, 2rem);
+  font-weight: 800;
+  line-height: 1.1;
 }
 
 .systems-grid dd {
@@ -230,15 +280,143 @@ footer {
 }
 
 .verification-row {
-  padding: 0.8rem 1rem;
+  padding: 0.65rem 0.9rem;
   border: 1px dashed var(--line);
+  margin-bottom: 0.5rem;
   color: var(--muted);
-  font-size: 0.75rem;
+  font-size: 0.74rem;
   text-transform: uppercase;
 }
 
 .verification-row strong {
   color: var(--ink);
+  text-align: right;
+}
+
+.slot-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(10.5rem, 1fr));
+  gap: 0.45rem;
+  margin-top: 0.85rem;
+}
+
+.slot-chip {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  padding: 0.5rem 0.6rem;
+  border: 1px solid var(--line);
+  border-left: 0.3rem solid var(--muted);
+  background: rgb(255 255 255 / 0.02);
+  font-size: 0.72rem;
+}
+
+.slot-chip--executing {
+  border-left-color: var(--live);
+}
+
+.slot-chip--idle {
+  border-left-color: var(--signal);
+}
+
+.slot-chip--cycling {
+  border-left-color: var(--signal);
+}
+
+.slot-chip--down,
+.slot-chip--offline {
+  border-left-color: var(--stale);
+}
+
+.slot-chip--parked {
+  border-left-color: var(--parked);
+}
+
+.slot-chip--unknown {
+  border-left-color: var(--muted);
+}
+
+.slot-chip-id {
+  font-weight: 800;
+  color: var(--ink);
+}
+
+.slot-chip-meta {
+  color: var(--muted);
+  font-size: 0.68rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cmux-vm-grid {
+  display: grid;
+  gap: 0.75rem;
+  margin-top: 0.75rem;
+}
+
+.cmux-vm-card {
+  padding: 0.85rem;
+  border: 1px solid var(--line);
+  background: rgb(255 255 255 / 0.015);
+}
+
+.cmux-vm-title {
+  font-size: 0.8rem;
+  font-weight: 700;
+  color: var(--ink);
+}
+
+.latency-grid {
+  display: grid;
+  gap: 0.75rem;
+  grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr));
+}
+
+.latency-card {
+  padding: 0.9rem;
+  border: 1px solid var(--line);
+  background: var(--panel);
+}
+
+.percentile-row {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 0.5rem;
+  margin-top: 0.5rem;
+}
+
+.percentile-row dd {
+  margin-top: 0.25rem;
+  font-size: 1.05rem;
+  font-weight: 800;
+  font-variant-numeric: tabular-nums;
+}
+
+.latency-workflows {
+  display: grid;
+  gap: 0.4rem;
+  margin-top: 0.9rem;
+}
+
+.latency-wf-row {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 0.5rem;
+  padding: 0.5rem 0.7rem;
+  border: 1px solid var(--line);
+  font-size: 0.74rem;
+}
+
+.latency-wf-name {
+  font-weight: 700;
+  color: var(--ink);
+}
+
+.latency-wf-metrics {
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
 }
 
 .systems-grid {
@@ -250,6 +428,12 @@ footer {
   border-top: 1px solid var(--line);
 }
 
+@media (max-width: 64rem) {
+  .reconcile-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+
 @media (max-width: 52rem) {
   .masthead,
   .status-banner {
@@ -259,6 +443,17 @@ footer {
 
   .fleet-grid {
     grid-template-columns: 1fr;
+  }
+
+  .fleet-panel > header,
+  .systems-panel > header {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 0.5rem;
+  }
+
+  .host-badge {
+    align-self: flex-start;
   }
 
   .timestamps {
@@ -277,7 +472,13 @@ footer {
 
   .metric-grid,
   .metric-grid--three,
+  .metric-grid--five,
+  .reconcile-grid,
   .systems-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .percentile-row {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }
@@ -291,18 +492,15 @@ footer {
   }
 }
 
-/* Queue block: separates genuinely waiting runs from GitHub zero-job ghosts.
-   Ghosts are shown but greyed, because they can never start and cannot be
-   cleaned up from our side -- counting them as backlog is the confusion this
-   whole panel exists to remove. */
+/* Queue block: separates genuinely waiting runs from GitHub zero-job ghosts. */
 .queue-panel {
-  margin-top: 1.5rem;
+  margin-top: 0.5rem;
 }
 
 .queue-summary {
   margin: 0 0 1rem;
   color: var(--muted, #9aa4b2);
-  font-size: 0.95rem;
+  font-size: 0.85rem;
 }
 
 .queue-grid {

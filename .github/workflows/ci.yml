@@ -41,6 +41,9 @@ jobs:
       - name: Runner dashboard contract tests
         run: |
           python3 -m unittest tests/runner_dashboard_snapshot_test.py
+          python3 -m unittest tests/ci_latency_probe_test.py
+          python3 -m unittest tests/fleet_live_dashboard_test.py
+          python3 -m unittest tests/queue_probe_test.py
           node --test tests/runner_dashboard_ui_test.mjs
           bash tests/runner_dashboard_host_probe_test.sh
           bash tests/runner_dashboard_publisher_test.sh
@@ -61,6 +64,8 @@ jobs:
           bash tests/cleanup_ios_release_scratch_test.sh
           bash tests/testflight_workflow_alert_test.sh
           bash tests/testflight_workflow_alert_install_test.sh
+          bash tests/gh_actions_cost_alert_test.sh
+          bash tests/setup_native_macos_runner_test.sh
       - name: Cleanup-stuck-runs regression tests
         run: |
           bash tests/cleanup_stuck_runs_force_cancel_test.sh
