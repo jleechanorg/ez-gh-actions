@@ -6,21 +6,45 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 HOME_T="$WORK/home"
 BIN="$WORK/bin"
-mkdir -p "$HOME_T/Library/LaunchAgents" "$BIN"
+mkdir -p "$HOME_T/Library/LaunchAgents" "$BIN" "$WORK/launchctl-state"
 
-sed -n '1,$p' > "$BIN/launchctl" <<'SH'
+sed -n '1,$p' > "$BIN/launchctl" <<SH
 #!/usr/bin/env bash
-if [[ -n "${LAUNCHCTL_LOG:-}" ]]; then printf '%s\n' "$*" >> "$LAUNCHCTL_LOG"; fi
-if [[ "${LAUNCHCTL_FAIL_DASHBOARD_LOAD:-0}" == "1" &&
-      "${1:-}" == "load" && "${2:-}" == *runner-dashboard.plist ]]; then
+state_dir="$WORK/launchctl-state"
+mkdir -p "\$state_dir"
+if [[ -n "\${LAUNCHCTL_LOG:-}" ]]; then printf '%s\n' "\$*" >> "\$LAUNCHCTL_LOG"; fi
+if [[ "\${LAUNCHCTL_FAIL_DASHBOARD_LOAD:-0}" == "1" &&
+      "\${1:-}" == "load" && "\${2:-}" == *runner-dashboard.plist ]]; then
   exit 42
 fi
-if [[ "${LAUNCHCTL_FAIL_DASHBOARD_LOAD:-0}" == "once" &&
-      "${1:-}" == "load" && "${2:-}" == *runner-dashboard.plist &&
-      ! -e "${LAUNCHCTL_FAIL_ONCE_STATE:?}" ]]; then
-  : > "$LAUNCHCTL_FAIL_ONCE_STATE"
+if [[ "\${LAUNCHCTL_FAIL_DASHBOARD_LOAD:-0}" == "once" &&
+      "\${1:-}" == "load" && "\${2:-}" == *runner-dashboard.plist &&
+      ! -e "\${LAUNCHCTL_FAIL_ONCE_STATE:?}" ]]; then
+  : > "\$LAUNCHCTL_FAIL_ONCE_STATE"
   exit 42
 fi
+case "\${1:-}" in
+  load)
+    lbl="\$(basename "\${2:-}" .plist)"
+    : > "\$state_dir/\$lbl"
+    ;;
+  unload)
+    lbl="\$(basename "\${2:-}" .plist)"
+    rm -f "\$state_dir/\$lbl"
+    ;;
+  bootout)
+    lbl="\${2##*/}"
+    rm -f "\$state_dir/\$lbl"
+    ;;
+  print)
+    lbl="\${2##*/}"
+    if [[ -f "\$state_dir/\$lbl" ]]; then
+      exit 0
+    fi
+    echo "Could not find service \"\${2:-}\" in domain" >&2
+    exit 113
+    ;;
+esac
 exit 0
 SH
 chmod +x "$BIN/launchctl"
