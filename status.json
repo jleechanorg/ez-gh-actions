@@ -6,11 +6,11 @@
       },
       "fleet": {
         "configured": 20,
-        "cycling": 7,
-        "down": 1,
-        "executing": 12,
-        "idle": 0,
-        "reserved": 13
+        "cycling": 6,
+        "down": 0,
+        "executing": 13,
+        "idle": 1,
+        "reserved": 12
       },
       "sources": {
         "config": {
@@ -39,7 +39,7 @@
     },
     "mac": {
       "disk": {
-        "status": "healthy"
+        "status": "unknown"
       },
       "fleet": {
         "configured": 4,
@@ -54,7 +54,7 @@
           "ok": true
         },
         "disk": {
-          "ok": true
+          "ok": false
         },
         "docker": {
           "ok": true
@@ -75,21 +75,21 @@
       }
     }
   },
-  "observed_at": "2026-11-19T01:20:37Z",
-  "published_at": "2026-11-19T01:21:41Z",
+  "observed_at": "2026-11-19T01:34:35Z",
+  "published_at": "2026-11-19T01:35:41Z",
   "queue": {
-    "fresh": 8,
+    "fresh": 14,
     "ghosts": 164,
     "ok": true,
-    "oldest_fresh_wait_minutes": 18,
+    "oldest_fresh_wait_minutes": 44,
     "repos": [
       {
-        "fresh": 7,
+        "fresh": 14,
         "ghosts": 149,
         "repo": "jleechanorg/worldarchitect.ai"
       },
       {
-        "fresh": 1,
+        "fresh": 0,
         "ghosts": 15,
         "repo": "jleechanorg/worldai_frontend"
       }
@@ -101,7 +101,7 @@
       "ok": false
     },
     "mac_host": {
-      "ok": true
+      "ok": false
     }
   }
 }
