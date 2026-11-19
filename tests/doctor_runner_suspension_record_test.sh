@@ -29,10 +29,19 @@ grep -q 'EZGHA_SUSPENSION_RECORD' "$D" \
   || fail "doctor-runner does not read EZGHA_SUSPENSION_RECORD"
 pass "structural: EZGHA_SUSPENSION_RECORD is read"
 
-# Extract just the parked-host block (lines 285-300: `if [ "$LOCAL_DISABLED" -eq 1 ]`
-# through its closing `fi`) so the assertion is about that code path, not about a
-# coincidence elsewhere in a 2000-line script.
-BLOCK="$(sed -n '285,300p' "$D")"
+# Extract just the parked-host block (`if [ "$LOCAL_DISABLED" -eq 1 ]` through its
+# closing `fi`) so the assertion is about that code path, not about a
+# coincidence elsewhere in a 2000-line script. Located by delimiters, never by
+# absolute line numbers: a hardcoded window rots on any unrelated edit.
+local_block() {
+  awk '
+    /^if \[ "\$LOCAL_DISABLED" -eq 1 \]; then$/ { inside = 1 }
+    inside && /^else$/ { exit }
+    inside { print }
+  ' "$D"
+}
+
+BLOCK="$(local_block)"
 [ -n "$BLOCK" ] || fail "could not isolate the parked-host block"
 grep -q 'suspension record' <<<"$BLOCK" \
   || fail "the parked-host block does not report the suspension record"
@@ -55,7 +64,7 @@ harness() { # value | "unset"
     echo 'warn() { echo "WARN:$*"; }'
     echo 'section() { :; }'
     echo 'LOCAL_DISABLED=1'
-    sed -n '285,300p' "$D" | sed '$d'
+    local_block
     echo 'fi'
   } > "$WORK/block.sh"
   bash "$WORK/block.sh"
@@ -94,7 +103,21 @@ pass "behavioral: unset defaults to the owning bead"
 # P1 from review: the reporting was inside the LOCAL_DISABLED branch only, so a
 # Linux doctor checking a parked Mac printed neither the pointer nor the warning,
 # contradicting the "every parked run" promise in AGENTS.md.
-REMOTE_BLOCK="$(sed -n '1452,1471p' "$D")"
+# Locate the branch by its OWN delimiters, never by absolute line numbers: a
+# hardcoded window silently decoupled from the code the moment any unrelated
+# edit shifted the file (2026-11-19: an unrelated +11-line insert in
+# remote_docker_env moved this block 1450 -> 1461 and the assertion started
+# failing on a branch whose behavior had not changed at all).
+remote_block() {
+  awk '
+    /^if \[ "\$REMOTE_DISABLED" -eq 1 \]; then$/ { inside = 1 }
+    inside && /^elif / { exit }
+    inside { print }
+  ' "$D"
+}
+
+REMOTE_BLOCK="$(remote_block)"
+[ -n "$REMOTE_BLOCK" ] || fail "could not isolate the REMOTE parked-leg branch"
 grep -q 'suspension record' <<<"$REMOTE_BLOCK" \
   || fail "the REMOTE parked-leg branch does not report the suspension record"
 grep -q 'no suspension record declared for the parked' <<<"$REMOTE_BLOCK" \
@@ -114,8 +137,9 @@ remote_harness() { # value | "unset"
     echo 'REMOTE_DISABLED=1'
     echo 'REMOTE_LABEL="macos(macbook)"'
     # Strip the leading `if [ "$REMOTE_DISABLED" -eq 1 ]; then` guard and the
-    # trailing `fi`/elif so the branch body runs standalone.
-    sed -n '1452,1471p' "$D"
+    # trailing `elif` so the branch body runs standalone. Delimiter-based, so
+    # unrelated line shifts cannot silently extract the wrong region.
+    remote_block | sed '1d'
   } > "$WORK/remote.sh"
   bash "$WORK/remote.sh"
 }
