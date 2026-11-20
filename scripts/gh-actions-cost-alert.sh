@@ -827,7 +827,7 @@ if [ -z "$fallback_reason" ]; then
 fi
 
 if [ -z "$fallback_reason" ]; then
-  if ! jq -c --slurpfile public_repos "$tmp.public_repos" --arg today "$TODAY_UTC" --arg yesterday "$YESTERDAY_UTC" --arg year_month "$YEAR_MONTH" --argjson include_yest "$((1 - rollover_yest_failed))" '
+  if ! jq -c --slurpfile public_repos "$tmp.public_repos" --arg org "$ALERT_ORG" --arg today "$TODAY_UTC" --arg yesterday "$YESTERDAY_UTC" --arg year_month "$YEAR_MONTH" --argjson include_yest "$((1 - rollover_yest_failed))" '
     def norm_repo: if (. // "") == "" then "(org-level)" else . end;
     def is_macos_min: (((.sku // "") | test("macos"; "i")) and (((.unitType // "") | ascii_downcase) == "minutes"));
     def is_valid_action_item:
@@ -841,12 +841,20 @@ if [ -z "$fallback_reason" ]; then
       and ((.date | type) == "string")
       and (((.date[:10]) | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}$")))
       and ((try (((.date[:10]) + "T00:00:00Z") | fromdateiso8601) catch null) != null);
+    def repo_bare: (. // "") | ascii_downcase | if test("/") then (split("/") | .[-1]) else . end;
+    def repo_owner: (. // "") | ascii_downcase | if test("/") then (split("/") | .[-2]) else "" end;
+    def is_standard_action_sku: (. // "") as $s | (["Actions macOS 3-core", "Actions Linux", "Actions Windows"] | index($s) != null);
     def is_free_public_standard:
       . as $item
+      | ($item.repositoryName // "") as $repo
+      | ($repo | repo_bare) as $bare
+      | ($repo | repo_owner) as $owner
       | (.netAmount == 0)
-        and (.unitType == "Minutes")
-        and (["Actions macOS 3-core", "Actions Linux", "Actions Windows"] | index($item.sku) != null)
-        and ($public_repos[0] | index($item.repositoryName) != null);
+        and (((($item.unitType // "") | ascii_downcase)) == "minutes")
+        and ($item.sku | is_standard_action_sku)
+        and (($bare | length) > 0)
+        and (($owner == "") or ($owner == ($org | ascii_downcase)))
+        and (($public_repos[0] | map(ascii_downcase)) | index($bare) != null);
     def sum_gross: (map(.grossAmount) | add // 0);
     def sum_net: (map(.netAmount) | add // 0);
     def sum_macos_min: (map(if is_macos_min then .quantity else 0 end) | add // 0);
@@ -888,6 +896,7 @@ if [ -z "$fallback_reason" ]; then
           free_public_gross_usd: ($free_public | sum_gross),
           free_public_macos_min: ($free_public | sum_macos_min),
           net_usd: ($mtd_actions | sum_net),
+          net_charges: ([$mtd_actions[] | select((.netAmount // 0) > 0)] | sort_by(-(.netAmount)) | .[0:3] | map({repo: (.repositoryName // "(org-level)"), sku: (.sku // ""), net_usd: .netAmount})),
           macos_min: ($mtd_actions | sum_macos_min)
         },
         days: ($target_days | unique | map(day_summary(.; $nonexempt_actions)))
@@ -1008,8 +1017,15 @@ fi
 free_public_gross="$(jq -r '.mtd.free_public_gross_usd // 0' "$tmp.summary")"
 if [ "$used_fallback" -eq 0 ] && ge_num "$free_public_gross" 0.000001; then
   free_public_macos="$(jq -r '.mtd.free_public_macos_min // 0' "$tmp.summary")"
+  # Name what the remaining net dollars are, so an exempted gross spike never hides a cash charge.
+  net_charge_detail="$(jq -r '[.mtd.net_charges[]? | "\(.repo) \(.sku) $\((.net_usd * 100 | round) / 100)"] | join("; ")' "$tmp.summary")"
+  if [ -n "$net_charge_detail" ]; then
+    net_charge_note="MTD net charges (still alertable): ${net_charge_detail}."
+  else
+    net_charge_note="No MTD net charges recorded."
+  fi
   if ! emit INFO FREE_PUBLIC_USAGE "$TODAY_UTC" \
-    "Informational only: verified public standard runners have zero net usage charges; MTD free public gross \$$(fmt_usd "$free_public_gross") (not a bill), ${free_public_macos} macOS min. Storage, larger runners, private/unknown repos and nonzero net remain alertable." \
+    "Informational only: verified public standard runners have zero net usage charges; MTD free public gross \$$(fmt_usd "$free_public_gross") (not a bill), ${free_public_macos} macOS min. ${net_charge_note} Storage, larger runners, private/unknown repos and nonzero net remain alertable." \
     "$free_public_gross" 0 "$free_public_macos" "" "$run_mode" "$mtd_gross" "$mtd_net"; then
     echo "[$NOW_ISO] WARN: free-public informational log failed; continuing charge checks" >&2
   fi

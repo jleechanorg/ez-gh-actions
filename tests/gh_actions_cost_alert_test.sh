@@ -1539,6 +1539,27 @@ for case_name in unknown failed private wrong-owner larger paid storage; do
    run_alert "$TMP/state-case-$case_name.json" "$TMP/gcloud-case-$case_name.log" "$TMP/gh-case-$case_name.log" >/dev/null
   [ "$(error_count "$TMP/gcloud-case-$case_name.log")" = 1 ] || fail "$case_name must retain one combined charge/unknown-risk ERROR"
 done
+# Documented billing shape uses lowercase unitType and owner/repo repositoryName; both must classify.
+jq '.usageItems[0].unitType="minutes" | .usageItems[0].repositoryName="jleechanorg/disk_magician"' \
+  "$TMP/free-public-billing.json" > "$TMP/doc-shape-billing.json"
+PUBLIC_REPOS_FIXTURE="$TMP/public-repos.json" BILLING_FIXTURE="$TMP/doc-shape-billing.json" \
+ run_alert "$TMP/state-doc-shape.json" "$TMP/gcloud-doc-shape.log" "$TMP/gh-doc-shape.log" >/dev/null
+[ "$(error_count "$TMP/gcloud-doc-shape.log")" = 0 ] || fail "documented billing shape (minutes + owner/repo) must stay exempt"
+grep -q 'FREE_PUBLIC_USAGE' "$TMP/gcloud-doc-shape.log" || fail "documented billing shape must still log INFO"
+# Owner comparison is case-insensitive, but a different owner stays alertable.
+jq '.usageItems[0].unitType="minutes" | .usageItems[0].repositoryName="JLeeChanOrg/disk_magician"' \
+  "$TMP/free-public-billing.json" > "$TMP/doc-shape-case-billing.json"
+PUBLIC_REPOS_FIXTURE="$TMP/public-repos.json" BILLING_FIXTURE="$TMP/doc-shape-case-billing.json" \
+ run_alert "$TMP/state-doc-shape-case.json" "$TMP/gcloud-doc-shape-case.log" "$TMP/gh-doc-shape-case.log" >/dev/null
+[ "$(error_count "$TMP/gcloud-doc-shape-case.log")" = 0 ] || fail "same-org owner case variant must stay exempt"
+jq '.usageItems[0].unitType="minutes" | .usageItems[0].repositoryName="other-org/disk_magician"' \
+  "$TMP/free-public-billing.json" > "$TMP/doc-shape-foreign-billing.json"
+PUBLIC_REPOS_FIXTURE="$TMP/public-repos.json" BILLING_FIXTURE="$TMP/doc-shape-foreign-billing.json" \
+ run_alert "$TMP/state-doc-shape-foreign.json" "$TMP/gcloud-doc-shape-foreign.log" "$TMP/gh-doc-shape-foreign.log" >/dev/null
+[ "$(error_count "$TMP/gcloud-doc-shape-foreign.log")" = 1 ] || fail "foreign-owner qualified repo must remain alertable"
+# The informational line names the remaining net charge instead of hiding it behind exempt gross.
+grep -q 'MTD net charges (still alertable): disk_magician Actions storage' "$TMP/gcloud-free-public.log" || \
+  fail "INFO must attribute the nonzero net charge"
 # Only validated public rows may lower severity. Exhausting the five-page bound is safe.
 python3 - "$TMP/public-repos.json" "$TMP/public-100.json" <<'PYREPOS'
 import json,sys
