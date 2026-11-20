@@ -17,8 +17,8 @@
         "configured": 20,
         "cycling": 0,
         "down": 0,
-        "executing": 0,
-        "idle": 20,
+        "executing": 1,
+        "idle": 19,
         "reserved": 20
       },
       "parked": false,
@@ -39,7 +39,7 @@
           "phase_badge": null,
           "slot": 2,
           "slot_id": "linux-2",
-          "state": "IDLE",
+          "state": "EXECUTING",
           "workflow_category": null
         },
         {
@@ -257,37 +257,37 @@
   },
   "latency": {
     "cancellation": {
-      "cancelled_rate_pct": 11.1,
+      "cancelled_rate_pct": 10.9,
       "cancelled_runs": 5,
-      "total_non_skipped_runs": 45
+      "total_non_skipped_runs": 46
     },
     "cohort": "success",
-    "generated_at": "2026-11-20T12:05:10Z",
+    "generated_at": "2026-11-20T12:16:24Z",
     "ok": true,
     "overall": {
       "e2e": {
-        "avg_s": 372.6,
+        "avg_s": 363.85,
         "max_s": 3340.0,
-        "n": 40,
-        "p50_s": 79.0,
-        "p90_s": 617.0,
-        "p99_s": 3314.65
+        "n": 41,
+        "p50_s": 70.0,
+        "p90_s": 493.0,
+        "p99_s": 3314.0
       },
       "execution": {
-        "avg_s": 315.7,
+        "avg_s": 311.36,
         "max_s": 3300.0,
-        "n": 69,
-        "p50_s": 80.0,
-        "p90_s": 809.8,
-        "p99_s": 3276.88
+        "n": 70,
+        "p50_s": 76.5,
+        "p90_s": 776.4,
+        "p99_s": 3276.54
       },
       "queue_wait": {
-        "avg_s": 3.97,
+        "avg_s": 3.93,
         "max_s": 173.0,
-        "n": 69,
+        "n": 70,
         "p50_s": 1.0,
         "p90_s": 2.0,
-        "p99_s": 58.08
+        "p99_s": 56.39
       }
     },
     "partial": false,
@@ -714,12 +714,12 @@
       }
     ]
   },
-  "observed_at": "2026-11-20T12:04:31Z",
-  "published_at": "2026-11-20T12:04:33Z",
+  "observed_at": "2026-11-20T12:15:45Z",
+  "published_at": "2026-11-20T12:15:48Z",
   "queue": {
     "fresh": null,
     "ghosts": null,
-    "in_progress_runs": 1,
+    "in_progress_runs": 0,
     "ok": true,
     "oldest_fresh_wait_minutes": null,
     "partial": true,
@@ -735,16 +735,16 @@
         "repo": "repo-2"
       }
     ],
-    "unverified_runs": 89
+    "unverified_runs": 90
   },
   "reconciliation": {
     "active_job_slots_occupied": null,
-    "active_workflow_runs": 1,
+    "active_workflow_runs": 0,
     "available_pools": 0,
     "configured_slots": null,
     "cycling_slots": null,
     "down_slots": null,
-    "explanation": "queue partial: 89 unverified.",
+    "explanation": "queue partial: 90 unverified.",
     "fresh_queued_runs": null,
     "idle_slots": null,
     "inert_ghosts": null,
