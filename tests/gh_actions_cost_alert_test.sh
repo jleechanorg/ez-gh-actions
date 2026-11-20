@@ -144,6 +144,30 @@ chmod +x "$TMP/bin/gh" "$TMP/bin/gcloud"
 run_alert() {
   local state_file="$1" gcloud_log="$2" gh_log="$3"
   shift 3
+  # Scenarios 1-27 pin the pre-calibration trip points so each keeps exercising its own mechanism
+  # (unpriced-label minute counting, fallback pricing, cooldown, ...); scenario 28 covers the
+  # shipped defaults end to end.
+  HOME="$TMP/home" \
+  GH_BIN="$TMP/bin/gh" \
+  GCLOUD_BIN="$TMP/bin/gcloud" \
+  STATE_FILE="$state_file" \
+  BILLING_FIXTURE="${BILLING_FIXTURE:-$TMP/billing.json}" \
+  GCLOUD_LOG="$gcloud_log" \
+  GH_CALL_LOG="$gh_log" \
+  POLICY_CAPTURE="$TMP/policy.json" \
+  POLICY_HISTORY="$TMP/policy-history.jsonl" \
+  NOW_ISO="${NOW_ISO:-2026-11-18T12:00:00Z}" \
+  TARGET_DATE_UTC="${TARGET_DATE_UTC:-2026-11-18}" \
+  DAILY_GROSS_WARN_USD="${TEST_DAILY_GROSS_WARN_USD:-25}" \
+  DAILY_MACOS_MIN_WARN="${TEST_DAILY_MACOS_MIN_WARN:-60}" \
+  MTD_GROSS_WARN_USD="${TEST_MTD_GROSS_WARN_USD:-250}" \
+  "$SCRIPT" "$@"
+}
+
+# Runs the script with its shipped defaults (no threshold overrides), for calibration coverage.
+run_shipped_defaults() {
+  local state_file="$1" gcloud_log="$2" gh_log="$3"
+  shift 3
   HOME="$TMP/home" \
   GH_BIN="$TMP/bin/gh" \
   GCLOUD_BIN="$TMP/bin/gcloud" \
@@ -762,6 +786,7 @@ rollover_fail_out="$(
   HOME="$TMP/home" GH_BIN="$TMP/bin/gh" GCLOUD_BIN="$TMP/bin/gcloud" \
   STATE_FILE="$TMP/state-rollover-fail.json" GCLOUD_LOG="$TMP/gcloud-rollover-fail.log" \
   GH_CALL_LOG="$TMP/gh-rollover-fail.log" POLICY_CAPTURE="$TMP/policy.json" POLICY_HISTORY="$TMP/policy-history.jsonl" \
+  DAILY_GROSS_WARN_USD=25 DAILY_MACOS_MIN_WARN=60 MTD_GROSS_WARN_USD=250 \
   "$SCRIPT"
 )"
 [ "$(error_count "$TMP/gcloud-rollover-fail.log")" = 1 ] || fail "simultaneous breaches must emit exactly 1 combined ERROR log (avoiding 300s rate-limit drop)"
@@ -1408,3 +1433,61 @@ grep -q '"macos_minutes":75' "$TMP/gcloud-xcode.log" || \
 grep -q '"gross_usd":0' "$TMP/gcloud-xcode.log" || \
   fail "xcode-27 unpriced hosted label must keep gross_usd=0"
 pass "Round-22 fixes: prior-month sku/unitType/repositoryName validation and xcode-* fallback macOS detection hold"
+
+# 28. Shipped-default calibration (operator ask 2026-11-20): ordinary baseline hosted usage must stay
+#     silent, while the 2026-11-17 incident and MTD gross runaway keep paging.
+cat > "$TMP/billing-cal-baseline.json" <<'JSON'
+{"usageItems":[
+ {"date":"2026-11-19T00:00:00Z","product":"actions","sku":"Actions macOS 3-core","quantity":1083.0,"unitType":"Minutes","pricePerUnit":0.062,"grossAmount":67.15,"discountAmount":67.15,"netAmount":0.0,"organizationName":"jleechanorg","repositoryName":"disk_magician"},
+ {"date":"2026-11-19T00:00:00Z","product":"actions","sku":"Actions Linux","quantity":1369.0,"unitType":"Minutes","pricePerUnit":0.006,"grossAmount":8.21,"discountAmount":8.02,"netAmount":0.19,"organizationName":"jleechanorg","repositoryName":"worldarchitect.ai"},
+ {"date":"2026-11-19T00:00:00Z","product":"actions","sku":"Actions storage","quantity":100.0,"unitType":"GigabyteHours","pricePerUnit":0.00033602,"grossAmount":0.03,"discountAmount":0.01,"netAmount":0.02,"organizationName":"jleechanorg","repositoryName":"worldarchitect.ai"}
+]}
+JSON
+BILLING_FIXTURE="$TMP/billing-cal-baseline.json" TARGET_DATE_UTC=2026-11-19 \
+  run_shipped_defaults "$TMP/state-cal-baseline.json" "$TMP/gcloud-cal-baseline.log" "$TMP/gh-cal-baseline.log" >/dev/null
+[ "$(error_count "$TMP/gcloud-cal-baseline.log")" = 0 ] || \
+  fail "2026-11-19 baseline (1083 macOS min, \$75.57 gross, \$0.21 net) must not alert at shipped defaults"
+pass "shipped defaults stay silent on the 2026-11-19 baseline (1083 macOS min, \$75.57 gross)"
+
+cat > "$TMP/billing-cal-spike.json" <<'JSON'
+{"usageItems":[
+ {"date":"2026-11-17T00:00:00Z","product":"actions","sku":"Actions macOS 3-core","quantity":2389.0,"unitType":"Minutes","pricePerUnit":0.062,"grossAmount":148.12,"discountAmount":148.12,"netAmount":0.0,"organizationName":"jleechanorg","repositoryName":"disk_magician"}
+]}
+JSON
+BILLING_FIXTURE="$TMP/billing-cal-spike.json" TARGET_DATE_UTC=2026-11-18 \
+  run_shipped_defaults "$TMP/state-cal-spike.json" "$TMP/gcloud-cal-spike.log" "$TMP/gh-cal-spike.log" >/dev/null
+[ "$(error_count "$TMP/gcloud-cal-spike.log")" = 1 ] || \
+  fail "2026-11-17 incident (2389 macOS min, \$148.12 gross) must still emit exactly 1 ERROR at shipped defaults"
+grep -q '"status":"COST_SPIKE"' "$TMP/gcloud-cal-spike.log" || \
+  fail "2026-11-17 incident must keep status=COST_SPIKE at shipped defaults"
+pass "shipped defaults still page on the 2026-11-17 incident (2389 macOS min, \$148.12 gross)"
+
+# 10 x \$92.75/day = \$927.50 MTD (the real 2026-11 MTD on 2026-11-20) stays below both gross gates.
+{
+  printf '{"usageItems":['
+  for d in 01 02 03 04 05 06 07 08 09 10; do
+    printf '{"date":"2026-11-%sT00:00:00Z","product":"actions","sku":"Actions macOS 3-core","quantity":1496.0,"unitType":"Minutes","pricePerUnit":0.062,"grossAmount":92.752,"discountAmount":92.752,"netAmount":0.0,"organizationName":"jleechanorg","repositoryName":"disk_magician"}' "$d"
+    [ "$d" = 10 ] || printf ','
+  done
+  printf ']}\n'
+} > "$TMP/billing-cal-mtd.json"
+BILLING_FIXTURE="$TMP/billing-cal-mtd.json" TARGET_DATE_UTC=2026-11-20 \
+  run_shipped_defaults "$TMP/state-cal-mtd.json" "$TMP/gcloud-cal-mtd.log" "$TMP/gh-cal-mtd.log" >/dev/null
+[ "$(error_count "$TMP/gcloud-cal-mtd.log")" = 0 ] || \
+  fail "MTD \$927.43-equivalent (10 x \$92.75/day) must stay under DAILY_GROSS_WARN_USD=100 and MTD_GROSS_WARN_USD=1500"
+pass "shipped defaults keep November MTD (10 x \$92.75/day) informational"
+
+cat > "$TMP/billing-cal-mtd-breach.json" <<'JSON'
+{"usageItems":[
+ {"date":"2026-11-18T00:00:00Z","product":"actions","sku":"Actions macOS 3-core","quantity":25000.0,"unitType":"Minutes","pricePerUnit":0.062,"grossAmount":1550.0,"discountAmount":1550.0,"netAmount":0.0,"organizationName":"jleechanorg","repositoryName":"disk_magician"}
+]}
+JSON
+BILLING_FIXTURE="$TMP/billing-cal-mtd-breach.json" TARGET_DATE_UTC=2026-11-19 \
+  run_shipped_defaults "$TMP/state-cal-mtd-breach.json" "$TMP/gcloud-cal-mtd-breach.log" "$TMP/gh-cal-mtd-breach.log" >/dev/null
+[ "$(error_count "$TMP/gcloud-cal-mtd-breach.log")" = 1 ] || \
+  fail "MTD gross \$1550 (>= MTD_GROSS_WARN_USD=1500) must emit exactly 1 combined ERROR at shipped defaults"
+grep -q 'MTD GROSS usage breach' "$TMP/gcloud-cal-mtd-breach.log" || \
+  fail "MTD gross runaway must keep the MTD GROSS usage breach text"
+grep -q '"status":"MULTI_BREACH"' "$TMP/gcloud-cal-mtd-breach.log" || \
+  fail "simultaneous COST_SPIKE + MTD gross breach must report status=MULTI_BREACH"
+pass "shipped defaults still page on MTD gross runaway (\$1550) as a combined MULTI_BREACH"

@@ -40,11 +40,20 @@ set -euo pipefail
 
 # Authority: defensive operational bounds (MAX_APP_API_CALLS=60, MIN_RATE_LIMIT_REMAINING=50, COOLDOWN_SEC=21600, STATE_LOCK_TIMEOUT_SEC=30, MAX_API_FAILURES=3) per operator ask (2026-11-18, #L10) and origin/main:AGENTS.md:246-247,257-258 (self-outage prevention & blast-radius caps; unrequested defaults disclosed in PR #238).
 ALERT_ORG="${ALERT_ORG:-jleechanorg}"
-DAILY_GROSS_WARN_USD="${DAILY_GROSS_WARN_USD:-25}"
-DAILY_MACOS_MIN_WARN="${DAILY_MACOS_MIN_WARN:-60}"
+# Calibration basis (measured 2026-11-20 from
+# /orgs/jleechanorg/settings/billing/usage, per UTC day, 2026-10-01..2026-11-20):
+#   gross USD/day  median ~$40, p90 ~$95, max $153.15 (2026-11-17)
+#   macOS min/day  median ~540, p90 ~1490, max 2389 (2026-11-17)
+# The previous defaults ($25/day, 60 macOS min, $250 MTD) fired COST_SPIKE on 19 of 19 complete
+# November days and MTD_SPEND_BREACH every month around day 6, because both hosted SKUs carry a
+# 100% public-repo discount (~$0.00/day net; only Actions storage is real cash, cents/day).
+# Gross/macOS gates now sit above p90 so ERROR means a genuine outlier (2026-11-17 and 2026-11-04
+# still fire); real cash is still watched by the unchanged NET gates, which is what a bill is.
+DAILY_GROSS_WARN_USD="${DAILY_GROSS_WARN_USD:-100}"
+DAILY_MACOS_MIN_WARN="${DAILY_MACOS_MIN_WARN:-1500}"
 DAILY_NET_WARN_USD="${DAILY_NET_WARN_USD:-10}"
 MTD_NET_WARN_USD="${MTD_NET_WARN_USD:-40}"
-MTD_GROSS_WARN_USD="${MTD_GROSS_WARN_USD:-250}"
+MTD_GROSS_WARN_USD="${MTD_GROSS_WARN_USD:-1500}"
 COOLDOWN_SEC="${COOLDOWN_SEC:-21600}"
 MAX_API_FAILURES="${MAX_API_FAILURES:-3}"
 MIN_RATE_LIMIT_REMAINING="${MIN_RATE_LIMIT_REMAINING:-50}"
