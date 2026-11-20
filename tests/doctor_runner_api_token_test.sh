@@ -1,26 +1,26 @@
 #!/usr/bin/env bash
-# Regression: doctor-runner's API calls must use ezgha's OWN app token
-# ($HOME/.config/ezgha/gh_token), not the operator's ambient `gh auth`.
+# Regression: doctor-runner must resolve ezgha's GitHub App token ONCE, before
+# the parked/active host-path split, and must never let an ambient operator
+# credential stand in for it.
 #
-# Defect (2026-11-20): doctor-runner validated ezgha's app token in section 4b
-# but ran the job-map `gh api` calls on the operator's ambient `gh auth` token.
-# With an invalid personal token the job map reported "0 in-progress + 0 queued"
-# and doctor forced "queue/API evidence UNPROVEN" even though the org token was
-# 10005/10400 healthy and completely unused.
+# Defect history (2026-11-20), three review rounds:
+#   R1  382377c: export lived in the ACTIVE-host branch; a parked host returned
+#       early and its job map rode the operator's ambient token -> "0 in-progress
+#       + 0 queued", verdict "queue/API evidence UNPROVEN", while the org token
+#       was 10005/10400 healthy and unused.
+#   R2  ced0d5f: export added to the parked block too, but the test was a grep --
+#       three mutants passed (export under `if false`, export removed, gated 200).
+#   R3  5803a8e: test rewritten to execute blocks; 401 abort fixed.
+#   R4  1c218be: CodeRabbit found the missing-file path kept the operator token
+#       live. `unset GH_TOKEN` added -- but only in the active branch, and unsetting
+#       GH_TOKEN alone does not deauthenticate `gh` (GITHUB_TOKEN / stored
+#       ~/.config/gh/hosts.yml still apply). Both holes found in review.
+#   R5  current: ONE credential resolution before the branch split; resolves
+#       EZGHA_APP_TOKEN_AVAILABLE, drops GITHUB_TOKEN/GH_ENTERPRISE_TOKEN when the
+#       App token is unavailable, and never re-exports inside a branch.
 #
-# WHY THIS TESTS EXECUTION, NOT TEXT:
-# two earlier versions of this test grepped for `export GH_TOKEN` and for its
-# line position. Review found BOTH passed against deliberately broken code:
-#   - export deleted from the parked path        -> passed
-#   - export wrapped in `if false; then`         -> passed
-#   - the active export removed entirely         -> passed
-#   - the active export gated on HTTP 200        -> passed
-# Grep cannot distinguish "exported" from "exported somewhere that runs".
-#
-# So each case below EXTRACTS the relevant guarded block from the real script,
-# wraps it in a harness that supplies the enclosing variables, and executes it.
-# A block whose export sits under `if false`, or which fails to export, is
-# observably different from one that works -- because we run it, not read it.
+# WHY THIS EXECUTES INSTEAD OF GREPPING: greps passed broken code twice. Every
+# case below runs real extracted script text and asserts on observable results.
 #
 # Usage: bash tests/doctor_runner_api_token_test.sh
 set -euo pipefail
@@ -39,145 +39,114 @@ WORK="$(mktemp -d)"
 cleanup() { rm -rf "${WORK:?}"; }
 trap cleanup EXIT
 
-FIXTURE_TOKEN="ghs_fixture_token_DO_NOT_USE_IN_PROD"
-mkdir -p "$WORK/home/.config/ezgha"
-printf '%s\n' "$FIXTURE_TOKEN" > "$WORK/home/.config/ezgha/gh_token"
+FIXTURE="ghs_fixture_token_DO_NOT_USE_IN_PROD"
+mkdir -p "$WORK/home_ok/.config/ezgha" "$WORK/home_missing" "$WORK/home_empty/.config/ezgha"
+printf '%s\n' "$FIXTURE" > "$WORK/home_ok/.config/ezgha/gh_token"
+: > "$WORK/home_empty/.config/ezgha/gh_token"
 
-# Locate the two guarded blocks that must each export the token:
-#   1. the parked-host block (banner -> its terminating top-level `else`)
-#   2. the active-host section-4b export
-PARKED_START="$(grep -n 'host lifecycle (parked host)' "$D" | head -1 | cut -d: -f1)"
-[ -n "$PARKED_START" ] || fail "cannot locate the parked-host lifecycle branch"
-PARKED_END="$(awk -v s="$PARKED_START" 'NR>s && /^else$/ {print NR; exit}' "$D")"
-[ -n "$PARKED_END" ] || fail "cannot locate the end of the parked-host block"
+# ── Structural: exactly ONE resolution site ───────────────────────────────
+# Two sites is how the parked path drifted from the active one (R1, R4).
+EXPORTS="$(grep -cE '^[[:space:]]*export GH_TOKEN=' "$D" || true)"
+[ "${EXPORTS:-0}" -eq 1 ] \
+  || fail "expected exactly 1 'export GH_TOKEN=' site (single credential resolution), found ${EXPORTS:-0}; multiple sites let the parked and active paths diverge"
+pass "structural: exactly one GH_TOKEN export site"
 
-# ── Case A: the PARKED block, executed, must export the token ──────────────
-# Build a harness: real block body + the variables it depends on, then print
-# what GH_TOKEN holds afterwards. The block ends by `exit`-ing in the real
-# script, so we lift only its body and let it fall through.
-awk -v s="$PARKED_START" -v e="$PARKED_END" 'NR>s && NR<e' "$D" > "$WORK/parked.body"
-grep -q 'export GH_TOKEN' "$WORK/parked.body" \
-  || fail "parked-host block ($PARKED_START-$PARKED_END) contains no 'export GH_TOKEN'; a parked host returns early and still rides ambient auth"
+UNSETS="$(grep -cE '^unset GH_TOKEN$' "$D" || true)"
+[ "${UNSETS:-0}" -eq 1 ] \
+  || fail "expected exactly 1 bare 'unset GH_TOKEN' (in the single resolution block), found ${UNSETS:-0}"
+pass "structural: exactly one 'unset GH_TOKEN'"
 
-cat > "$WORK/parked.harness.sh" <<'HS'
-#!/usr/bin/env bash
-set -uo pipefail
-PLATFORM=Darwin
-HOST=testhost
-section() { :; }; ok() { :; }; info() { :; }; bad() { :; }; warn() { :; }
-FLEET_CONTRACT_SLOTS=0
-HS
-cat "$WORK/parked.body" >> "$WORK/parked.harness.sh"
-cat >> "$WORK/parked.harness.sh" <<'HS'
-printf 'RESULT=%s\n' "${GH_TOKEN:+SET}"
-HS
-chmod +x "$WORK/parked.harness.sh"
-PARKED_RESULT="$(env -u GH_TOKEN HOME="$WORK/home" bash "$WORK/parked.harness.sh" 2>/dev/null | grep '^RESULT=' | cut -d= -f2)"
-[ "$PARKED_RESULT" = "SET" ] \
-  || fail "parked-host block executed but did NOT set GH_TOKEN (result='${PARKED_RESULT:-<none>}'); the export is missing or unreachable there"
-pass "parked path: executing the real parked block sets GH_TOKEN"
+# The resolution block must sit BEFORE the parked-host branch, or a parked host
+# returns before reaching it (the R1 defect).
+EXPORT_LINE="$(grep -nE '^[[:space:]]*export GH_TOKEN=' "$D" | head -1 | cut -d: -f1)"
+PARKED_LINE="$(grep -n 'host lifecycle (parked host)' "$D" | head -1 | cut -d: -f1)"
+[ -n "$EXPORT_LINE" ] && [ -n "$PARKED_LINE" ] || fail "cannot locate export or parked-branch line"
+[ "$EXPORT_LINE" -lt "$PARKED_LINE" ] \
+  || fail "credential resolution (line $EXPORT_LINE) comes after the parked-host branch (line $PARKED_LINE); a parked host returns early and never reaches it"
+pass "structural: credential resolution precedes the parked-host branch ($EXPORT_LINE < $PARKED_LINE)"
 
-# ── Case B: the ACTIVE export, executed, must set the token ───────────────
-# Lift only the export statement plus its guard, and run it.
-awk '/^[[:space:]]*if \[ -f "\$GH_TOKEN_PATH" \] && \[ -s "\$GH_TOKEN_PATH" \]; then$/{f=1} f{print} f&&/^[[:space:]]*fi$/{exit}' "$D" > "$WORK/active.body"
-[ -s "$WORK/active.body" ] || fail "cannot extract the active-host export guard from doctor-runner"
-grep -q 'export GH_TOKEN' "$WORK/active.body" \
-  || fail "the active-host export guard contains no 'export GH_TOKEN'"
+# ── Extract the real resolution block and execute it ─────────────────────
+BLOCK_START="$(grep -n 'Credential resolution: ONE place' "$D" | head -1 | cut -d: -f1)"
+[ -n "$BLOCK_START" ] || fail "cannot locate the credential-resolution block"
+# Block runs from EZGHA_APP_TOKEN_PATH= to the closing fi of the GITHUB_TOKEN guard.
+BLOCK_END="$(awk -v s="$BLOCK_START" 'NR>=s && /^fi$/ {n++; if (n==2) {print NR; exit}}' "$D")"
+[ -n "$BLOCK_END" ] || fail "cannot locate the end of the credential-resolution block"
+awk -v s="$BLOCK_START" -v e="$BLOCK_END" 'NR>=s && NR<=e' "$D" > "$WORK/resolve.body"
+grep -q 'export GH_TOKEN' "$WORK/resolve.body" \
+  || fail "extracted resolution block contains no 'export GH_TOKEN'"
 
-cat > "$WORK/active.harness.sh" <<'HS'
-#!/usr/bin/env bash
-set -uo pipefail
-HS
-echo 'GH_TOKEN_PATH="$HOME/.config/ezgha/gh_token"' >> "$WORK/active.harness.sh"
-cat "$WORK/active.body" >> "$WORK/active.harness.sh"
-echo 'printf "RESULT=%s\n" "${GH_TOKEN:+SET}"' >> "$WORK/active.harness.sh"
-chmod +x "$WORK/active.harness.sh"
-ACTIVE_RESULT="$(env -u GH_TOKEN HOME="$WORK/home" bash "$WORK/active.harness.sh" 2>/dev/null | grep '^RESULT=' | cut -d= -f2)"
-[ "$ACTIVE_RESULT" = "SET" ] \
-  || fail "active-host export guard executed but did NOT set GH_TOKEN (result='${ACTIVE_RESULT:-<none>}')"
-pass "active path: executing the real export guard sets GH_TOKEN"
+run_resolve() { # $1=home  -> prints AVAIL= and HAS_GH= and HAS_GITHUB=
+  local home="$1"
+  {
+    echo '#!/usr/bin/env bash'
+    echo 'set -uo pipefail'
+    cat "$WORK/resolve.body"
+    echo 'printf "AVAIL=%s HAS_GH=%s HAS_GITHUB=%s\n" "$EZGHA_APP_TOKEN_AVAILABLE" "${GH_TOKEN:+set}" "${GITHUB_TOKEN:+set}"'
+  } > "$WORK/resolve.sh"
+  env -u GH_TOKEN HOME="$home" ${2:+GITHUB_TOKEN="$2"} bash "$WORK/resolve.sh" 2>/dev/null | tail -1
+}
 
-# ── Case C: the value must be the token file's contents, not something else ─
-cat >> "$WORK/active.harness.sh" <<'HS'
-printf 'VALUE_OK=%s\n' "$([ "${GH_TOKEN:-}" = "ghs_fixture_token_DO_NOT_USE_IN_PROD" ] && echo yes || echo no)"
-HS
-VALUE_OK="$(env -u GH_TOKEN HOME="$WORK/home" bash "$WORK/active.harness.sh" 2>/dev/null | grep '^VALUE_OK=' | cut -d= -f2)"
-[ "$VALUE_OK" = "yes" ] || fail "exported GH_TOKEN does not equal the token file contents"
-pass "value: exported GH_TOKEN equals the token file contents"
-
-# ── Case D: export must not be gated on the live HTTP probe succeeding ────
-# If `export GH_TOKEN` sits after a check that requires HTTP 200, a probe
-# failure disables the token path -- the original defect, reintroduced.
-case "$(cat "$WORK/active.body")" in
-  *'200'*|*GH_TOKEN_LIVE_HTTP*)
-    fail "the active export guard references the live HTTP probe (200 / GH_TOKEN_LIVE_HTTP); a probe failure would disable the token path" ;;
+# ── Case F1: valid token file -> App token exported, available=1 ──────────
+R="$(run_resolve "$WORK/home_ok")"
+case "$R" in
+  *"AVAIL=1"*"HAS_GH=set"*) pass "valid token file: App token exported, availability=1" ;;
+  *) fail "valid token file did not produce a usable App token (got: $R)" ;;
 esac
-pass "guard: export is presence-gated, not gated on a successful live probe"
 
-# ── Case E: a 401 from the live probe must not abort the script ───────────
-# (predates this PR, but it aborts before the export and skips every local
-# diagnostic, so a bad token produces no actionable output at all.)
-# ── Case E: a 401 from the live probe must not abort the script ───────────
-# (predates this PR, but it aborts before the export and skips every local
-# diagnostic, so a bad token produces no actionable output at all.)
+# ── Case F2: valid token file beats an inherited operator token ───────────
+R="$(run_resolve "$WORK/home_ok" "inherited_operator_value")"
+case "$R" in
+  *"AVAIL=1"*"HAS_GH=set"*) pass "inherited operator token is overridden by the App token" ;;
+  *) fail "an inherited operator credential was not overridden (got: $R)" ;;
+esac
+
+# ── Case F3: missing token file -> no App token, and GITHUB_TOKEN dropped ─
+# This is the R4 finding: unsetting GH_TOKEN alone leaves GITHUB_TOKEN (and the
+# stored hosts.yml credential) usable, so `gh` still authenticates as the operator.
+R="$(run_resolve "$WORK/home_missing" "inherited_github_token")"
+case "$R" in
+  *"AVAIL=0"*) : ;;
+  *) fail "missing token file still reported the App token as available (got: $R)" ;;
+esac
+case "$R" in
+  *"HAS_GITHUB=set"*) fail "missing token file left GITHUB_TOKEN set, so gh can authenticate as the operator (got: $R)" ;;
+  *) pass "missing token file: availability=0 and GITHUB_TOKEN dropped" ;;
+esac
+
+# ── Case F4: empty token file -> same, availability=0 ────────────────────
+R="$(run_resolve "$WORK/home_empty" "inherited_github_token")"
+case "$R" in
+  *"AVAIL=0"*) pass "empty token file: availability=0" ;;
+  *) fail "empty token file was treated as a usable App token (got: $R)" ;;
+esac
+
+# ── Case E: a 401 from the live probe must not abort the script ──────────
 PROBE_LINE="$(grep -n 'GH_TOKEN_LIVE_HTTP=\$(' "$D" | head -1 | cut -d: -f1)"
 [ -n "$PROBE_LINE" ] || fail "cannot locate the live-probe assignment"
-PROBE_SRC="$(sed -n "${PROBE_LINE}p" "$D")"
-
-# The assignment must handle a nonzero gh exit locally. Without `|| ...`, a
-# 401/403 aborts the whole script under set -e/pipefail before any diagnosis.
-case "$PROBE_SRC" in
-  *') || '*|*'|| true'*)
-    pass "401 case: the live-probe assignment catches a nonzero gh exit instead of aborting" ;;
+# EXECUTE the line under `set -e` with a gh that exits nonzero. Pattern-matching
+# for "||" was not enough: review found `|| exit 1` still satisfies a "||" check
+# while aborting the script, which is the same defect wearing a different hat.
+mkdir -p "$WORK/probe-bin"
+printf '#!/usr/bin/env bash\necho "HTTP/2.0 401 Unauthorized"\nexit 1\n' > "$WORK/probe-bin/gh"
+chmod +x "$WORK/probe-bin/gh"
+{
+  echo '#!/usr/bin/env bash'
+  echo 'set -euo pipefail'
+  echo 'export PATH="$PROBE_BIN:$PATH"'
+  echo 'GH_TOKEN_PATH=/nonexistent'
+  echo 'ORG=acme'
+  sed -n "${PROBE_LINE}p" "$D"
+  echo 'printf "SURVIVED=yes\n"'
+} > "$WORK/probe.sh"
+PROBE_RC=0
+PROBE_OUT="$(env PROBE_BIN="$WORK/probe-bin" bash "$WORK/probe.sh" 2>/dev/null)" || PROBE_RC=$?
+case "$PROBE_OUT" in
+  *"SURVIVED=yes"*)
+    [ "$PROBE_RC" -eq 0 ] \
+      || fail "401 case: the live-probe line printed SURVIVED but exited $PROBE_RC" ;;
   *)
-    fail "401 case: the live-probe assignment (line $PROBE_LINE) has no local failure handling; under set -e/pipefail a 401 aborts the script before it can print its token diagnosis or run any local check" ;;
+    fail "401 case: the live-probe assignment (line $PROBE_LINE) aborts the script when gh exits nonzero (rc=$PROBE_RC, output='${PROBE_OUT}'); under set -e/pipefail a 401 kills the run before it can print its token diagnosis. Pattern-matched '||' is NOT sufficient — it must route to a fallback, not exit." ;;
 esac
+pass "401 case: executing the real live-probe line survives a nonzero gh exit"
 
-# ── Case F: a MISSING token file must not leave the operator's token live ──
-# Section 5 makes every downstream `gh api` call. If the app-token file is
-# absent and the operator's ambient GH_TOKEN is inherited, a bare
-# `if [ -f ... ]; then export ...; fi` skips the export, leaves the inherited
-# personal credential in scope, and section 5 silently rides it -- exactly the
-# wrong-identity fallback this file exists to prevent (found in review).
-# The guard must therefore unset first and export only on success.
-awk '/^[[:space:]]*unset GH_TOKEN[[:space:]]*$/{f=1} f{print} f&&/^[[:space:]]*fi$/{exit}' "$D" > "$WORK/unset.body"
-[ -s "$WORK/unset.body" ] \
-  || fail "the active-host token guard has no 'unset GH_TOKEN' before its presence check; an absent token file would leave the operator's inherited credential in scope for section 5"
-
-cat > "$WORK/unset.harness.sh" <<'HS'
-#!/usr/bin/env bash
-set -uo pipefail
-HS
-echo 'GH_TOKEN_PATH="$HOME/.config/ezgha/gh_token"' >> "$WORK/unset.harness.sh"
-cat "$WORK/unset.body" >> "$WORK/unset.harness.sh"
-echo 'printf "RESULT=%s\n" "${GH_TOKEN:-UNSET}"' >> "$WORK/unset.harness.sh"
-chmod +x "$WORK/unset.harness.sh"
-
-# Arm F1: inherited operator token + NO token file -> must end UNSET.
-NOHOME="$WORK/home-no-token"
-mkdir -p "$NOHOME"
-MISSING_RESULT="$(HOME="$NOHOME" GH_TOKEN=operator_personal_token bash "$WORK/unset.harness.sh" 2>/dev/null | grep '^RESULT=' | cut -d= -f2-)"
-[ "$MISSING_RESULT" = "UNSET" ] \
-  || fail "missing token file left the inherited operator GH_TOKEN in scope (result='${MISSING_RESULT:-<none>}'); section 5 would authenticate with the personal credential instead of failing loudly"
-pass "missing token file: the inherited operator GH_TOKEN is unset, not silently retained"
-
-# Arm F2: inherited operator token + EMPTY token file -> must end UNSET.
-# A zero-byte token file is a real failure mode (an interrupted refresh writes
-# the file before its contents). The guard must reject it on size, not just
-# existence, or section 5 exports an empty token and still masks the operator's
-# inherited credential from diagnosis.
-EMPTYHOME="$WORK/home-empty-token"
-mkdir -p "$EMPTYHOME/.config/ezgha"
-: > "$EMPTYHOME/.config/ezgha/gh_token"
-EMPTY_RESULT="$(HOME="$EMPTYHOME" GH_TOKEN=operator_personal_token bash "$WORK/unset.harness.sh" 2>/dev/null | grep '^RESULT=' | cut -d= -f2-)"
-[ "$EMPTY_RESULT" = "UNSET" ] \
-  || fail "empty token file left GH_TOKEN holding '${EMPTY_RESULT:-<none>}'; the guard must reject a zero-byte file on size (-s), not only on existence (-f)"
-pass "empty token file: GH_TOKEN ends unset rather than exported empty or retaining the operator token"
-
-# Arm F3: inherited operator token + VALID token file -> app token must win.
-PRESENT_RESULT="$(HOME="$WORK/home" GH_TOKEN=operator_personal_token bash "$WORK/unset.harness.sh" 2>/dev/null | grep '^RESULT=' | cut -d= -f2-)"
-[ "$PRESENT_RESULT" = "$FIXTURE_TOKEN" ] \
-  || fail "with the app-token file present the export must override the inherited operator token (got '${PRESENT_RESULT:-<none>}')"
-pass "valid token file: the app token overrides any inherited operator GH_TOKEN"
-
-echo "ALL PASS: doctor-runner exports the app token on both host paths, with correct value and a non-aborting probe"
+echo "ALL PASS: doctor-runner resolves the App token once, before the host-path split, and never falls back to an operator credential"

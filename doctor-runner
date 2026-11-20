@@ -247,6 +247,38 @@ if [ -z "$RUNNER_NAME_PREFIX" ]; then
   # Legacy / missing config: fall back to `ez-org-runner` (the pre-#8143 default).
   RUNNER_NAME_PREFIX="ez-org-runner"
 fi
+
+# ── Credential resolution: ONE place, before any host-path branch ─────────
+# Every `gh` call in this script must use ezgha's own GitHub App token, never the
+# operator's ambient credential. Resolve it here, once, so neither the parked path
+# nor the active path can skip it. An export inside only one branch was the
+# 2026-11-20 defect: a parked host returned early and its job map reported degraded
+# zeros while the org token sat unused at 10005/10400.
+#
+# `unset GH_TOKEN` alone is NOT sufficient to drop the operator's identity: `gh`
+# falls back to GITHUB_TOKEN, GH_ENTERPRISE_TOKEN, and finally the stored
+# ~/.config/gh/hosts.yml credential (verified: with GH_TOKEN unset, `gh auth
+# status` still reports "Logged in ... jleechan2015"). So when the app token is
+# missing or empty we record App-backed evidence as UNAVAILABLE and let the
+# sections that need it say so explicitly, instead of silently authenticating as
+# the operator. GH_TOKEN is still unset so nothing inherits it by accident.
+EZGHA_APP_TOKEN_PATH="$HOME/.config/ezgha/gh_token"
+EZGHA_APP_TOKEN_AVAILABLE=0
+unset GH_TOKEN
+if [ -f "$EZGHA_APP_TOKEN_PATH" ] && [ -s "$EZGHA_APP_TOKEN_PATH" ]; then
+  EZGHA_APP_TOKEN="$(cat "$EZGHA_APP_TOKEN_PATH" 2>/dev/null)"
+  if [ -n "$EZGHA_APP_TOKEN" ]; then
+    export GH_TOKEN="$EZGHA_APP_TOKEN"
+    EZGHA_APP_TOKEN_AVAILABLE=1
+  fi
+fi
+unset EZGHA_APP_TOKEN
+# With no App token, also drop the other ambient credential sources so `gh` cannot
+# authenticate as somebody else through a different variable.
+if [ "$EZGHA_APP_TOKEN_AVAILABLE" -eq 0 ]; then
+  unset GITHUB_TOKEN GH_ENTERPRISE_TOKEN
+fi
+
 # Seed the verdict inputs that the parked-host gate would otherwise leave unset
 # (`set -u` aborted with `SERVICE_STATE: unbound variable`). A parked host owns no
 # service and no VM, so "disabled/absent" is the truthful observation; the verdict
@@ -291,11 +323,7 @@ if [ "$LOCAL_DISABLED" -eq 1 ]; then
   # the operator's ambient `gh auth`. That is the 2026-11-20 defect: an invalid
   # personal token made the job map report "0 in-progress + 0 queued" and forced
   # "queue/API evidence UNPROVEN" while the org token was 10005/10400 healthy.
-  # Exported here as well so the parked path cannot silently regress.
-  GH_TOKEN_PATH_PARKED="$HOME/.config/ezgha/gh_token"
-  if [ -f "$GH_TOKEN_PATH_PARKED" ] && [ -s "$GH_TOKEN_PATH_PARKED" ]; then
-    export GH_TOKEN="$(cat "$GH_TOKEN_PATH_PARKED" 2>/dev/null)"
-  fi
+  # GH_TOKEN was resolved once, before this branch (see "Credential resolution").
   # AGENTS.md requires every suspension to carry a start date and a restore
   # condition so the opt-out cannot quietly become a permanent capacity
   # reduction. Nothing surfaced a MISSING record before this: the Mac leg sat
@@ -552,9 +580,11 @@ fi
 # would silently ride the personal credential this section exists to avoid
 # (found in review). Unset first, then export only on success, so downstream
 # calls run unauthenticated (fail loudly) rather than with the wrong identity.
-unset GH_TOKEN
-if [ -f "$GH_TOKEN_PATH" ] && [ -s "$GH_TOKEN_PATH" ]; then
-  export GH_TOKEN="$(cat "$GH_TOKEN_PATH" 2>/dev/null)"
+# GH_TOKEN was already resolved once, before the parked/active split, so this
+# branch cannot diverge. Do NOT re-export here: two resolution sites is exactly
+# how the parked path drifted from the active one.
+if [ "$EZGHA_APP_TOKEN_AVAILABLE" -eq 0 ]; then
+  bad "App-token evidence UNAVAILABLE: $EZGHA_APP_TOKEN_PATH missing or empty — GitHub-backed sections below report UNPROVEN rather than authenticating as the operator"
 fi
 # --- C. GitHub-side runner fleet ----------------------------------------
 section "5. GitHub org runner fleet ($ORG)"
