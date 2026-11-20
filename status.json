@@ -257,24 +257,24 @@
   },
   "latency": {
     "cancellation": {
-      "cancelled_rate_pct": 6.2,
+      "cancelled_rate_pct": 6.1,
       "cancelled_runs": 3,
-      "total_non_skipped_runs": 48
+      "total_non_skipped_runs": 49
     },
     "cohort": "success",
-    "generated_at": "2026-11-20T14:19:45Z",
+    "generated_at": "2026-11-20T14:30:59Z",
     "ok": true,
     "overall": {
       "e2e": {
-        "avg_s": 328.42,
+        "avg_s": 324.24,
         "max_s": 3340.0,
-        "n": 45,
-        "p50_s": 104.0,
-        "p90_s": 450.0,
-        "p99_s": 3311.4
+        "n": 46,
+        "p50_s": 104.5,
+        "p90_s": 443.0,
+        "p99_s": 3310.75
       },
       "execution": {
-        "avg_s": 328.0,
+        "avg_s": 328.06,
         "max_s": 3300.0,
         "n": 66,
         "p50_s": 99.5,
@@ -282,7 +282,7 @@
         "p99_s": 3277.9
       },
       "queue_wait": {
-        "avg_s": 4.27,
+        "avg_s": 4.29,
         "max_s": 173.0,
         "n": 66,
         "p50_s": 2.0,
@@ -350,23 +350,23 @@
       },
       {
         "e2e": {
-          "avg_s": 206.36,
+          "avg_s": 200.5,
           "max_s": 493.0,
-          "n": 11,
-          "p50_s": 179.0,
-          "p90_s": 408.0,
-          "p99_s": 484.5
+          "n": 12,
+          "p50_s": 157.5,
+          "p90_s": 402.4,
+          "p99_s": 483.65
         },
         "execution": {
-          "avg_s": 169.09,
+          "avg_s": 169.45,
           "max_s": 402.0,
           "n": 11,
-          "p50_s": 127.0,
+          "p50_s": 131.0,
           "p90_s": 347.0,
           "p99_s": 396.5
         },
         "queue_wait": {
-          "avg_s": 2.64,
+          "avg_s": 2.73,
           "max_s": 4.0,
           "n": 11,
           "p50_s": 3.0,
@@ -714,8 +714,8 @@
       }
     ]
   },
-  "observed_at": "2026-11-20T14:19:06Z",
-  "published_at": "2026-11-20T14:19:08Z",
+  "observed_at": "2026-11-20T14:30:20Z",
+  "published_at": "2026-11-20T14:30:22Z",
   "queue": {
     "fresh": null,
     "ghosts": null,
