@@ -516,7 +516,14 @@ fi
 if [ -f "$GH_TOKEN_PATH" ] && { [ "$GH_TOKEN_STATUS" = "fresh" ] || [ "$GH_TOKEN_STATUS" = "warn" ]; }; then
   # awk NR==1 (no exit) consumes gh's full output — `| head -1` here made gh
   # take SIGPIPE under pipefail and killed the whole script with exit 141.
-  GH_TOKEN_LIVE_HTTP=$(GH_TOKEN="$(cat "$GH_TOKEN_PATH" 2>/dev/null)" gh api -i "orgs/$ORG/actions/runners?per_page=1" 2>/dev/null | awk 'NR==1{print $2}')
+  # `|| GH_TOKEN_LIVE_HTTP=""` is load-bearing: under `set -euo pipefail` a gh
+  # that exits nonzero (401/403 on a dead or under-scoped token) would abort the
+  # whole script here -- before the BAD/status branch below could print WHICH
+  # failure it was, and before any local diagnostic ran. Observed 2026-11-20:
+  # with a 401 the script died at this assignment with rc=1 and no output, so a
+  # genuinely dead token produced no actionable diagnosis at all. Catching the
+  # status locally routes it to the existing diagnosis instead of aborting.
+  GH_TOKEN_LIVE_HTTP=$(GH_TOKEN="$(cat "$GH_TOKEN_PATH" 2>/dev/null)" gh api -i "orgs/$ORG/actions/runners?per_page=1" 2>/dev/null | awk 'NR==1{print $2}') || GH_TOKEN_LIVE_HTTP=""
   if [ "$GH_TOKEN_LIVE_HTTP" = "200" ]; then
     ok "gh_token live-check: 200 against orgs/$ORG/actions/runners (mtime freshness confirmed by a real call, not just a clock)"
   else

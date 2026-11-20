@@ -8,12 +8,19 @@
 # and doctor forced "queue/API evidence UNPROVEN" even though the org token was
 # 10005/10400 healthy and completely unused.
 #
-# Why this test checks reachability rather than only grepping for `export`:
-# review of the first version found that a structural grep passes even when the
-# export sits inside a branch that never runs. The parked-host path
-# (LOCAL_DISABLED=1) returns early, so an export placed only inside the
-# active-host branch satisfies a grep while never executing — which is exactly
-# the bug that shipped in the first revision of this fix.
+# WHY THIS TESTS EXECUTION, NOT TEXT:
+# two earlier versions of this test grepped for `export GH_TOKEN` and for its
+# line position. Review found BOTH passed against deliberately broken code:
+#   - export deleted from the parked path        -> passed
+#   - export wrapped in `if false; then`         -> passed
+#   - the active export removed entirely         -> passed
+#   - the active export gated on HTTP 200        -> passed
+# Grep cannot distinguish "exported" from "exported somewhere that runs".
+#
+# So each case below EXTRACTS the relevant guarded block from the real script,
+# wraps it in a harness that supplies the enclosing variables, and executes it.
+# A block whose export sits under `if false`, or which fails to export, is
+# observably different from one that works -- because we run it, not read it.
 #
 # Usage: bash tests/doctor_runner_api_token_test.sh
 set -euo pipefail
@@ -32,88 +39,98 @@ WORK="$(mktemp -d)"
 cleanup() { rm -rf "${WORK:?}"; }
 trap cleanup EXIT
 
-# ── 1. The script exports GH_TOKEN from the ezgha token file ───────────────
-grep -qE '^[[:space:]]*export GH_TOKEN=' "$D" \
-  || fail "doctor-runner never exports GH_TOKEN from the ezgha token file; API calls ride the operator's ambient gh auth"
-pass "structural: doctor-runner exports GH_TOKEN"
+FIXTURE_TOKEN="ghs_fixture_token_DO_NOT_USE_IN_PROD"
+mkdir -p "$WORK/home/.config/ezgha"
+printf '%s\n' "$FIXTURE_TOKEN" > "$WORK/home/.config/ezgha/gh_token"
 
-# ── 2. Exports read the ezgha token path, not an ambient variable ──────────
-grep -qE 'export GH_TOKEN="\$\(cat "\$GH_TOKEN_PATH' "$D" \
-  || grep -qE 'export GH_TOKEN="\$\(cat "\$GH_TOKEN_PATH_PARKED' "$D" \
-  || fail "GH_TOKEN export does not read the ezgha token file ($GH_TOKEN_PATH)"
-pass "structural: export reads the ezgha token file"
-
-# ── 3. Reachability on BOTH host paths ────────────────────────────────────
-# A parked host takes the LOCAL_DISABLED branch and returns early; an export
-# that lives only in the active-host branch never runs there. Prove the export
-# exists BEFORE the parked branch returns, by locating the first export line and
-# the parked branch's exit line.
-EXPORT_LINE="$(grep -nE '^[[:space:]]*export GH_TOKEN=' "$D" | head -1 | cut -d: -f1)"
-[ -n "$EXPORT_LINE" ] || fail "no export GH_TOKEN line"
-
-# The parked branch that RETURNS EARLY and skips the job map is the second
-# `LOCAL_DISABLED` block (the first, ~line 254, only seeds verdict variables and
-# does not exit). Target the block containing the "host lifecycle (parked host)"
-# section banner so the reachability test measures the branch that actually
-# skips sections 8/10.
-PARKED_LINE="$(grep -n 'host lifecycle (parked host)' "$D" | head -1 | cut -d: -f1)"
-[ -n "$PARKED_LINE" ] || fail "cannot locate the parked-host lifecycle branch"
-
-# Bounding the parked BLOCK matters: an export anywhere later in the file
-# (including the active-host branch's own export) would otherwise look
-# "reachable" from PARKED_LINE, which is how the first version of this check
-# wrongly passed an unreachable export. The parked block ends at the first
-# top-level `else` after the banner.
-PARKED_END="$(awk -v s="$PARKED_LINE" 'NR>s && /^else$/ {print NR; exit}' "$D")"
+# Locate the two guarded blocks that must each export the token:
+#   1. the parked-host block (banner -> its terminating top-level `else`)
+#   2. the active-host section-4b export
+PARKED_START="$(grep -n 'host lifecycle (parked host)' "$D" | head -1 | cut -d: -f1)"
+[ -n "$PARKED_START" ] || fail "cannot locate the parked-host lifecycle branch"
+PARKED_END="$(awk -v s="$PARKED_START" 'NR>s && /^else$/ {print NR; exit}' "$D")"
 [ -n "$PARKED_END" ] || fail "cannot locate the end of the parked-host block"
 
-# An export inside the parked branch (>= PARKED_LINE and before the active
-# branch's section 4b) satisfies the parked path. An export only in the active
-# branch (after the parked branch's `else`) does not.
-PARKED_EXPORT="$(awk -v s="$PARKED_LINE" -v e="$PARKED_END" 'NR>=s && NR<e && /^[[:space:]]*export GH_TOKEN=/ {print NR; exit}' "$D")"
-ACTIVE_EXPORT="$EXPORT_LINE"
+# ── Case A: the PARKED block, executed, must export the token ──────────────
+# Build a harness: real block body + the variables it depends on, then print
+# what GH_TOKEN holds afterwards. The block ends by `exit`-ing in the real
+# script, so we lift only its body and let it fall through.
+awk -v s="$PARKED_START" -v e="$PARKED_END" 'NR>s && NR<e' "$D" > "$WORK/parked.body"
+grep -q 'export GH_TOKEN' "$WORK/parked.body" \
+  || fail "parked-host block ($PARKED_START-$PARKED_END) contains no 'export GH_TOKEN'; a parked host returns early and still rides ambient auth"
 
-if [ -n "$PARKED_EXPORT" ]; then
-  pass "reachable: parked-host branch exports GH_TOKEN (line $PARKED_EXPORT) inside the parked block ($PARKED_LINE-$PARKED_END)"
-elif [ "$ACTIVE_EXPORT" -lt "$PARKED_LINE" ]; then
-  pass "reachable: export at line $ACTIVE_EXPORT precedes the parked branch at $PARKED_LINE"
-else
-  fail "unreachable on a parked host: no export inside the parked block ($PARKED_LINE-$PARKED_END); the only export is at line $ACTIVE_EXPORT in the active-host branch, so a parked host returns early and its job map still rides the ambient token"
-fi
-
-# ── 4. Behavioural: the token path works where ambient fails ──────────────
-mkdir -p "$WORK/bin" "$WORK/home/.config/ezgha"
-printf 'ghs_fakeorgtoken\n' > "$WORK/home/.config/ezgha/gh_token"
-
-cat > "$WORK/bin/gh" <<'SH'
+cat > "$WORK/parked.harness.sh" <<'HS'
 #!/usr/bin/env bash
-if [ -z "${GH_TOKEN:-}" ]; then
-  echo 'gh: API rate limit exceeded for user ID 13840161. (HTTP 403)' >&2
-  exit 1
-fi
-echo '{"total_count":0,"workflow_runs":[],"runners":[],"jobs":[]}'
-SH
-chmod +x "$WORK/bin/gh"
+set -uo pipefail
+PLATFORM=Darwin
+HOST=testhost
+section() { :; }; ok() { :; }; info() { :; }; bad() { :; }; warn() { :; }
+FLEET_CONTRACT_SLOTS=0
+HS
+cat "$WORK/parked.body" >> "$WORK/parked.harness.sh"
+cat >> "$WORK/parked.harness.sh" <<'HS'
+printf 'RESULT=%s\n' "${GH_TOKEN:+SET}"
+HS
+chmod +x "$WORK/parked.harness.sh"
+PARKED_RESULT="$(env -u GH_TOKEN HOME="$WORK/home" bash "$WORK/parked.harness.sh" 2>/dev/null | grep '^RESULT=' | cut -d= -f2)"
+[ "$PARKED_RESULT" = "SET" ] \
+  || fail "parked-host block executed but did NOT set GH_TOKEN (result='${PARKED_RESULT:-<none>}'); the export is missing or unreachable there"
+pass "parked path: executing the real parked block sets GH_TOKEN"
 
-AMBIENT_RC=0
-env -u GH_TOKEN HOME="$WORK/home" PATH="$WORK/bin:$PATH" \
-  gh api "repos/acme/one/actions/runs?status=queued&per_page=50" >/dev/null 2>&1 || AMBIENT_RC=$?
-[ "$AMBIENT_RC" -ne 0 ] || fail "shim broken: ambient call should fail but succeeded"
+# ── Case B: the ACTIVE export, executed, must set the token ───────────────
+# Lift only the export statement plus its guard, and run it.
+awk '/^[[:space:]]*if \[ -f "\$GH_TOKEN_PATH" \] && \[ -s "\$GH_TOKEN_PATH" \]; then$/{f=1} f{print} f&&/^[[:space:]]*fi$/{exit}' "$D" > "$WORK/active.body"
+[ -s "$WORK/active.body" ] || fail "cannot extract the active-host export guard from doctor-runner"
+grep -q 'export GH_TOKEN' "$WORK/active.body" \
+  || fail "the active-host export guard contains no 'export GH_TOKEN'"
 
-TOKEN_RC=0
-env -u GH_TOKEN HOME="$WORK/home" PATH="$WORK/bin:$PATH" \
-  GH_TOKEN="$(cat "$WORK/home/.config/ezgha/gh_token")" \
-  gh api "repos/acme/one/actions/runs?status=queued&per_page=50" >/dev/null 2>&1 || TOKEN_RC=$?
-[ "$TOKEN_RC" -eq 0 ] || fail "shim broken: token call should succeed but failed (rc=$TOKEN_RC)"
-pass "behavioural: ambient token fails (403), ezgha token succeeds"
+cat > "$WORK/active.harness.sh" <<'HS'
+#!/usr/bin/env bash
+set -uo pipefail
+HS
+echo 'GH_TOKEN_PATH="$HOME/.config/ezgha/gh_token"' >> "$WORK/active.harness.sh"
+cat "$WORK/active.body" >> "$WORK/active.harness.sh"
+echo 'printf "RESULT=%s\n" "${GH_TOKEN:+SET}"' >> "$WORK/active.harness.sh"
+chmod +x "$WORK/active.harness.sh"
+ACTIVE_RESULT="$(env -u GH_TOKEN HOME="$WORK/home" bash "$WORK/active.harness.sh" 2>/dev/null | grep '^RESULT=' | cut -d= -f2)"
+[ "$ACTIVE_RESULT" = "SET" ] \
+  || fail "active-host export guard executed but did NOT set GH_TOKEN (result='${ACTIVE_RESULT:-<none>}')"
+pass "active path: executing the real export guard sets GH_TOKEN"
 
-# ── 5. Guard: the export must not be gated on the token being valid ───────
-# A file-exists check is required (so a missing file is reported, not silently
-# swapped for ambient auth), but the export must not require the live probe to
-# have succeeded, or a probe failure would itself disable the token path.
-if grep -A3 -E '^[[:space:]]*export GH_TOKEN=' "$D" | grep -qE '200|GH_TOKEN_LIVE_HTTP'; then
-  fail "GH_TOKEN export appears gated on the live HTTP probe succeeding; a probe failure must not disable the token path"
-fi
-pass "guard: export is presence-gated only, not gated on a successful live probe"
+# ── Case C: the value must be the token file's contents, not something else ─
+cat >> "$WORK/active.harness.sh" <<'HS'
+printf 'VALUE_OK=%s\n' "$([ "${GH_TOKEN:-}" = "ghs_fixture_token_DO_NOT_USE_IN_PROD" ] && echo yes || echo no)"
+HS
+VALUE_OK="$(env -u GH_TOKEN HOME="$WORK/home" bash "$WORK/active.harness.sh" 2>/dev/null | grep '^VALUE_OK=' | cut -d= -f2)"
+[ "$VALUE_OK" = "yes" ] || fail "exported GH_TOKEN does not equal the token file contents"
+pass "value: exported GH_TOKEN equals the token file contents"
 
-echo "ALL PASS: doctor-runner API calls use ezgha's own token on both host paths"
+# ── Case D: export must not be gated on the live HTTP probe succeeding ────
+# If `export GH_TOKEN` sits after a check that requires HTTP 200, a probe
+# failure disables the token path -- the original defect, reintroduced.
+case "$(cat "$WORK/active.body")" in
+  *'200'*|*GH_TOKEN_LIVE_HTTP*)
+    fail "the active export guard references the live HTTP probe (200 / GH_TOKEN_LIVE_HTTP); a probe failure would disable the token path" ;;
+esac
+pass "guard: export is presence-gated, not gated on a successful live probe"
+
+# ── Case E: a 401 from the live probe must not abort the script ───────────
+# (predates this PR, but it aborts before the export and skips every local
+# diagnostic, so a bad token produces no actionable output at all.)
+# ── Case E: a 401 from the live probe must not abort the script ───────────
+# (predates this PR, but it aborts before the export and skips every local
+# diagnostic, so a bad token produces no actionable output at all.)
+PROBE_LINE="$(grep -n 'GH_TOKEN_LIVE_HTTP=\$(' "$D" | head -1 | cut -d: -f1)"
+[ -n "$PROBE_LINE" ] || fail "cannot locate the live-probe assignment"
+PROBE_SRC="$(sed -n "${PROBE_LINE}p" "$D")"
+
+# The assignment must handle a nonzero gh exit locally. Without `|| ...`, a
+# 401/403 aborts the whole script under set -e/pipefail before any diagnosis.
+case "$PROBE_SRC" in
+  *') || '*|*'|| true'*)
+    pass "401 case: the live-probe assignment catches a nonzero gh exit instead of aborting" ;;
+  *)
+    fail "401 case: the live-probe assignment (line $PROBE_LINE) has no local failure handling; under set -e/pipefail a 401 aborts the script before it can print its token diagnosis or run any local check" ;;
+esac
+
+echo "ALL PASS: doctor-runner exports the app token on both host paths, with correct value and a non-aborting probe"
