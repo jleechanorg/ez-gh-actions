@@ -5,6 +5,18 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# Preflight: doctor-runner runs the remote probe under `timeout` (GNU coreutils).
+# Stock macOS ships neither `timeout` nor `gtimeout`, so without this check the
+# failure surfaces as an unrelated endpoint/DOWN assertion. Name the real cause
+# instead (bead jleechan-hz5u).
+command -v timeout >/dev/null 2>&1 || {
+  echo 'FAIL: GNU `timeout` not found on PATH — doctor-runner requires it.' >&2
+  echo '      This is a missing test dependency, NOT a production defect.' >&2
+  echo '      macOS: brew install coreutils   (provides timeout/gtimeout)' >&2
+  echo '      Debian/Ubuntu: apt-get install coreutils' >&2
+  exit 1
+}
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 mkdir -p "$TMP/bin" "$TMP/remote-home"
