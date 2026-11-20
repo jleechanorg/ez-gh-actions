@@ -3881,6 +3881,21 @@ fn start_one_with_generate_at_slot(
     cmd.args(["--cpus", &format!("{:.2}", cpus)]);
     cmd.args(["--pids-limit", &format!("{}", cfg.limits.pids)]);
     cmd.args(["--security-opt", "no-new-privileges"]);
+    // Bead jleechan-5khv: Docker's built-in seccomp profile denies
+    // clone(CLONE_NEWUSER), so any CI step that isolates itself with
+    // `unshare -Urn` dies with `Operation not permitted` on BOTH fleets --
+    // including the host where AppArmor is entirely disabled, which rules
+    // AppArmor out and leaves seccomp as the common denial. Both opt-ins are
+    // off by default: the hardened profile stays in place unless an operator
+    // deliberately widens it.
+    if let Some(profile) = &cfg.limits.seccomp_profile {
+        // Narrower route wins. A custom profile can allow clone(CLONE_NEWUSER)
+        // while keeping every other default denial, so it must never be
+        // silently replaced by `seccomp=unconfined`.
+        cmd.args(["--security-opt", &format!("seccomp={profile}")]);
+    } else if cfg.limits.allow_userns {
+        cmd.args(["--security-opt", "seccomp=unconfined"]);
+    }
     if let Some(parent) = &cfg.limits.cgroup_parent {
         cmd.args(["--cgroup-parent", parent]);
     }
@@ -10575,6 +10590,99 @@ esac
              workspace mount so /usr/local/bin/tar knows to guard extractions; \
              got: {run_line}"
         );
+    }
+
+    /// Bead jleechan-5khv: a CI step that isolates itself with `unshare -Urn`
+    /// fails `Operation not permitted` inside runner containers because
+    /// Docker's built-in seccomp profile denies clone(CLONE_NEWUSER). Proven
+    /// on both fleets, with AppArmor disabled on one -- so seccomp, not the
+    /// LSM, is the common denial. These three cases pin the contract: the
+    /// hardened default is untouched, an explicit profile is emitted, and an
+    /// explicit profile always wins over `allow_userns`.
+    #[test]
+    fn userns_seccomp_flags_are_opt_in_and_narrow_profile_wins() {
+        fn run_args_for(cfg: &crate::config::Config, tag: &str) -> String {
+            // NOTE: the fake docker helper writes this path into a shell script
+            // unquoted, so the directory name must be shell-safe -- no `{:?}`
+            // of a ThreadId (it renders as `ThreadId(2)` and breaks the script).
+            let temp_dir = env::temp_dir().join(format!(
+                "ezgha-userns-seccomp-{}-{}",
+                std::process::id(),
+                tag
+            ));
+            std::fs::create_dir_all(&temp_dir).unwrap();
+            let capture = temp_dir.join("docker-args.log");
+            let script = fake_docker_capturing_args(&temp_dir, &capture);
+            *TEST_DOCKER_BIN.lock().unwrap() = Some(script.to_string_lossy().into_owned());
+            start_one_with_generate(cfg, Backend::Docker, |_gh, _name, _labels, _owned| {
+                Ok(("jit".into(), 7_777))
+            })
+            .expect("start_one should succeed");
+            let logged = std::fs::read_to_string(&capture).unwrap();
+            logged
+                .lines()
+                .find(|l| l.contains("run "))
+                .expect("a docker run invocation should have been logged")
+                .to_string()
+        }
+
+        // 1. Default: hardened profile, no unconfined, no custom seccomp.
+        {
+            let _env = TestEnv::new("seccomp_default_hardened");
+            const CASE: &str = "default-hardened";
+            cpu_probe_overrides::set(Some(true));
+            let cfg = cfg_with(1, "ez-org-runner");
+            let args = run_args_for(&cfg, CASE);
+            assert!(
+                args.contains("--security-opt no-new-privileges"),
+                "no-new-privileges must stay by default; got: {args}"
+            );
+            assert!(
+                !args.contains("seccomp=unconfined"),
+                "seccomp must NOT be relaxed by default; got: {args}"
+            );
+            assert!(
+                !args.contains("seccomp="),
+                "no seccomp profile should be passed by default; got: {args}"
+            );
+        }
+
+        // 2. allow_userns alone -> the deliberate unconfined relaxation.
+        {
+            let _env = TestEnv::new("seccomp_allow_userns");
+            const CASE: &str = "allow-userns";
+            cpu_probe_overrides::set(Some(true));
+            let mut cfg = cfg_with(1, "ez-org-runner");
+            cfg.limits.allow_userns = true;
+            let args = run_args_for(&cfg, CASE);
+            assert!(
+                args.contains("--security-opt seccomp=unconfined"),
+                "allow_userns should request seccomp=unconfined; got: {args}"
+            );
+            assert!(
+                args.contains("--security-opt no-new-privileges"),
+                "no-new-privileges must survive the relaxation; got: {args}"
+            );
+        }
+
+        // 3. A custom profile is narrower than unconfined and must win.
+        {
+            let _env = TestEnv::new("seccomp_custom_profile_wins");
+            const CASE: &str = "custom-profile";
+            cpu_probe_overrides::set(Some(true));
+            let mut cfg = cfg_with(1, "ez-org-runner");
+            cfg.limits.allow_userns = true;
+            cfg.limits.seccomp_profile = Some("/etc/ezgha/userns.json".into());
+            let args = run_args_for(&cfg, CASE);
+            assert!(
+                args.contains("--security-opt seccomp=/etc/ezgha/userns.json"),
+                "the explicit profile must be emitted; got: {args}"
+            );
+            assert!(
+                !args.contains("seccomp=unconfined"),
+                "an explicit profile must never be widened to unconfined; got: {args}"
+            );
+        }
     }
 
     #[test]
