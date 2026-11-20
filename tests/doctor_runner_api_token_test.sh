@@ -133,4 +133,38 @@ case "$PROBE_SRC" in
     fail "401 case: the live-probe assignment (line $PROBE_LINE) has no local failure handling; under set -e/pipefail a 401 aborts the script before it can print its token diagnosis or run any local check" ;;
 esac
 
+# ── Case F: a MISSING token file must not leave the operator's token live ──
+# Section 5 makes every downstream `gh api` call. If the app-token file is
+# absent and the operator's ambient GH_TOKEN is inherited, a bare
+# `if [ -f ... ]; then export ...; fi` skips the export, leaves the inherited
+# personal credential in scope, and section 5 silently rides it -- exactly the
+# wrong-identity fallback this file exists to prevent (found in review).
+# The guard must therefore unset first and export only on success.
+awk '/^[[:space:]]*unset GH_TOKEN[[:space:]]*$/{f=1} f{print} f&&/^[[:space:]]*fi$/{exit}' "$D" > "$WORK/unset.body"
+[ -s "$WORK/unset.body" ] \
+  || fail "the active-host token guard has no 'unset GH_TOKEN' before its presence check; an absent token file would leave the operator's inherited credential in scope for section 5"
+
+cat > "$WORK/unset.harness.sh" <<'HS'
+#!/usr/bin/env bash
+set -uo pipefail
+HS
+echo 'GH_TOKEN_PATH="$HOME/.config/ezgha/gh_token"' >> "$WORK/unset.harness.sh"
+cat "$WORK/unset.body" >> "$WORK/unset.harness.sh"
+echo 'printf "RESULT=%s\n" "${GH_TOKEN:-UNSET}"' >> "$WORK/unset.harness.sh"
+chmod +x "$WORK/unset.harness.sh"
+
+# Arm F1: inherited operator token + NO token file -> must end UNSET.
+NOHOME="$WORK/home-no-token"
+mkdir -p "$NOHOME"
+MISSING_RESULT="$(HOME="$NOHOME" GH_TOKEN=operator_personal_token bash "$WORK/unset.harness.sh" 2>/dev/null | grep '^RESULT=' | cut -d= -f2-)"
+[ "$MISSING_RESULT" = "UNSET" ] \
+  || fail "missing token file left the inherited operator GH_TOKEN in scope (result='${MISSING_RESULT:-<none>}'); section 5 would authenticate with the personal credential instead of failing loudly"
+pass "missing token file: the inherited operator GH_TOKEN is unset, not silently retained"
+
+# Arm F2: inherited operator token + PRESENT token file -> app token must win.
+PRESENT_RESULT="$(HOME="$WORK/home" GH_TOKEN=operator_personal_token bash "$WORK/unset.harness.sh" 2>/dev/null | grep '^RESULT=' | cut -d= -f2-)"
+[ "$PRESENT_RESULT" = "$FIXTURE_TOKEN" ] \
+  || fail "with the app-token file present the export must override the inherited operator token (got '${PRESENT_RESULT:-<none>}')"
+pass "present token file: the app token overrides any inherited operator GH_TOKEN"
+
 echo "ALL PASS: doctor-runner exports the app token on both host paths, with correct value and a non-aborting probe"

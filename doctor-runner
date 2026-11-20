@@ -545,9 +545,14 @@ fi
 #   2. each call validated a credential it was not actually supposed to use.
 # Exporting here means every downstream call exercises the token this script
 # claims to be checking, and the org's much larger budget is the one consumed.
-# Only export when the file exists; a missing/broken token must keep failing
-# loudly through the existing GH_TOKEN_STATUS paths rather than silently
-# falling back to a personal token mid-run.
+# A missing/broken token must keep failing loudly through the existing
+# GH_TOKEN_STATUS paths, and it must NOT leave the operator's ambient token in
+# scope: `if [ -f ... ]; then export ...` alone skips the export when the file
+# is absent, so an inherited GH_TOKEN would stay set and every gh api call below
+# would silently ride the personal credential this section exists to avoid
+# (found in review). Unset first, then export only on success, so downstream
+# calls run unauthenticated (fail loudly) rather than with the wrong identity.
+unset GH_TOKEN
 if [ -f "$GH_TOKEN_PATH" ] && [ -s "$GH_TOKEN_PATH" ]; then
   export GH_TOKEN="$(cat "$GH_TOKEN_PATH" 2>/dev/null)"
 fi
