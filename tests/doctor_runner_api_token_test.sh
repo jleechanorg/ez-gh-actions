@@ -161,10 +161,23 @@ MISSING_RESULT="$(HOME="$NOHOME" GH_TOKEN=operator_personal_token bash "$WORK/un
   || fail "missing token file left the inherited operator GH_TOKEN in scope (result='${MISSING_RESULT:-<none>}'); section 5 would authenticate with the personal credential instead of failing loudly"
 pass "missing token file: the inherited operator GH_TOKEN is unset, not silently retained"
 
-# Arm F2: inherited operator token + PRESENT token file -> app token must win.
+# Arm F2: inherited operator token + EMPTY token file -> must end UNSET.
+# A zero-byte token file is a real failure mode (an interrupted refresh writes
+# the file before its contents). The guard must reject it on size, not just
+# existence, or section 5 exports an empty token and still masks the operator's
+# inherited credential from diagnosis.
+EMPTYHOME="$WORK/home-empty-token"
+mkdir -p "$EMPTYHOME/.config/ezgha"
+: > "$EMPTYHOME/.config/ezgha/gh_token"
+EMPTY_RESULT="$(HOME="$EMPTYHOME" GH_TOKEN=operator_personal_token bash "$WORK/unset.harness.sh" 2>/dev/null | grep '^RESULT=' | cut -d= -f2-)"
+[ "$EMPTY_RESULT" = "UNSET" ] \
+  || fail "empty token file left GH_TOKEN holding '${EMPTY_RESULT:-<none>}'; the guard must reject a zero-byte file on size (-s), not only on existence (-f)"
+pass "empty token file: GH_TOKEN ends unset rather than exported empty or retaining the operator token"
+
+# Arm F3: inherited operator token + VALID token file -> app token must win.
 PRESENT_RESULT="$(HOME="$WORK/home" GH_TOKEN=operator_personal_token bash "$WORK/unset.harness.sh" 2>/dev/null | grep '^RESULT=' | cut -d= -f2-)"
 [ "$PRESENT_RESULT" = "$FIXTURE_TOKEN" ] \
   || fail "with the app-token file present the export must override the inherited operator token (got '${PRESENT_RESULT:-<none>}')"
-pass "present token file: the app token overrides any inherited operator GH_TOKEN"
+pass "valid token file: the app token overrides any inherited operator GH_TOKEN"
 
 echo "ALL PASS: doctor-runner exports the app token on both host paths, with correct value and a non-aborting probe"
