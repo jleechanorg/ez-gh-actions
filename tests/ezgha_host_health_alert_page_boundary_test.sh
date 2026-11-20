@@ -32,11 +32,25 @@ exit 1
 STUB
 cat > "$W/ssh" <<'STUB'
 #!/usr/bin/env bash
+if [ "${SSH_FIXTURE:-}" = fail ]; then
+  echo "1 inactive 0"
+  exit 7
+fi
 exec /bin/bash -c "${@: -1}"
 STUB
 cat > "$W/systemctl" <<'STUB'
 #!/usr/bin/env bash
 echo active
+STUB
+cat > "$W/tail" <<'STUB'
+#!/usr/bin/env bash
+/bin/cat "$2"
+exit 7
+STUB
+cat > "$W/jq" <<'STUB'
+#!/usr/bin/env bash
+[ "$1" != -Rr ] || exit 7
+exec "${REAL_JQ:?}" "$@"
 STUB
 chmod +x "$W/gcloud" "$W/docker" "$W/df" "$W/ssh" "$W/systemctl"
 
@@ -155,5 +169,48 @@ run blind-retry FAIL_LOG_WRITE=1
 run blind-retry
 expect blind-retry 'length == 1 and (.[0] | .cause == "blind" and .dispatch == "--severity=ERROR")' \
   "rejected blind write does not start the cooldown"
+
+# Unknown measurements retain independent recovery obligations.
+run disk-recovery HEALTH_ALERT_FREE_GB=1
+run disk-recovery PATH="$W:$PATH" HEALTH_ALERT_FREE_GB= HEALTH_ALERT_SERVICE_OK=0
+expect disk-recovery 'all(.status != "RECOVERED")' "unknown disk never recovers a disk incident through NOTE"
+run disk-recovery
+expect disk-recovery 'map(select(.status == "RECOVERED") | .cause) == ["disk"]' "measured disk recovery survives the intervening blind poll"
+mkdir -p "$W/state-legacy-fail"
+printf '{"status":"FAIL","last_sent":123}\n' >"$W/state-legacy-fail/host-health-alert-test-page-boundary.json"
+run legacy-fail
+expect legacy-fail 'all(.status != "RECOVERED")' "ambiguous legacy FAIL infers no recovery cause"
+
+run peer-emergency HEALTH_ALERT_FREE_GB=1 HEALTH_ALERT_PEER_OK=0
+expect peer-emergency 'length == 2 and (.[0] | .cause == "disk" and .dispatch == "--severity=ERROR") and (.[1] | .cause == "peer" and .dispatch == "--severity=WARNING")' "measured local emergency precedes and does not suppress a peer warning"
+
+run changed-blind HEALTH_ALERT_CONTAINER_COUNT= DOCKER_FIXTURE=timeout
+run changed-blind PATH="$W:$PATH" HEALTH_ALERT_FREE_GB=
+expect changed-blind 'any(.cause == "blind" and .dispatch == "--severity=WARNING") and all(.dispatch != "--severity=ERROR")' "unrelated consecutive local failures do not page blind"
+
+crit replayed-blind runner_pool.host_disk_measurement_unavailable 60
+run replayed-blind
+run replayed-blind
+expect replayed-blind 'any(.cause == "blind" and .dispatch == "--severity=WARNING") and all(.dispatch != "--severity=ERROR")' "rereading one daemon failure cannot establish persistence"
+crit replayed-blind runner_pool.host_disk_measurement_unavailable 10
+run replayed-blind
+expect replayed-blind 'any(.cause == "blind" and .dispatch == "--severity=ERROR")' "a distinct daemon failure establishes persistence"
+
+run ssh-failed PATH="$W:$PATH" HEALTH_ALERT_PLATFORM=Darwin HEALTH_ALERT_PEER_OK= SSH_FIXTURE=fail
+expect ssh-failed 'length == 1 and (.[0] | .cause == "peer" and (.failed_checks | length == 1 and (.[0] | contains("unreachable"))))' "discard peer stdout from failed SSH attempts"
+run ssh-duplicate PATH="$W:$PATH" HEALTH_ALERT_PLATFORM=Darwin HEALTH_ALERT_PEER_OK= DOCKER_FIXTURE=duplicate
+expect ssh-duplicate 'length == 1 and (.[0] | .cause == "peer" and any(.failed_checks[]; contains("Docker runner count unavailable")))' "reject duplicate peer Docker IDs"
+
+# Make each error supply partial evidence and never classify it.
+mkdir -p "$W/fail-tail" "$W/fail-jq"
+mv "$W/tail" "$W/fail-tail/tail"
+mv "$W/jq" "$W/fail-jq/jq"
+chmod +x "$W/fail-tail/tail" "$W/fail-jq/jq"
+crit tail-failed runner_pool.disk_measurement_unavailable 60
+run tail-failed PATH="$W/fail-tail:$PATH"
+expect tail-failed 'length == 1 and (.[0] | .cause == "blind" and .dispatch == "--severity=WARNING")' "failed tail ignores partial producer assertion and warns blind"
+crit jq-failed runner_pool.disk_measurement_unavailable 60
+run jq-failed PATH="$W/fail-jq:$PATH" REAL_JQ="$(command -v jq)"
+expect jq-failed 'length == 1 and (.[0] | .cause == "blind" and .dispatch == "--severity=WARNING")' "failed jq warns blind instead of silence"
 
 exit "$FAILED"
