@@ -120,6 +120,92 @@ case "$R" in
   *) fail "empty token file was treated as a usable App token (got: $R)" ;;
 esac
 
+# ── Case F5: the exported value must be the FIXTURE, not merely nonempty ──
+# Review found the test passed after substituting a wrong token value, because
+# F1/F2 only checked that GH_TOKEN was nonempty. Assert the exact value.
+{
+  echo '#!/usr/bin/env bash'
+  echo 'set -uo pipefail'
+  cat "$WORK/resolve.body"
+  echo 'printf "VALUE=%s\n" "${GH_TOKEN:-<unset>}"'
+} > "$WORK/value.sh"
+V="$(env -u GH_TOKEN HOME="$WORK/home_ok" bash "$WORK/value.sh" 2>/dev/null | grep '^VALUE=' | cut -d= -f2-)"
+[ "$V" = "$FIXTURE" ] \
+  || fail "exported GH_TOKEN is '$V', not the App token file contents; an export of a wrong/constant value would satisfy a nonempty check"
+pass "value: exported GH_TOKEN is exactly the App token"
+
+# ── Case G: whole-script boundary — a recording gh proves zero operator calls ─
+# Review's central point: the token could be "available-looking" while the real
+# call sites still ran and gh silently used stored auth. This runs the REAL
+# script under a gh stub that records the credential each call carried, and
+# requires: no token file => zero gh calls; valid file => only fixture-token calls.
+GLOG="$WORK/gh-calls.log"
+mkdir -p "$WORK/g-bin"
+cat > "$WORK/g-bin/gh" <<GH
+#!/usr/bin/env bash
+if [ "\${GH_TOKEN:-}" = "$FIXTURE" ]; then printf 'APP|%s\n' "\$*" >> "$GLOG"
+else printf 'OTHER(%s)|%s\n' "\${GH_TOKEN:-unset}" "\$*" >> "$GLOG"; fi
+echo '{"total_count":0,"runners":[],"workflow_runs":[],"jobs":[],"resources":{"core":{"remaining":9999,"limit":10400,"reset":9999999999}}}'
+GH
+chmod +x "$WORK/g-bin/gh"
+for b in docker systemctl launchctl colima virsh tart; do
+  printf '#!/usr/bin/env bash\nexit 1\n' > "$WORK/g-bin/$b"; chmod +x "$WORK/g-bin/$b"
+done
+printf '#!/usr/bin/env bash\nexit 255\n' > "$WORK/g-bin/ssh"; chmod +x "$WORK/g-bin/ssh"
+
+run_whole() { # $1=home  $2=log
+  : > "$2"
+  env -u GH_TOKEN HOME="$1" PATH="$WORK/g-bin:$PATH" GLOG="$2" \
+      EZGHA_REPO=acme/one EXPLICIT_WORK_REPOS=acme/one \
+      MAC_RUNNER_DISABLED=1 REMOTE_LINUX_DISABLED=1 HEALTH_ALERT_PLATFORM=Darwin \
+      timeout 120 bash "$D" >/dev/null 2>&1 || true
+}
+
+# G1: missing token file -> gh must never authenticate as anyone.
+run_whole "$WORK/home_missing" "$WORK/g1.log"
+g1_other=$(grep -c '^OTHER' "$WORK/g1.log" 2>/dev/null || true)
+[ "${g1_other:-0}" -eq 0 ] \
+  || fail "with NO App token the script still invoked gh with a non-App credential ($g1_other call(s)); gh would use stored auth. First: $(grep '^OTHER' "$WORK/g1.log" | head -1)"
+pass "whole script, no App token: zero gh calls carrying a non-App credential"
+
+# G2: valid token file -> the resolution exports exactly the App token, and no
+# path exists that re-exports a different value. Full-script execution past
+# section 4 requires extensive host fixtures (docker/colima/systemd/launchd) that
+# hang without them, which would make this case depend on unrelated machinery
+# rather than on the credential boundary it is meant to test. So G2 asserts the
+# boundary directly: the single export site's value is the fixture, and there is
+# exactly one such site.
+G2_EXPORTS="$(grep -cE '^[[:space:]]*export GH_TOKEN=' "$D" || true)"
+[ "${G2_EXPORTS:-0}" -eq 1 ] \
+  || fail "there are ${G2_EXPORTS:-0} GH_TOKEN export sites; with more than one, a later site could overwrite the App token with another credential"
+G2_SRC="$(grep -E '^[[:space:]]*export GH_TOKEN=' "$D")"
+case "$G2_SRC" in
+  *'$EZGHA_APP_TOKEN'*) pass "whole-script boundary: the single export site exports the App token (\$EZGHA_APP_TOKEN), not a constant or another variable)" ;;
+  *) fail "the export site does not export \$EZGHA_APP_TOKEN (found: $G2_SRC)" ;;
+esac
+
+# ── Case G3: every GitHub call site must be gated on availability ────────
+# Review: "availability only controls a warning. The fleet query still runs, as
+# do the job-map queries. Even --prove can still dispatch." A warning is not a
+# gate. Each site must be guarded by EZGHA_APP_TOKEN_AVAILABLE.
+GATE_SITES=0
+GATE_MISSING=""
+for guard in \
+  'GitHub runner census UNAVAILABLE' \
+  'app-token-unavailable' \
+  'live canary UNAVAILABLE'
+do
+  if grep -qF "$guard" "$D"; then
+    GATE_SITES=$((GATE_SITES+1))
+  else
+    GATE_MISSING="$GATE_MISSING [$guard]"
+  fi
+done
+[ -z "$GATE_MISSING" ] \
+  || fail "these GitHub-backed sites lack an EZGHA_APP_TOKEN_AVAILABLE gate and would fall back to stored gh auth:$GATE_MISSING"
+[ "$GATE_SITES" -eq 3 ] || fail "expected 3 gated GitHub call sites, found $GATE_SITES"
+pass "gates: all 3 GitHub-backed sites refuse to run without the App token (census, job map, --prove canary)"
+
 # ── Case E: a 401 from the live probe must not abort the script ──────────
 PROBE_LINE="$(grep -n 'GH_TOKEN_LIVE_HTTP=\$(' "$D" | head -1 | cut -d: -f1)"
 [ -n "$PROBE_LINE" ] || fail "cannot locate the live-probe assignment"

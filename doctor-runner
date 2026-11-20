@@ -588,7 +588,17 @@ if [ "$EZGHA_APP_TOKEN_AVAILABLE" -eq 0 ]; then
 fi
 # --- C. GitHub-side runner fleet ----------------------------------------
 section "5. GitHub org runner fleet ($ORG)"
+# Gated on App-token availability. Without it, `gh` would fall back to
+# GITHUB_TOKEN or the stored ~/.config/gh/hosts.yml login and answer as the
+# operator -- exactly the identity confusion this PR removes. Better to report
+# the census as unavailable than to authenticate as somebody else.
+if [ "$EZGHA_APP_TOKEN_AVAILABLE" -eq 0 ]; then
+  bad "GitHub runner census UNAVAILABLE (no App token) — not querying as the operator"
+  RAW='{"runners":[]}'
+  : > /dev/null
+else
 RAW=$($(command -v gh) api "orgs/$ORG/actions/runners" --paginate 2>/dev/null || echo '{"runners":[]}')
+fi
 TOTAL=$(echo "$RAW" | jq '.total_count // (.runners | length)')
 ONLINE=$(echo "$RAW" | jq '[.runners[] | select(.status=="online")] | length')
 OFFLINE=$(echo "$RAW" | jq '[.runners[] | select(.status=="offline")] | length')
@@ -761,7 +771,10 @@ fi
 # then confirms the runner_name matches the configured prefix and conclusion=success.
 # This is the strongest "handled for real, right now" proof.
 CANARY_OK=""
-if [ "$PROVE" = "1" ]; then
+if [ "$PROVE" = "1" ] && [ "$EZGHA_APP_TOKEN_AVAILABLE" -eq 0 ]; then
+  section "7b. live canary (dispatch + verify a job runs on our fleet NOW)"
+  bad "live canary UNAVAILABLE: --prove needs the App token; refusing to dispatch as the operator via a stored gh login"
+elif [ "$PROVE" = "1" ]; then
   section "7b. live canary (dispatch + verify a job runs on our fleet NOW)"
   before=$($(command -v gh) run list -R "$EZGHA_REPO" -w ezgha-selftest -L 1 --json databaseId --jq '.[0].databaseId // 0' 2>/dev/null)
   $(command -v gh) workflow run ezgha-selftest -R "$EZGHA_REPO" >/dev/null 2>&1
@@ -842,6 +855,13 @@ build_runner_job_index() {
     fresh_cutoff=$(date -u -v-"${STALE_HOURS:-8}"H +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)
   else
     fresh_cutoff=$(date -u -d "${STALE_HOURS:-8} hours ago" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)
+  fi
+  # No App token => do not query the job map at all. `gh` would fall back to
+  # GITHUB_TOKEN or the stored hosts.yml login, so the map would be built from
+  # the operator's identity rather than the App's.
+  if [ "${EZGHA_APP_TOKEN_AVAILABLE:-0}" -eq 0 ]; then
+    echo "app-token-unavailable" >> "$JOBMAP_ERRORS_FILE"
+    return 0
   fi
   for repo in $EXPLICIT_WORK_REPOS; do
     for status in in_progress queued; do
