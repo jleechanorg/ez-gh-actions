@@ -262,19 +262,19 @@
       "total_non_skipped_runs": 50
     },
     "cohort": "success",
-    "generated_at": "2026-11-20T16:47:07Z",
+    "generated_at": "2026-11-20T16:58:36Z",
     "ok": true,
     "overall": {
       "e2e": {
-        "avg_s": 420.78,
+        "avg_s": 404.22,
         "max_s": 3340.0,
         "n": 46,
-        "p50_s": 107.5,
+        "p50_s": 89.0,
         "p90_s": 932.0,
         "p99_s": 3310.75
       },
       "execution": {
-        "avg_s": 319.72,
+        "avg_s": 319.7,
         "max_s": 3300.0,
         "n": 83,
         "p50_s": 86.0,
@@ -282,7 +282,7 @@
         "p99_s": 3272.12
       },
       "queue_wait": {
-        "avg_s": 3.57,
+        "avg_s": 3.58,
         "max_s": 173.0,
         "n": 83,
         "p50_s": 1.0,
@@ -490,12 +490,12 @@
       },
       {
         "e2e": {
-          "avg_s": 263.29,
+          "avg_s": 211.6,
           "max_s": 446.0,
-          "n": 7,
-          "p50_s": 319.0,
-          "p90_s": 441.8,
-          "p99_s": 445.58
+          "n": 5,
+          "p50_s": 164.0,
+          "p90_s": 395.2,
+          "p99_s": 440.92
         },
         "execution": {
           "avg_s": 207.0,
@@ -714,12 +714,12 @@
       }
     ]
   },
-  "observed_at": "2026-11-20T16:45:59Z",
-  "published_at": "2026-11-20T16:46:31Z",
+  "observed_at": "2026-11-20T16:57:55Z",
+  "published_at": "2026-11-20T16:57:58Z",
   "queue": {
     "fresh": null,
     "ghosts": null,
-    "in_progress_runs": 0,
+    "in_progress_runs": 1,
     "ok": true,
     "oldest_fresh_wait_minutes": null,
     "partial": true,
@@ -739,7 +739,7 @@
   },
   "reconciliation": {
     "active_job_slots_occupied": null,
-    "active_workflow_runs": 0,
+    "active_workflow_runs": 1,
     "available_pools": 0,
     "configured_slots": null,
     "cycling_slots": null,
