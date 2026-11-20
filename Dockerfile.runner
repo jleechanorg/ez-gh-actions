@@ -12,6 +12,7 @@ RUN apt-get update && apt-get install -y \
     git \
     python3-venv \
     python3-pip \
+    iproute2 \
     && rm -rf /var/lib/apt/lists/*
 
 # Pre-bake pip at the latest version. CI workflows that `pip install`
