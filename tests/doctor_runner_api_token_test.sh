@@ -281,6 +281,48 @@ case "$GUARD_COND" in
 esac
 pass "live probe: guard condition tests EZGHA_APP_TOKEN_AVAILABLE and precedes the call ($PROBE_GUARD_LINE < $PROBE_API_LINE)"
 
+# ── Case H3: emptying the file AFTER resolution must not change the probe ─
+# Review: "One fallback remains at doctor-runner:562: the probe rereads the file
+# and overrides the already-loaded GH_TOKEN. If the file is emptied after
+# resolution, the probe can still call gh with an empty token." Reproduced by the
+# reviewer with a loaded synthetic token and an emptied file. The probe must use
+# the SAME resolved token as every other call.
+H3_TOKEN="$WORK/h3-token"; H3_LOG="$WORK/h3.log"
+printf '%s\n' "$FIXTURE" > "$H3_TOKEN"
+mkdir -p "$WORK/h3-bin"
+cat > "$WORK/h3-bin/gh" <<'GH'
+#!/usr/bin/env bash
+printf 'TOKEN=%s\n' "${GH_TOKEN:-<unset>}" >> "$GLOG"
+printf 'HTTP/2.0 200 OK\n'
+GH
+chmod +x "$WORK/h3-bin/gh"
+{
+  echo '#!/usr/bin/env bash'
+  echo 'set -uo pipefail'
+  echo 'export PATH="$H_BIN:$PATH"'
+  echo 'ORG=acme'
+  echo 'GH_TOKEN_PATH="$H_TOKEN"'
+  echo 'EZGHA_APP_TOKEN_AVAILABLE=0'
+  echo 'ok() { :; }; bad() { :; }; info() { :; }; warn() { :; }'
+  # Resolve once, as the script does.
+  echo 'if [ -f "$GH_TOKEN_PATH" ] && [ -s "$GH_TOKEN_PATH" ]; then'
+  echo '  EZGHA_APP_TOKEN="$(cat "$GH_TOKEN_PATH")"; export GH_TOKEN="$EZGHA_APP_TOKEN"; EZGHA_APP_TOKEN_AVAILABLE=1'
+  echo 'fi'
+  # Now empty the file, simulating truncation/rotation after resolution.
+  echo ': > "$GH_TOKEN_PATH"'
+  echo 'GH_TOKEN_STATUS=fresh'
+  # Evaluated probe line.
+  sed -n "$(grep -n 'GH_TOKEN_LIVE_HTTP=\$(' "$D" | head -1 | cut -d: -f1)p" "$D"
+  echo 'printf "COMPLETED_H3\n"'
+} > "$WORK/h3.sh"
+: > "$H3_LOG"
+H3_OUT="$(env -u GH_TOKEN H_BIN="$WORK/h3-bin" GLOG="$H3_LOG" H_TOKEN="$H3_TOKEN" bash "$WORK/h3.sh" 2>/dev/null)"
+case "$H3_OUT" in *COMPLETED_H3*) : ;; *) fail "H3 harness did not complete; cannot conclude" ;; esac
+H3_TOK="$(grep '^TOKEN=' "$H3_LOG" | head -1 | cut -d= -f2-)"
+[ "$H3_TOK" = "$FIXTURE" ] \
+  || fail "after the token file was emptied, the probe called gh with TOKEN='$H3_TOK' instead of the already-resolved App token; gh would fall back to stored auth"
+pass "probe uses the resolved App token even if the file is emptied afterwards"
+
 # ── Case E: a 401 from the live probe must not abort the script ──────────
 PROBE_LINE="$(grep -n 'GH_TOKEN_LIVE_HTTP=\$(' "$D" | head -1 | cut -d: -f1)"
 [ -n "$PROBE_LINE" ] || fail "cannot locate the live-probe assignment"

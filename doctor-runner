@@ -559,7 +559,14 @@ elif [ -f "$GH_TOKEN_PATH" ] && { [ "$GH_TOKEN_STATUS" = "fresh" ] || [ "$GH_TOK
   # with a 401 the script died at this assignment with rc=1 and no output, so a
   # genuinely dead token produced no actionable diagnosis at all. Catching the
   # status locally routes it to the existing diagnosis instead of aborting.
-  GH_TOKEN_LIVE_HTTP=$(GH_TOKEN="$(cat "$GH_TOKEN_PATH" 2>/dev/null)" gh api -i "orgs/$ORG/actions/runners?per_page=1" 2>/dev/null | awk 'NR==1{print $2}') || GH_TOKEN_LIVE_HTTP=""
+  # Do NOT re-read the token file here. The earlier resolution already loaded and
+  # exported the App token; re-reading it inline meant that if the file were
+  # emptied or truncated AFTER resolution, this call would pass GH_TOKEN="" and
+  # `gh` would fall back to GITHUB_TOKEN or the stored hosts.yml login -- so the
+  # "live check" would validate somebody else's credential (review finding,
+  # reproduced: loaded synthetic token + emptied file => stub received an empty
+  # token and doctor still reported success). Use the already-resolved token.
+  GH_TOKEN_LIVE_HTTP=$(gh api -i "orgs/$ORG/actions/runners?per_page=1" 2>/dev/null | awk 'NR==1{print $2}') || GH_TOKEN_LIVE_HTTP=""
   if [ "$GH_TOKEN_LIVE_HTTP" = "200" ]; then
     ok "gh_token live-check: 200 against orgs/$ORG/actions/runners (mtime freshness confirmed by a real call, not just a clock)"
   else
