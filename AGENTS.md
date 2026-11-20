@@ -77,6 +77,7 @@ If daemon logs show `could not measure daemon free disk … image missing?` afte
 Every commit subject must be prefixed with the runtime that produced it:
 - `gemini/<model-id>: <subject>`
 - `claude/<model-id>: <subject>`
+- `instinct: <subject>` (Instinct-authored, no model claim)
 - `human: <subject>`
 
 **Enforced server-side for same-repository squash candidates** by the
@@ -87,7 +88,7 @@ allocated. A merge-dialog title override remains outside this repository
 workflow; preventing that requires a GitHub repository ruleset. **Enforced
 locally for ordinary commits** by the same hook (bead `ez-gh-actions-jcie`).
 Recognized prefixes: `claude/`, `claudem/`, `claudew/`, `gemini/`, `codex/`,
-`cursor/`, `ao/`, `human` (each terminated by `:`). Opt in per-developer
+`cursor/`, `ao/`, `pi/`, `instinct:`, `human:` (model-based labels also require their model segment). Opt in per-developer
 with `git config core.hooksPath .githooks` — see `.githooks/README.md`.
 Merge commits and `git commit --no-verify` bypass the gate.
 
