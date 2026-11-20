@@ -1151,10 +1151,21 @@ remote_docker_env() {
     if [ -f ~/Library/LaunchAgents/org.jleechanorg.ezgha.plist ]; then
       plutil -extract EnvironmentVariables.DOCKER_HOST raw ~/Library/LaunchAgents/org.jleechanorg.ezgha.plist 2>/dev/null || exit 1
     elif command -v systemctl >/dev/null 2>&1; then
+      # A non-interactive ssh command has neither XDG_RUNTIME_DIR nor
+      # DBUS_SESSION_BUS_ADDRESS, so `systemctl --user` fails with
+      # "Failed to connect to bus: No medium found" (rc=1) even though the
+      # unit is loaded and running. Without these exports this function
+      # returned 1 for a healthy host, and every Linux slot was then reported
+      # "Docker endpoint unresolved — counted DOWN without a Docker probe"
+      # (2026-11-18: 20/20 Linux slots falsely DOWN while 15 were executing).
+      export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+      export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/$(id -u)/bus}"
       unit_load_state=$(systemctl --user show ezgha.service -p LoadState --value 2>/dev/null) || exit 1
       [ "$unit_load_state" = loaded ] || exit 1
       service_env=$(systemctl --user show ezgha.service -p Environment --value 2>/dev/null) || exit 1
       # Parse quoted systemctl assignments as data, never as shell code.
+      # DOCKER_HOST_OVERRIDE is the ezgha-owned pointer and outranks a plain
+      # DOCKER_HOST; when neither is set, fall back to the native socket.
       endpoint=$(printf "%s\n" "$service_env" | python3 -c "import shlex,sys; items=shlex.split(sys.stdin.read()); print(next((x.split(\"=\",1)[1] for x in items if x.startswith(\"DOCKER_HOST_OVERRIDE=\")),\"\"),end=\"\")") || exit 1
       case "$endpoint" in
         *[![:space:]]*) printf "%s" "$endpoint" ;;
