@@ -29,15 +29,31 @@ grep -q 'EZGHA_SUSPENSION_RECORD' "$D" \
   || fail "doctor-runner does not read EZGHA_SUSPENSION_RECORD"
 pass "structural: EZGHA_SUSPENSION_RECORD is read"
 
-# Extract just the parked-host block (`if [ "$LOCAL_DISABLED" -eq 1 ]` through its
-# closing `fi`) so the assertion is about that code path, not about a
-# coincidence elsewhere in a 2000-line script. Located by delimiters, never by
-# absolute line numbers: a hardcoded window rots on any unrelated edit.
+# Extract just the parked-host block so the assertion is about that code path, not
+# about a coincidence elsewhere in a 2000-line script. Located by delimiters,
+# never by absolute line numbers: a hardcoded window rots on any unrelated edit.
+#
+# `doctor-runner` contains TWO `if [ "$LOCAL_DISABLED" -eq 1 ]` guards (the early
+# verdict-input seeding and the section 1-6 host-lifecycle span). The `ok "...
+# intentionally DISABLED (operator opt-out)"` line distinguishes the latter, so
+# anchor on that and walk BACK to its opening guard. Anchoring on the guard alone
+# matched the seeding block first and silently widened the window to ~30 lines of
+# unrelated code, weakening the assertion while still passing (codex P2).
 local_block() {
   awk '
-    /^if \[ "\$LOCAL_DISABLED" -eq 1 \]; then$/ { inside = 1 }
-    inside && /^else$/ { exit }
-    inside { print }
+    { lines[NR] = $0 }
+    /intentionally DISABLED \(operator opt-out\)/ && !guard {
+      for (i = NR; i >= 1; i--) {
+        if (lines[i] ~ /^if \[ "\$LOCAL_DISABLED" -eq 1 \]; then$/) { guard = i; break }
+      }
+    }
+    END {
+      if (!guard) exit 1
+      for (i = guard; i <= NR; i++) {
+        if (i > guard && lines[i] == "else") break
+        print lines[i]
+      }
+    }
   ' "$D"
 }
 
