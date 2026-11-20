@@ -18,6 +18,14 @@
 #                 unreachable, or no local containers). Severity ERROR notifies
 #                 "[CRITICAL] ezgha: GitHub Actions Runners Down Alert".
 #   cause=peer  → peer-only failures remain WARNING diagnostics.
+#   cause=probe → the docker CLI probe timed out but dockerd is still alive
+#                 (independent liveness check), so the fleet may well be
+#                 serving. Severity WARNING ⇒ logged, NOT paged, for
+#                 `PROBE_PAGE_AFTER_MIN` (default 15) minutes; a probe that
+#                 stays indeterminate past that window escalates to cause=fleet
+#                 so a genuinely wedged daemon still pages. A daemon confirmed
+#                 down (unit inactive/failed, no dockerd pid) is cause=fleet
+#                 immediately, unchanged.
 #   cause=disk  → free space is under the admission floor but the fleet is
 #                 otherwise healthy. Severity WARNING ⇒ logged, NOT paged, for
 #                 `DISK_PAGE_AFTER_MIN` (default 15) minutes, because ezgha's own
@@ -51,6 +59,11 @@
 #   HEALTH_ALERT_PEER_SERVICE (active)
 #   HEALTH_ALERT_DISK_FLOOR_GB (Linux 30, Darwin 20)
 #   HEALTH_ALERT_DISK_EMERGENCY_GB (15)      HEALTH_ALERT_DISK_PAGE_AFTER_MIN (15)
+#   HEALTH_ALERT_PROBE_PAGE_AFTER_MIN (15)   HEALTH_ALERT_PROBE_ATTEMPTS (3)
+#   HEALTH_ALERT_PROBE_BACKOFF_SEC (2)       HEALTH_ALERT_DOCKERD_ALIVE (1|0; "" = probe)
+#   HEALTH_ALERT_DOCKER_PIDFILE (/var/run/docker.pid)
+#   HEALTH_ALERT_LIVENESS_TIMEOUT_SEC (3; per pgrep/systemctl call)
+#   HEALTH_ALERT_PROC_ROOT (/proc; tests only)
 #   HEALTH_ALERT_COOLDOWN_SEC (1800)         GCLOUD_BIN, DOCKER_BIN
 #
 set -euo pipefail
@@ -90,7 +103,7 @@ DOCKER_BIN="${DOCKER_BIN:-docker}"
 # ── Policy definitions (single source of truth, used by --ensure-policies) ────
 FLEET_POLICY_NAME="[CRITICAL] ezgha: GitHub Actions Runners Down Alert"
 FLEET_POLICY_SUBJECT="[CRITICAL] ezgha runner fleet down"
-FLEET_POLICY_DOC="The ezgha runner fleet on this host cannot run jobs (service down, docker unreachable, or 0 runner containers on this host, or a recent daemon CRITICAL such as an admission pause). A degraded PEER host is explicitly NOT this alert (cause=\"peer\", WARNING). Disk-floor breaches are NOT this alert; see '[CRITICAL] ezgha: host disk below safety floor'. Source: scripts/ezgha-host-health-alert.sh with jsonPayload.cause=\"fleet\"."
+FLEET_POLICY_DOC="The ezgha runner fleet on this host cannot run jobs (service down, docker unreachable, or 0 runner containers on this host, or a recent daemon CRITICAL such as an admission pause). A degraded PEER host is explicitly NOT this alert (cause=\"peer\", WARNING). A docker CLI probe that timed out while dockerd is still alive is NOT this alert either (cause=\"probe\", WARNING) unless the probe has stayed indeterminate past its escalation window. Disk-floor breaches are NOT this alert; see '[CRITICAL] ezgha: host disk below safety floor'. Source: scripts/ezgha-host-health-alert.sh with jsonPayload.cause=\"fleet\"."
 DISK_POLICY_NAME="[CRITICAL] ezgha: host disk below safety floor"
 DISK_POLICY_SUBJECT="[CRITICAL] ezgha host disk below safety floor"
 DISK_POLICY_DOC="Host free space has been under the ezgha admission floor for the sustained window (or below the emergency floor), so runner admission is paused. Source: scripts/ezgha-host-health-alert.sh with jsonPayload.cause=\"disk\"."
@@ -105,6 +118,22 @@ fi
 PEER_DISK_FLOOR_GB="${HEALTH_ALERT_PEER_DISK_FLOOR_GB:-30}"
 DISK_EMERGENCY_GB="${HEALTH_ALERT_DISK_EMERGENCY_GB:-15}"
 DISK_PAGE_AFTER_MIN="${HEALTH_ALERT_DISK_PAGE_AFTER_MIN:-15}"
+# Docker CLI probe: retries, then an independent dockerd liveness check, then a
+# fail-closed escalation window (see "Probe-indeterminate escalation" below).
+PROBE_ATTEMPTS="${HEALTH_ALERT_PROBE_ATTEMPTS:-3}"
+PROBE_BACKOFF_SEC="${HEALTH_ALERT_PROBE_BACKOFF_SEC:-2}"
+# Persisted CONTINUOUS-OBSERVATION threshold, not a wall-clock delivery cap: real
+# time-to-page also includes the probe retries and backoff, the poll cadence,
+# sink latency, and state-file clock conditions. Do not tune it before those are
+# grounded (review finding 6) - the default stays 15.
+PROBE_PAGE_AFTER_MIN="${HEALTH_ALERT_PROBE_PAGE_AFTER_MIN:-15}"
+# Wall-clock budget for each out-of-band liveness call (pgrep/systemctl). These
+# must never outlive the poll interval, or a hung call suppresses the escalation
+# window the probe verdict depends on.
+LIVENESS_TIMEOUT_SEC="${HEALTH_ALERT_LIVENESS_TIMEOUT_SEC:-3}"
+# procfs root: only ever re-pointed by hermetic tests (macOS has no /proc), so a
+# pidfile identity check can be exercised on any host.
+PROC_ROOT="${HEALTH_ALERT_PROC_ROOT:-/proc}"
 COOLDOWN_SEC="${HEALTH_ALERT_COOLDOWN_SEC:-1800}"
 
 # Daemon CRITICAL follow-up. The daemon writes Slack alerts to alerts.jsonl;
@@ -220,27 +249,148 @@ if [ "$SERVICE_OK" != "1" ] && [ "$LOCAL_LEG_PARKED" -ne 1 ]; then
 fi
 
 # ── 2. Local Docker & Containers ─────────────────────────────────────────────
+# A single `timeout 10 docker info` cannot tell "the daemon is dead" apart from
+# "the daemon is alive but too starved to answer in 10s". On 2026-11-19
+# jeff-ubuntu (62GB RAM, swap exhausted, load 176 on 32 CPUs) failed that probe
+# for ~96s while all 20 ez-runner-c-* containers kept executing jobs, and the
+# run dispatched CRITICAL cause=fleet with container_count=0 — a fleet-down page
+# for a fleet that was serving. Retry the probe, then ask an independent
+# daemon-liveness source before calling the fleet down.
 CONTAINER_COUNT="${HEALTH_ALERT_CONTAINER_COUNT:-}"
 DOCKER_UNREACHABLE=0
+PROBE_INDETERMINATE=0
+CONTAINER_COUNT_KNOWN=true
+PROBE_NOTE=""
+
+# Out-of-band dockerd liveness. Prints alive|down|unknown.
+# Only Linux has an independent source; Darwin/colima keeps its historical
+# behaviour (an unreachable socket is a real fleet fault, never cause=probe).
+# A live PID in the pidfile is not evidence of a live daemon: PIDs are recycled,
+# so the file can name an unrelated process that happens to exist (review
+# finding 1 - an unchecked /proc/<pid> is PID-reuse, not liveness). Require the
+# process identity to be dockerd before the pidfile counts as positive evidence.
+dockerd_pid_is_dockerd() { # pid
+  local p="$1" comm="" argv0=""
+  [ -r "$PROC_ROOT/$p/comm" ] || return 1
+  read -r comm < "$PROC_ROOT/$p/comm" 2>/dev/null || return 1
+  # Exact daemon name only: `docker` is the CLI client, not the daemon.
+  [ "$comm" = "dockerd" ] && return 0
+  # Otherwise the executable identity must be dockerd: argv[0]'s basename, not a
+  # substring anywhere in the command line (a CLI invocation mentioning dockerd,
+  # or `sh -c 'echo dockerd'`, must not pass).
+  [ -r "$PROC_ROOT/$p/cmdline" ] || return 1
+  argv0=$(tr '\0' '\n' < "$PROC_ROOT/$p/cmdline" 2>/dev/null | head -1)
+  [ "${argv0##*/}" = "dockerd" ] && return 0
+  return 1
+}
+
+dockerd_probe_state() {
+  case "${HEALTH_ALERT_DOCKERD_ALIVE:-}" in
+    1) echo alive; return 0 ;;
+    0) echo down; return 0 ;;
+  esac
+  if [ "$PLATFORM" != "Linux" ]; then echo unknown; return 0; fi
+  # Positive evidence first: a unit-less/rootless daemon is alive even when
+  # docker.service was never the thing that started it.
+  local pid="" unit="" pidfile="${HEALTH_ALERT_DOCKER_PIDFILE:-/var/run/docker.pid}"
+  if [ -r "$pidfile" ]; then
+    pid=$(tr -dc '0-9' < "$pidfile" 2>/dev/null || true)
+  fi
+  if [ -n "$pid" ] && [ -d "$PROC_ROOT/$pid" ] && dockerd_pid_is_dockerd "$pid"; then echo alive; return 0; fi
+  # Every out-of-band liveness call is bounded: an unbounded `pgrep`/`systemctl`
+  # on a starved host would stall this script and suppress the very escalation
+  # this change adds (review finding 5).
+  if timeout "$LIVENESS_TIMEOUT_SEC" pgrep -x dockerd >/dev/null 2>&1; then echo alive; return 0; fi
+  if command -v systemctl >/dev/null 2>&1; then
+    # ONE bounded call, and its TEXT is the verdict: a positive `active` result
+    # must be honoured as liveness. Asking `--quiet` first meant a timeout or an
+    # inconclusive exit could drop a genuinely active unit into `unknown` and page
+    # immediately (review finding 3). Only an unreadable result falls through.
+    unit=$(timeout "$LIVENESS_TIMEOUT_SEC" systemctl is-active docker 2>/dev/null || true)
+    case "$unit" in
+      active|activating|reloading) echo alive; return 0 ;;
+      inactive|failed|deactivating) echo down; return 0 ;;
+    esac
+  fi
+  # No source answered (no systemd bus, no pid, nothing): unknown. The caller
+  # then keeps the historical fail-closed classification instead of guessing,
+  # and reports the container count as unknown rather than an observed 0.
+  echo unknown
+}
+
 if [ -z "$CONTAINER_COUNT" ]; then
   if [ "$PLATFORM" = "Darwin" ] && [ -S "$HOME/.colima/default/docker.sock" ] && [ -z "${DOCKER_HOST:-}" ]; then
     export DOCKER_HOST="unix://$HOME/.colima/default/docker.sock"
   fi
-  if ! timeout 10 "$DOCKER_BIN" info >/dev/null 2>&1; then
-    # A parked host has no docker running BY CONSTRUCTION, so an unreachable
-    # daemon is the decision, not a defect (bead jleechan-hxz0).
-    if [ "$LOCAL_LEG_PARKED" -ne 1 ]; then
-      FLEET_FAILS+=("local: docker daemon unreachable or timed out")
+  PROBE_OK=0
+  PROBE_TRIES=0
+  while [ "$PROBE_TRIES" -lt "$PROBE_ATTEMPTS" ]; do
+    PROBE_TRIES=$((PROBE_TRIES + 1))
+    if timeout 10 "$DOCKER_BIN" info >/dev/null 2>&1; then PROBE_OK=1; break; fi
+    if [ "$PROBE_TRIES" -lt "$PROBE_ATTEMPTS" ] && [ "$PROBE_BACKOFF_SEC" -gt 0 ]; then
+      sleep "$PROBE_BACKOFF_SEC"
     fi
-    DOCKER_UNREACHABLE=1
-    CONTAINER_COUNT=0
+  done
+  if [ "$PROBE_OK" -eq 1 ]; then
+    # The daemon answered, so a container-count probe that still fails/times out
+    # leaves the count UNKNOWN — reporting the empty output as 0 would page
+    # cause=fleet with "0 ezgha runner containers running" for a live fleet.
+    if PS_OUT=$(timeout 10 "$DOCKER_BIN" ps --filter label=ezgha=managed -q 2>/dev/null); then
+      CONTAINER_COUNT=$(printf '%s\n' "$PS_OUT" | grep -c '[^[:space:]]' || true)
+    else
+      DOCKER_UNREACHABLE=1
+      PROBE_INDETERMINATE=1
+      CONTAINER_COUNT=-1
+      CONTAINER_COUNT_KNOWN=false
+      PROBE_NOTE="local: docker CLI container count timed out (daemon active) - probe indeterminate, container count unknown"
+    fi
   else
-    CONTAINER_COUNT=$(timeout 10 "$DOCKER_BIN" ps --filter label=ezgha=managed -q 2>/dev/null | wc -l || echo 0)
+    DOCKER_UNREACHABLE=1
+    case "$(dockerd_probe_state)" in
+      alive)
+        # Daemon alive, CLI probe timed out: the count is UNKNOWN, never 0.
+        PROBE_INDETERMINATE=1
+        CONTAINER_COUNT=-1
+        CONTAINER_COUNT_KNOWN=false
+        PROBE_NOTE="local: docker CLI probe timed out (daemon active) after ${PROBE_TRIES} attempt(s) - probe indeterminate, container count unknown"
+        ;;
+      down)
+        # Daemon confirmed down: unchanged fail-closed fleet failure. A parked
+        # host has no docker BY CONSTRUCTION, so an unreachable daemon is the
+        # decision (bead jleechan-hxz0), not a defect.
+        if [ "$LOCAL_LEG_PARKED" -ne 1 ]; then
+          FLEET_FAILS+=("local: docker daemon unreachable or timed out")
+        fi
+        CONTAINER_COUNT=0
+        ;;
+      *)
+        # No independent liveness source (always Darwin/colima, or a Linux host
+        # with no pidfile and no systemd bus). Keep the historical fail-closed
+        # page - never hide a dead daemon - but the count is UNKNOWN, not an
+        # observed 0 (review finding 4), so the payload must not claim
+        # container_count=0 with container_count_known=true.
+        if [ "$LOCAL_LEG_PARKED" -ne 1 ]; then
+          FLEET_FAILS+=("local: docker daemon unreachable or timed out (dockerd liveness unknown - no independent signal)")
+        fi
+        CONTAINER_COUNT=-1
+        CONTAINER_COUNT_KNOWN=false
+        ;;
+    esac
   fi
 fi
+if [ "$LOCAL_LEG_PARKED" -eq 1 ]; then
+  PROBE_INDETERMINATE=0
+  PROBE_NOTE=""
+  CONTAINER_COUNT=0
+  CONTAINER_COUNT_KNOWN=true
+fi
 CONTAINER_COUNT=$(printf '%d' "$CONTAINER_COUNT" 2>/dev/null || echo 0)
+# Human-readable count for the verdict line: an unknown count must never read
+# like a number, and -1 is the machine sentinel.
+if [ "$CONTAINER_COUNT_KNOWN" = "true" ]; then COUNT_TEXT="$CONTAINER_COUNT"; else COUNT_TEXT="unknown"; fi
 # A zero-container fleet is the core fleet-down signal, whichever way the count
-# was obtained (live probe or an audit-mode override).
+# was obtained (live probe or an audit-mode override). An unknown count is -1,
+# so it can never be read as a live 0.
 if [ "$CONTAINER_COUNT" -eq 0 ] && [ "$DOCKER_UNREACHABLE" -eq 0 ] && [ "$LOCAL_LEG_PARKED" -ne 1 ]; then
   FLEET_FAILS+=("local: 0 ezgha runner containers running")
 fi
@@ -418,6 +568,8 @@ PREV_STATUS="OK"
 PREV_LAST_SENT_FLEET=0
 PREV_LAST_SENT_DISK=0
 PREV_DISK_SINCE=0
+PREV_PROBE_SINCE=0
+PREV_PENDING=""
 read_state() { # file
   local f="$1"
   [ -f "$f" ] || return 0
@@ -425,10 +577,14 @@ read_state() { # file
   PREV_LAST_SENT_FLEET=$(sed -n 's/.*"last_sent_fleet":[[:space:]]*\([0-9]*\).*/\1/p' "$f" 2>/dev/null | head -1)
   PREV_LAST_SENT_DISK=$(sed -n 's/.*"last_sent_disk":[[:space:]]*\([0-9]*\).*/\1/p' "$f" 2>/dev/null | head -1)
   PREV_DISK_SINCE=$(sed -n 's/.*"disk_breach_since":[[:space:]]*\([0-9]*\).*/\1/p' "$f" 2>/dev/null | head -1)
+  PREV_PROBE_SINCE=$(sed -n 's/.*"probe_indeterminate_since":[[:space:]]*\([0-9]*\).*/\1/p' "$f" 2>/dev/null | head -1)
+  PREV_PENDING=$(sed -n 's/.*"pending_recovery":[[:space:]]*"\([^"]*\)".*/\1/p' "$f" 2>/dev/null | head -1)
   PREV_STATUS="${PREV_STATUS:-OK}"
   PREV_LAST_SENT_FLEET="${PREV_LAST_SENT_FLEET:-0}"
   PREV_LAST_SENT_DISK="${PREV_LAST_SENT_DISK:-0}"
   PREV_DISK_SINCE="${PREV_DISK_SINCE:-0}"
+  PREV_PROBE_SINCE="${PREV_PROBE_SINCE:-0}"
+  PREV_PENDING="${PREV_PENDING:-}"
 }
 read_state "$STATE_FILE"
 if [ ! -f "$STATE_FILE" ]; then
@@ -442,8 +598,11 @@ if [ ! -f "$STATE_FILE" ]; then
 fi
 
 save_state() { # status last_sent_fleet last_sent_disk disk_since
-  printf '{"status":"%s", "last_sent_fleet":%s, "last_sent_disk":%s, "disk_breach_since":%s, "updated_at":"%s"}\n' \
-    "$1" "$2" "$3" "$4" "$NOW_ISO" > "$STATE_FILE"
+  # probe_indeterminate_since is read from PROBE_SINCE (set in the escalation
+  # block below) and pending_recovery from PENDING_NEXT, rather than passed
+  # positionally, so both survive every branch without touching eight call sites.
+  printf '{"status":"%s", "last_sent_fleet":%s, "last_sent_disk":%s, "disk_breach_since":%s, "probe_indeterminate_since":%s, "pending_recovery":"%s", "updated_at":"%s"}\n' \
+    "$1" "$2" "$3" "$4" "${PROBE_SINCE:-0}" "${PENDING_NEXT:-}" "$NOW_ISO" > "$STATE_FILE"
 }
 
 emit() { # severity payload-json
@@ -462,10 +621,89 @@ emit() { # severity payload-json
 
 json_checks() { printf '%s\n' "$@" | jq -R . | jq -s .; }
 
+# ── Probe-indeterminate escalation window (bead jleechan-q0ms) ───────────────
+# An alive-but-unanswerable daemon is reported as cause=probe WARNING, which no
+# Slack policy matches. That must not become a permanent blind spot: once the
+# probe has been indeterminate for PROBE_PAGE_AFTER_MIN the verdict fails closed
+# onto the existing cause=fleet CRITICAL page, exactly like a sustained disk
+# breach escalates to the disk policy. Computed before FLEET_COUNT so an
+# escalated probe reaches the unchanged fleet page.
+PROBE_SINCE=$PREV_PROBE_SINCE
+PROBE_MIN=0
+PROBE_ESCALATED=0
+if [ "$PROBE_INDETERMINATE" -eq 1 ]; then
+  if [ "$PROBE_SINCE" -eq 0 ]; then PROBE_SINCE=$NOW_EPOCH; fi
+  PROBE_MIN=$(( (NOW_EPOCH - PROBE_SINCE) / 60 ))
+  if [ "$PROBE_MIN" -ge "$PROBE_PAGE_AFTER_MIN" ]; then
+    PROBE_ESCALATED=1
+    FLEET_FAILS+=("local: docker CLI probe timed out and stayed indeterminate for ${PROBE_MIN}m (>= ${PROBE_PAGE_AFTER_MIN}m window) with dockerd alive - treating as fleet failure")
+  fi
+else
+  PROBE_SINCE=0
+fi
+
+# ── Pending recovery obligations ────────────────────────────────────────────
+# A RECOVERED entry is only truthful for an OBSERVED healthy fleet. When a paged
+# state ends during a poll that could not observe the fleet (probe
+# indeterminate), emitting the recovery there is a false all-clear. Carry the
+# cause in the state file instead and recover on the first known-healthy poll,
+# exactly once.
+recovery_causes_for() { # previous status -> zero or more cause names
+  case "$1" in
+    DOWN|FAIL) echo fleet ;;
+  esac
+  case "$1" in
+    DISK|DEGRADED|FAIL) echo disk ;;
+  esac
+  case "$1" in
+    PEER) echo peer ;;
+  esac
+  case "$1" in
+    PROBE) echo probe ;;
+  esac
+}
+join_unique() { # de-duplicated space-separated list (bash 3.2 safe)
+  local out="" c
+  for c in "$@"; do
+    [ -n "$c" ] || continue
+    case " $out " in *" $c "*) continue ;; esac
+    out="${out:+$out }$c"
+  done
+  printf '%s' "$out"
+}
+PENDING_ITEMS=()
+if [ -n "$PREV_PENDING" ]; then
+  OLD_IFS="$IFS"
+  IFS=','
+  for c in $PREV_PENDING; do [ -n "$c" ] && PENDING_ITEMS+=("$c"); done
+  IFS="$OLD_IFS"
+fi
+while IFS= read -r c; do [ -n "$c" ] && PENDING_ITEMS+=("$c"); done < <(recovery_causes_for "$PREV_STATUS")
+PENDING_CARRY=$(join_unique ${PENDING_ITEMS[@]+"${PENDING_ITEMS[@]}"})
+# Default for every branch that did not observe a healthy fleet: the obligation
+# stays outstanding, so the state file carries it to the next poll.
+PENDING_NEXT="$PENDING_CARRY"
+
+emit_pending_recoveries() { # emit each outstanding cause exactly once
+  [ -n "$PENDING_CARRY" ] || return 0
+  local c
+  for c in $PENDING_CARRY; do
+    REC_PAYLOAD=$(printf '{"host":"%s", "platform":"%s", "status":"RECOVERED", "cause":"%s", "container_count":%d, "free_gb":%d, "ts":"%s"}' \
+      "$HOST" "$PLATFORM" "$c" "$CONTAINER_COUNT" "$FREE_GB" "$NOW_ISO")
+    emit INFO "$REC_PAYLOAD"
+  done
+}
+
 FLEET_COUNT=${#FLEET_FAILS[@]}
 DISK_COUNT=${#DISK_FAILS[@]}
 PEER_COUNT=${#PEER_FAILS[@]}
 DISK_SINCE=$PREV_DISK_SINCE
+# A sustained-breach timer only survives while the breach is observed. Carrying
+# it across a poll that measured a healthy disk let a NEW breach inherit an old
+# window and page immediately instead of starting a fresh one (review finding 2:
+# a DEGRADED state seeded with a stale disk_breach_since survived the probe
+# branch, because only the OK/NOTE paths reset it).
+if [ "$DISK_COUNT" -eq 0 ]; then DISK_SINCE=0; fi
 NOW_LAST_FLEET=$PREV_LAST_SENT_FLEET
 NOW_LAST_DISK=$PREV_LAST_SENT_DISK
 EXIT_CODE=0
@@ -486,7 +724,7 @@ if [ "$LOCAL_LEG_PARKED" -eq 1 ] && [ "$FLEET_COUNT" -eq 0 ]; then
   # has no FLEET_FAILS by construction, so this is exactly the empty case.
   # "${A[@]+"${A[@]}"}" expands to nothing when unset/empty and to the elements
   # otherwise, on both bash 3.2 and 5.x.
-  PAYLOAD=$(printf '{"host":"%s", "platform":"%s", "status":"DISABLED", "cause":"parked", "severity":"INFO", "failed_checks":%s, "container_count":%d, "free_gb":%d, "ts":"%s"}' \
+  PAYLOAD=$(printf '{"host":"%s", "platform":"%s", "status":"DISABLED", "cause":"parked", "severity":"INFO", "failed_checks":%s, "container_count":%d, "container_count_known":true, "free_gb":%d, "ts":"%s"}' \
     "$HOST" "$PLATFORM" "$(json_checks ${FLEET_FAILS[@]+"${FLEET_FAILS[@]}"})" "$CONTAINER_COUNT" "$FREE_GB" "$NOW_ISO")
   emit INFO "$PAYLOAD"
   save_state "DISABLED" "$NOW_LAST_FLEET" "$NOW_LAST_DISK" "$DISK_SINCE"
@@ -504,15 +742,19 @@ if [ "$FLEET_COUNT" -gt 0 ]; then
   if [ "$DISK_COUNT" -gt 0 ]; then
     REASONS="${REASONS}; $(IFS='; '; echo "${DISK_FAILS[*]}")"
   fi
-  echo "[$NOW_ISO] FLEET DOWN on $HOST ($CONTAINER_COUNT containers, ${FREE_GB}GB free): $REASONS" >&2
+  echo "[$NOW_ISO] FLEET DOWN on $HOST ($COUNT_TEXT containers, ${FREE_GB}GB free): $REASONS" >&2
   SINCE_LAST=$(( NOW_EPOCH - NOW_LAST_FLEET ))
   if [ "$PREV_STATUS" = "DOWN" ] && [ "$SINCE_LAST" -lt "$COOLDOWN_SEC" ]; then
     echo "[$NOW_ISO] fleet alert throttled (last sent ${SINCE_LAST}s ago, cooldown ${COOLDOWN_SEC}s)" >&2
   else
     ALL_FAILS=("${FLEET_FAILS[@]}")
     if [ "$DISK_COUNT" -gt 0 ]; then ALL_FAILS+=("${DISK_FAILS[@]}"); fi
-    PAYLOAD=$(printf '{"host":"%s", "platform":"%s", "status":"DOWN", "cause":"fleet", "severity":"CRITICAL", "failed_checks":%s, "container_count":%d, "free_gb":%d, "ts":"%s"}' \
-      "$HOST" "$PLATFORM" "$(json_checks "${ALL_FAILS[@]}")" "$CONTAINER_COUNT" "$FREE_GB" "$NOW_ISO")
+    # Keep the probe diagnostic on a page caused by something else (service
+    # down beside an indeterminate probe). The escalated probe already carries
+    # its own failure entry, so this only adds the non-escalated case.
+    if [ "$PROBE_INDETERMINATE" -eq 1 ] && [ "$PROBE_ESCALATED" -eq 0 ]; then ALL_FAILS+=("$PROBE_NOTE"); fi
+    PAYLOAD=$(printf '{"host":"%s", "platform":"%s", "status":"DOWN", "cause":"fleet", "severity":"CRITICAL", "failed_checks":%s, "container_count":%d, "container_count_known":%s, "free_gb":%d, "ts":"%s"}' \
+      "$HOST" "$PLATFORM" "$(json_checks "${ALL_FAILS[@]}")" "$CONTAINER_COUNT" "$CONTAINER_COUNT_KNOWN" "$FREE_GB" "$NOW_ISO")
     emit ERROR "$PAYLOAD"
     NOW_LAST_FLEET=$NOW_EPOCH
   fi
@@ -536,9 +778,13 @@ if [ "$PEER_COUNT" -gt 0 ]; then
     echo "[$NOW_ISO] OPERATIONAL NOTE on $HOST: $OPERATIONAL_NOTE" >&2
     PEER_CHECKS+=("$OPERATIONAL_NOTE")
   fi
+  if [ "$PROBE_INDETERMINATE" -eq 1 ]; then
+    echo "[$NOW_ISO] PROBE INDETERMINATE on $HOST: $PROBE_NOTE" >&2
+    PEER_CHECKS+=("$PROBE_NOTE")
+  fi
   if [ "$PREV_STATUS" != "PEER" ]; then
-    PAYLOAD=$(printf '{"host":"%s", "platform":"%s", "status":"DEGRADED", "cause":"peer", "severity":"WARNING", "failed_checks":%s, "container_count":%d, "free_gb":%d, "ts":"%s"}' \
-      "$HOST" "$PLATFORM" "$(json_checks "${PEER_CHECKS[@]}")" "$CONTAINER_COUNT" "$FREE_GB" "$NOW_ISO")
+    PAYLOAD=$(printf '{"host":"%s", "platform":"%s", "status":"DEGRADED", "cause":"peer", "severity":"WARNING", "failed_checks":%s, "container_count":%d, "container_count_known":%s, "free_gb":%d, "ts":"%s"}' \
+      "$HOST" "$PLATFORM" "$(json_checks "${PEER_CHECKS[@]}")" "$CONTAINER_COUNT" "$CONTAINER_COUNT_KNOWN" "$FREE_GB" "$NOW_ISO")
     emit WARNING "$PAYLOAD"
   fi
   save_state "PEER" "$NOW_LAST_FLEET" "$NOW_LAST_DISK" "$DISK_SINCE"
@@ -562,8 +808,8 @@ if [ "$DISK_COUNT" -gt 0 ]; then
       echo "[$NOW_ISO] disk alert throttled (last sent ${SINCE_LAST}s ago, cooldown ${COOLDOWN_SEC}s)" >&2
     else
       echo "[$NOW_ISO] DISK BELOW FLOOR ${BREACH_MIN}m on $HOST (${CONTAINER_COUNT} containers, ${FREE_GB}GB free): $REASONS" >&2
-      PAYLOAD=$(printf '{"host":"%s", "platform":"%s", "status":"DEGRADED", "cause":"disk", "severity":"CRITICAL", "failed_checks":%s, "container_count":%d, "free_gb":%d, "disk_breach_min":%d, "ts":"%s"}' \
-        "$HOST" "$PLATFORM" "$(json_checks "${DISK_FAILS[@]}")" "$CONTAINER_COUNT" "$FREE_GB" "$BREACH_MIN" "$NOW_ISO")
+      PAYLOAD=$(printf '{"host":"%s", "platform":"%s", "status":"DEGRADED", "cause":"disk", "severity":"CRITICAL", "failed_checks":%s, "container_count":%d, "container_count_known":%s, "free_gb":%d, "disk_breach_min":%d, "ts":"%s"}' \
+        "$HOST" "$PLATFORM" "$(json_checks "${DISK_FAILS[@]}")" "$CONTAINER_COUNT" "$CONTAINER_COUNT_KNOWN" "$FREE_GB" "$BREACH_MIN" "$NOW_ISO")
       emit ERROR "$PAYLOAD"
       NOW_LAST_DISK=$NOW_EPOCH
     fi
@@ -574,12 +820,37 @@ if [ "$DISK_COUNT" -gt 0 ]; then
     # fleet page is still recorded, without claiming cause=fleet.
     DISK_NOTE_FAILS=("${DISK_FAILS[@]}")
     if [ -n "${OPERATIONAL_NOTE:-}" ]; then DISK_NOTE_FAILS+=("$OPERATIONAL_NOTE"); fi
-    PAYLOAD=$(printf '{"host":"%s", "platform":"%s", "status":"DEGRADED", "cause":"disk", "severity":"WARNING", "failed_checks":%s, "container_count":%d, "free_gb":%d, "disk_breach_min":%d, "ts":"%s"}' \
-      "$HOST" "$PLATFORM" "$(json_checks "${DISK_NOTE_FAILS[@]}")" "$CONTAINER_COUNT" "$FREE_GB" "$BREACH_MIN" "$NOW_ISO")
+    if [ "$PROBE_INDETERMINATE" -eq 1 ]; then DISK_NOTE_FAILS+=("$PROBE_NOTE"); fi
+    PAYLOAD=$(printf '{"host":"%s", "platform":"%s", "status":"DEGRADED", "cause":"disk", "severity":"WARNING", "failed_checks":%s, "container_count":%d, "container_count_known":%s, "free_gb":%d, "disk_breach_min":%d, "ts":"%s"}' \
+      "$HOST" "$PLATFORM" "$(json_checks "${DISK_NOTE_FAILS[@]}")" "$CONTAINER_COUNT" "$CONTAINER_COUNT_KNOWN" "$FREE_GB" "$BREACH_MIN" "$NOW_ISO")
     emit WARNING "$PAYLOAD"
     save_state "DEGRADED" "$NOW_LAST_FLEET" "$NOW_LAST_DISK" "$DISK_SINCE"
   fi
   exit "$EXIT_CODE"
+fi
+
+# ── Daemon alive but the CLI probe timed out: WARNING cause=probe, no page. ──
+# This is the state the 2026-11-19 incident should have produced: dockerd was
+# alive and 20 containers were serving while `docker info` timed out under
+# memory pressure. It is NOT a fleet outage, so it must not match the
+# severity>=ERROR AND jsonPayload.cause="fleet" policy. A genuinely wedged
+# daemon is still caught: PROBE_ESCALATED already pushed a cause=fleet entry
+# above and the fleet branch returned before this one.
+if [ "$PROBE_INDETERMINATE" -eq 1 ]; then
+  echo "[$NOW_ISO] PROBE INDETERMINATE ${PROBE_MIN}m on $HOST (dockerd active, container count unknown, ${FREE_GB}GB free): $PROBE_NOTE — WARNING cause=probe, not a fleet outage" >&2
+  PROBE_CHECKS=("$PROBE_NOTE")
+  if [ -n "${OPERATIONAL_NOTE:-}" ]; then PROBE_CHECKS+=("$OPERATIONAL_NOTE"); fi
+  # NO recovery is emitted here: this poll could not observe the fleet, so an
+  # all-clear would be unearned. Any outstanding cause stays in PENDING_NEXT
+  # (the default for this branch) and is recovered by the first known-healthy
+  # poll.
+  if [ "$PREV_STATUS" != "PROBE" ]; then
+    PAYLOAD=$(printf '{"host":"%s", "platform":"%s", "status":"DEGRADED", "cause":"probe", "severity":"WARNING", "failed_checks":%s, "container_count":%d, "container_count_known":false, "probe_indeterminate_min":%d, "probe_page_after_min":%d, "free_gb":%d, "ts":"%s"}' \
+      "$HOST" "$PLATFORM" "$(json_checks "${PROBE_CHECKS[@]}")" "$CONTAINER_COUNT" "$PROBE_MIN" "$PROBE_PAGE_AFTER_MIN" "$FREE_GB" "$NOW_ISO")
+    emit WARNING "$PAYLOAD"
+  fi
+  save_state "PROBE" "$NOW_LAST_FLEET" "$NOW_LAST_DISK" "$DISK_SINCE"
+  exit 0
 fi
 
 # ── Healthy ─────────────────────────────────────────────────────────────────
@@ -594,20 +865,12 @@ if [ -n "${OPERATIONAL_NOTE:-}" ]; then
   # DOWN -> NOTE -> OK emitted no RECOVERED for either transition, so an outage
   # that cleared while a note was showing was never reported as recovered.
   # Emit the outstanding recovery first, then record the note state.
-  case "$PREV_STATUS" in
-    DOWN|FAIL|DISK|DEGRADED|PEER)
-      echo "[$NOW_ISO] Host $HOST recovered (while noting an operational transient); emitting recovery log to GCP..."
-      RECOVERY_CAUSES=()
-      case "$PREV_STATUS" in DOWN|FAIL) RECOVERY_CAUSES+=("fleet") ;; esac
-      case "$PREV_STATUS" in DISK|DEGRADED|FAIL) RECOVERY_CAUSES+=("disk") ;; esac
-      case "$PREV_STATUS" in PEER) RECOVERY_CAUSES+=("peer") ;; esac
-      for cause in ${RECOVERY_CAUSES[@]+"${RECOVERY_CAUSES[@]}"}; do
-        REC_PAYLOAD=$(printf '{"host":"%s", "platform":"%s", "status":"RECOVERED", "cause":"%s", "container_count":%d, "free_gb":%d, "ts":"%s"}' \
-          "$HOST" "$PLATFORM" "$cause" "$CONTAINER_COUNT" "$FREE_GB" "$NOW_ISO")
-        emit INFO "$REC_PAYLOAD"
-      done
-      ;;
-  esac
+  if [ -n "$PENDING_CARRY" ]; then
+    echo "[$NOW_ISO] Host $HOST recovered (while noting an operational transient); emitting recovery log to GCP..."
+    emit_pending_recoveries
+  fi
+  # The fleet was observed healthy on this poll, so nothing stays outstanding.
+  PENDING_NEXT=""
   if [ "$PREV_STATUS" != "NOTE" ]; then
     PAYLOAD=$(printf '{"host":"%s", "platform":"%s", "status":"DEGRADED", "cause":"operational", "severity":"WARNING", "failed_checks":%s, "container_count":%d, "free_gb":%d, "ts":"%s"}' \
       "$HOST" "$PLATFORM" "$(json_checks "$OPERATIONAL_NOTE")" "$CONTAINER_COUNT" "$FREE_GB" "$NOW_ISO")
@@ -617,24 +880,14 @@ if [ -n "${OPERATIONAL_NOTE:-}" ]; then
   exit 0
 fi
 
-if [ "$PREV_STATUS" = "DOWN" ] || [ "$PREV_STATUS" = "FAIL" ] || [ "$PREV_STATUS" = "DISK" ] || [ "$PREV_STATUS" = "DEGRADED" ] || [ "$PREV_STATUS" = "PEER" ]; then
+if [ -n "$PENDING_CARRY" ]; then
   echo "[$NOW_ISO] Host $HOST and peer have recovered! Emitting recovery log to GCP..."
-  RECOVERED_CAUSES=()
-  case "$PREV_STATUS" in
-    DOWN|FAIL) RECOVERED_CAUSES+=("fleet") ;;
-  esac
-  case "$PREV_STATUS" in
-    DISK|DEGRADED|FAIL) RECOVERED_CAUSES+=("disk") ;;
-  esac
-  case "$PREV_STATUS" in
-    PEER) RECOVERED_CAUSES+=("peer") ;;
-  esac
-  for cause in "${RECOVERED_CAUSES[@]}"; do
-    PAYLOAD=$(printf '{"host":"%s", "platform":"%s", "status":"RECOVERED", "cause":"%s", "container_count":%d, "free_gb":%d, "ts":"%s"}' \
-      "$HOST" "$PLATFORM" "$cause" "$CONTAINER_COUNT" "$FREE_GB" "$NOW_ISO")
-    emit INFO "$PAYLOAD"
-  done
+  # Emits every cause this host still owes (previous status plus anything carried
+  # through an unobserved poll), each exactly once.
+  emit_pending_recoveries
 fi
 
+# A known-healthy observation settles every outstanding obligation.
+PENDING_NEXT=""
 save_state "OK" 0 0 0
 exit 0
