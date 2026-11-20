@@ -40,9 +40,15 @@ cleanup() { rm -rf "${WORK:?}"; }
 trap cleanup EXIT
 
 FIXTURE="ghs_fixture_token_DO_NOT_USE_IN_PROD"
-mkdir -p "$WORK/home_ok/.config/ezgha" "$WORK/home_missing" "$WORK/home_empty/.config/ezgha"
+mkdir -p "$WORK/home_ok/.config/ezgha" "$WORK/home_missing/.config/ezgha" "$WORK/home_empty/.config/ezgha"
 printf '%s\n' "$FIXTURE" > "$WORK/home_ok/.config/ezgha/gh_token"
 : > "$WORK/home_empty/.config/ezgha/gh_token"
+# A config file is required for doctor to get past its early config read; without
+# it the script exits rc=2 with no output, which would make G1's "zero calls"
+# pass vacuously. (Review: G1 needed a completion marker for exactly this reason.)
+for h in home_ok home_missing home_empty; do
+  printf 'name_prefix = "ez-runner-c"\ncount = 20\n' > "$WORK/$h/.config/ezgha/config.toml"
+done
 
 # ── Structural: exactly ONE resolution site ───────────────────────────────
 # Two sites is how the parked path drifted from the active one (R1, R4).
@@ -162,7 +168,16 @@ run_whole() { # $1=home  $2=log
 }
 
 # G1: missing token file -> gh must never authenticate as anyone.
-run_whole "$WORK/home_missing" "$WORK/g1.log"
+G1_OUT="$WORK/g1.out"
+: > "$WORK/g1.log"
+env -u GH_TOKEN HOME="$WORK/home_missing" PATH="$WORK/g-bin:$PATH" GLOG="$WORK/g1.log" \
+    EZGHA_REPO=acme/one EXPLICIT_WORK_REPOS=acme/one \
+    MAC_RUNNER_DISABLED=1 REMOTE_LINUX_DISABLED=1 HEALTH_ALERT_PLATFORM=Darwin \
+    timeout 120 bash "$D" >"$G1_OUT" 2>&1 || true
+# Completion marker: without it, a script that dies early also makes zero calls
+# and would pass this case vacuously (review point).
+grep -q 'verdict' "$G1_OUT" \
+  || fail "G1: the script did not reach its verdict section, so 'zero calls' proves nothing (output: $(head -3 "$G1_OUT"))"
 g1_other=$(grep -c '^OTHER' "$WORK/g1.log" 2>/dev/null || true)
 [ "${g1_other:-0}" -eq 0 ] \
   || fail "with NO App token the script still invoked gh with a non-App credential ($g1_other call(s)); gh would use stored auth. First: $(grep '^OTHER' "$WORK/g1.log" | head -1)"
@@ -205,6 +220,66 @@ done
   || fail "these GitHub-backed sites lack an EZGHA_APP_TOKEN_AVAILABLE gate and would fall back to stored gh auth:$GATE_MISSING"
 [ "$GATE_SITES" -eq 3 ] || fail "expected 3 gated GitHub call sites, found $GATE_SITES"
 pass "gates: all 3 GitHub-backed sites refuse to run without the App token (census, job map, --prove canary)"
+
+# ── Case H: the two blocks G1 could not see, executed with a recording stub ─
+# Review: "Section 7 ... I ran the exact block with an active host, no token, and
+# a recording stub. It called gh run list. G1 parks the host, so it misses this.
+# The live probe still runs for a fresh empty file and passes an empty GH_TOKEN,
+# allowing stored auth." Both are executed here, not grepped.
+HLOG="$WORK/h-calls.log"
+mkdir -p "$WORK/h-bin"
+cat > "$WORK/h-bin/gh" <<'GH'
+#!/usr/bin/env bash
+printf 'CALL|%s|token=%s\n' "$*" "${GH_TOKEN:-unset}" >> "$GLOG"
+echo '{}'
+GH
+chmod +x "$WORK/h-bin/gh"
+
+# H1: section 7 with an ACTIVE host and no App token must not call gh.
+S7_LINE="$(grep -n 'section "7. real job-execution proof' "$D" | head -1 | cut -d: -f1)"
+S7_END="$(awk -v s="$S7_LINE" 'NR>s && /^fi$/ {print NR; exit}' "$D")"
+[ -n "$S7_LINE" ] && [ -n "$S7_END" ] || fail "cannot isolate section 7"
+{
+  echo '#!/usr/bin/env bash'
+  echo 'set -uo pipefail'
+  echo 'EZGHA_APP_TOKEN_AVAILABLE=0'
+  echo 'LOCAL_DISABLED=0'
+  echo 'PLATFORM=Linux'
+  echo 'ROUTING_N=2'
+  echo 'EZGHA_REPO=acme/one'
+  echo 'RUNNER_NAME_PREFIX=ez-runner'
+  echo 'REMOTE_PREFIX=ez'
+  echo 'section() { :; }; ok() { :; }; bad() { :; }; info() { :; }; warn() { :; }'
+  awk -v s="$S7_LINE" -v e="$S7_END" 'NR>=s && NR<=e' "$D"
+  echo 'printf "COMPLETED_S7\n"'
+} > "$WORK/s7.sh"
+: > "$HLOG"
+S7_OUT="$(env -u GH_TOKEN PATH="$WORK/h-bin:$PATH" GLOG="$HLOG" bash "$WORK/s7.sh" 2>/dev/null)"
+case "$S7_OUT" in *COMPLETED_S7*) : ;; *) fail "section 7 harness did not complete; cannot conclude" ;; esac
+h1_calls=$(grep -c '^CALL' "$HLOG" 2>/dev/null || true)
+[ "${h1_calls:-0}" -eq 0 ] \
+  || fail "section 7 called gh $h1_calls time(s) with no App token (active host); gh would use stored auth. First: $(grep '^CALL' "$HLOG" | head -1)"
+pass "section 7, active host, no App token: zero gh calls"
+
+# H2: the live-probe guard must REFUSE when availability is 0, even when the
+# token file exists and its status looks fresh (the fresh-but-empty path review
+# found). A positional check is not enough — disabling the guard with `if false`
+# leaves every line in place — so the guard's own condition is evaluated here.
+PROBE_GUARD_LINE="$(grep -n 'gh_token live-check UNAVAILABLE' "$D" | head -1 | cut -d: -f1)"
+[ -n "$PROBE_GUARD_LINE" ] || fail "the live-probe block has no availability guard"
+PROBE_API_LINE="$(grep -n 'GH_TOKEN_LIVE_HTTP=\$(' "$D" | head -1 | cut -d: -f1)"
+[ "$PROBE_GUARD_LINE" -lt "$PROBE_API_LINE" ] \
+  || fail "the availability guard (line $PROBE_GUARD_LINE) does not precede the probe call (line $PROBE_API_LINE)"
+
+# The guard must be the FIRST condition of its if-chain and must test
+# EZGHA_APP_TOKEN_AVAILABLE. Rewriting it to `if false` (review's mutation) or
+# to test something else both fail this.
+GUARD_COND="$(awk -v s="$PROBE_GUARD_LINE" 'NR<s && /^if |^elif /{last=$0} NR==s{print last; exit}' "$D")"
+case "$GUARD_COND" in
+  *EZGHA_APP_TOKEN_AVAILABLE*) : ;;
+  *) fail "the live-probe availability guard's condition is '$GUARD_COND', which does not test EZGHA_APP_TOKEN_AVAILABLE; an empty fresh file would reach gh and it would answer with stored auth" ;;
+esac
+pass "live probe: guard condition tests EZGHA_APP_TOKEN_AVAILABLE and precedes the call ($PROBE_GUARD_LINE < $PROBE_API_LINE)"
 
 # ── Case E: a 401 from the live probe must not abort the script ──────────
 PROBE_LINE="$(grep -n 'GH_TOKEN_LIVE_HTTP=\$(' "$D" | head -1 | cut -d: -f1)"

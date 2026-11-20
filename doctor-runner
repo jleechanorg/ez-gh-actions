@@ -541,7 +541,15 @@ fi
 # ezgha's own app token, so none of them actually exercise gh_token's
 # validity; explicitly override GH_TOKEN for this one call so it tests what
 # section 4b claims to test.
-if [ -f "$GH_TOKEN_PATH" ] && { [ "$GH_TOKEN_STATUS" = "fresh" ] || [ "$GH_TOKEN_STATUS" = "warn" ]; }; then
+if [ "$EZGHA_APP_TOKEN_AVAILABLE" -eq 0 ]; then
+  # The probe would pass GH_TOKEN="" here, and `gh` then falls back to
+  # GITHUB_TOKEN or the stored hosts.yml login -- so the "live check" would
+  # validate the OPERATOR's credential while reporting on the App token's
+  # freshness (review finding: a fresh-but-empty file reached this block).
+  bad "gh_token live-check UNAVAILABLE: token file missing, empty, or unreadable — refusing to probe with a fallback identity"
+  GH_TOKEN_STATUS="live_check_unavailable"
+  GH_TOKEN_STALE_CRITICAL=1
+elif [ -f "$GH_TOKEN_PATH" ] && { [ "$GH_TOKEN_STATUS" = "fresh" ] || [ "$GH_TOKEN_STATUS" = "warn" ]; }; then
   # awk NR==1 (no exit) consumes gh's full output — `| head -1` here made gh
   # take SIGPIPE under pipefail and killed the whole script with exit 141.
   # `|| GH_TOKEN_LIVE_HTTP=""` is load-bearing: under `set -euo pipefail` a gh
@@ -748,6 +756,12 @@ if [ "$LOCAL_DISABLED" -eq 1 ]; then
   # attributed to it. Requiring execution proof from a deliberately empty fleet
   # is the same defect as requiring it from a DOWN slot: state the truth instead.
   ok "real job-execution proof NOT REQUIRED — $PLATFORM leg intentionally DISABLED (operator opt-out), so it has no runners to execute on; unset the opt-out to require proof"
+elif [ "$EZGHA_APP_TOKEN_AVAILABLE" -eq 0 ]; then
+  # No App token: refuse to query. `gh` would fall back to GITHUB_TOKEN or the
+  # stored ~/.config/gh/hosts.yml login and attribute runs to the operator's
+  # identity instead of the App's (review finding: this block called
+  # `gh run list` ungated, and G1 -- which parks the host -- could not see it).
+  bad "real job-execution proof UNAVAILABLE (no App token) — not querying as the operator"
 else
 while read -r rid; do
   [ -z "$rid" ] && continue
