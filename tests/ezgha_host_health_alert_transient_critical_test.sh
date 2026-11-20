@@ -100,7 +100,7 @@ pass "unrecognized CRITICAL key remains visible without a fleet page"
 run mem0 100 0 HEALTH_ALERT_ALERTS_FILE="$W/alerts-mem.jsonl"
 [ "$(errors mem0)" = 1 ] \
   || { cat "$(log_of mem0)" >&2; fail "0 containers must page regardless of the transient key"; }
-grep -q '0 ezgha runner containers running' "$(log_of mem0)" \
+grep -q '0 ezgha runner processes ready' "$(log_of mem0)" \
   || fail "the 0-container probe must be the reason cited"
 pass "0-container truth still pages even with a transient CRITICAL present"
 
