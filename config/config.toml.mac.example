@@ -71,6 +71,12 @@ memory_mb = 3072
 cpus = 1.0
 pids = 512
 min_free_disk_gb = 30
+# Opt-in (bead jleechan-5khv): see config.toml.linux.example for the full
+# explanation. Docker's built-in seccomp profile denies clone(CLONE_NEWUSER),
+# which makes `unshare -Urn` fail `Operation not permitted` in the runner
+# container. Both settings default OFF (hardened profile preserved).
+# seccomp_profile = "/etc/ezgha/seccomp-userns.json"
+# allow_userns = false
 
 [policy]
 # Colima = docker-in-VM, but backend isolation is still "container".
