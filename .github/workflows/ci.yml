@@ -100,6 +100,7 @@ jobs:
           bash tests/doctor_runner_remote_optout_test.sh
           bash tests/doctor_runner_service_docker_endpoint_test.sh
           bash tests/doctor_runner_remote_user_bus_test.sh
+          bash tests/doctor_runner_respawn_user_bus_test.sh
           bash tests/doctor_runner_unreachable_remote_test.sh
           bash tests/doctor_runner_verdict_line_test.sh
           bash tests/doctor_sh_deprecation_stub_test.sh
