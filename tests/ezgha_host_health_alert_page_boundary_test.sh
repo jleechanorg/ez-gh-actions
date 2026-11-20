@@ -15,12 +15,22 @@ STUB
 cat > "$W/docker" <<'STUB'
 #!/usr/bin/env bash
 if [ "$1" = info ]; then exit 0; fi
+if [ "$1" = top ]; then
+  printf 'PID COMMAND\n'
+  case "$DOCKER_FIXTURE" in
+    zombie) printf '1 sleep\n2 NotRunner.Workerish\n' ;;
+    top-failed) printf '1 Runner.Worker\n'; exit 1 ;;
+    *) case "$2" in *1) printf '1 Runner.Listener\n' ;; *) printf '1 Runner.Worker\n' ;; esac ;;
+  esac
+  exit 0
+fi
 case "$DOCKER_FIXTURE" in
   timeout) exit 124 ;;
   partial) printf '%064d\n' 1; exit 1 ;;
   malformed) echo 'incomplete docker output' ;;
   blank) echo ;;
   duplicate) printf '%064d\n' 1 1 ;;
+  zombie|top-failed) printf '%064d\n' 1 ;;
   running) printf '%064d\n' 1 2 ;;
   zero) exit 0 ;;
 esac
@@ -59,14 +69,15 @@ crit() { # case event_key age_seconds
   printf '{"severity":"CRITICAL","event_key":"%s","ts_unix":%s}\n' "$2" "$(( NOW - $3 ))" >> "$W/$1.jsonl"
 }
 run() { # case [env overrides]
-  local name="$1"; shift
+  local name="$1" flags=(); shift
+  if [ "${MONITOR_ARGS:-}" = --dry-run ]; then flags+=(--dry-run); fi
   : > "$W/log-$name"
   env GCLOUD_BIN="$W/gcloud" STUB_LOG="$W/log-$name" DOCKER_BIN="$W/docker" \
     HEALTH_ALERT_HOST=test-page-boundary HEALTH_ALERT_PLATFORM=Linux \
     HEALTH_ALERT_STATE_DIR="$W/state-$name" HEALTH_ALERT_SERVICE_OK=1 HEALTH_ALERT_PEER_OK=1 \
     HEALTH_ALERT_FREE_GB=100 HEALTH_ALERT_CONTAINER_COUNT=20 \
     HEALTH_ALERT_ALERTS_FILE="$W/$name.jsonl" MAC_RUNNER_DISABLED=0 REMOTE_LINUX_DISABLED=0 \
-    "$@" /bin/bash "$S" > "$W/out-$name" 2>&1
+    "$@" /bin/bash "$S" ${flags[@]+"${flags[@]}"} > "$W/out-$name" 2>&1
 }
 expect() { # case jq assertion description
   if jq -es "$2" "$W/log-$1" >/dev/null; then
@@ -75,6 +86,72 @@ expect() { # case jq assertion description
     echo "FAIL: $3"; FAILED=1
   fi
 }
+
+# Four independent fixtures can be selected for one-fix revert checks.
+p0_capacity() {
+  run proof-p0 HEALTH_ALERT_CONTAINER_COUNT= DOCKER_FIXTURE=zombie
+  expect proof-p0 'length == 1 and (.[0] | .cause == "fleet" and .container_count == 0)' "P0 capacity: a valid Docker ID without a runner process is zero capacity"
+  run proof-peer-p0 PATH="$W:$PATH" HEALTH_ALERT_PLATFORM=Darwin HEALTH_ALERT_PEER_OK= DOCKER_FIXTURE=zombie
+  expect proof-peer-p0 'length == 1 and (.[0] | .cause == "peer" and any(.failed_checks[]; contains("0 runner processes ready")))' "P0 capacity: Docker peer shares process proof"
+  run proof-p0 HEALTH_ALERT_CONTAINER_COUNT= DOCKER_FIXTURE=top-failed
+  expect proof-p0 'length == 1 and (.[0] | .cause == "blind" and .container_count == null and .status != "RECOVERED")' "P0 capacity: failed top with partial runner output is blind, not recovery"
+  run proof-p0 HEALTH_ALERT_CONTAINER_COUNT= DOCKER_FIXTURE=running
+  expect proof-p0 'length == 1 and (.[0] | .cause == "fleet" and .status == "RECOVERED" and .container_count == 2)' "P0 capacity: an idle Listener and a busy Worker both prove ready capacity"
+}
+
+p0_blind() {
+  run cool-p0 PATH="$W:$PATH" HEALTH_ALERT_FREE_GB=
+  run cool-p0 PATH="$W:$PATH" HEALTH_ALERT_FREE_GB=
+  run cool-p0 HEALTH_ALERT_CONTAINER_COUNT= DOCKER_FIXTURE=timeout
+  run cool-p0 HEALTH_ALERT_CONTAINER_COUNT= DOCKER_FIXTURE=timeout
+  expect cool-p0 'length == 1 and (.[0] | .cause == "blind" and .container_count == null and .dispatch == "--severity=ERROR")' "P0 cooldown: persistent Docker failure is not suppressed by the disk channel"
+  run cool-p0 HEALTH_ALERT_CONTAINER_COUNT= DOCKER_FIXTURE=timeout
+  expect cool-p0 'length == 0' "P0 cooldown: same-source repeat remains throttled"
+}
+
+p0_disk() {
+  crit disk-p0 runner_pool.disk_floor 60
+  run disk-p0
+  : > "$W/disk-p0.jsonl"
+  run disk-p0
+  expect disk-p0 'all(.status != "RECOVERED")' "P0 disk: host df and disappeared daemon row cannot recover Docker overlay incident"
+  run disk-p0 HEALTH_ALERT_FREE_GB=1
+  run disk-p0
+  expect disk-p0 'map(select(.status == "RECOVERED") | .cause) == ["disk"]' "P0 disk: genuine host recovery remains independent of open Docker incident"
+  jq -e '.docker_disk_open == 1 and .disk_open == 0 and .status == "DISK_UNVERIFIED"' "$W/state-disk-p0/host-health-alert-test-page-boundary.json" >/dev/null ||
+    { echo "FAIL: P0 disk: persisted Docker and host provenance"; FAILED=1; }
+}
+
+p0_dry() {
+  mkdir -p "$W/state-dry-p0"
+  live="$W/state-dry-p0/host-health-alert-test-page-boundary.json"
+  printf '{"status":"DOWN","fleet_open":1,"last_sent_fleet":123}\n' > "$live"
+  cp "$live" "$W/unchanged"
+  MONITOR_ARGS=--dry-run run dry-p0
+  if cmp -s "$live" "$W/unchanged" && ! grep -q '"status":"RECOVERED"' "$W/out-dry-p0" && [ ! -s "$W/log-dry-p0" ]; then
+    echo "PASS: P0 dry-run: no reads from or writes to live state and no dispatch"
+  else
+    echo "FAIL: P0 dry-run: no reads from or writes to live state and no dispatch"; FAILED=1
+  fi
+  export HEALTH_ALERT_DRY_RUN_STATE_DIR="$W/shadow-p0"
+  MONITOR_ARGS=--dry-run run dry-p0 HEALTH_ALERT_CONTAINER_COUNT=0
+  MONITOR_ARGS=--dry-run run dry-p0 HEALTH_ALERT_CONTAINER_COUNT=0
+  if grep -q 'fleet alert throttled' "$W/out-dry-p0" && cmp -s "$live" "$W/unchanged" && [ ! -s "$W/log-dry-p0" ]; then
+    echo "PASS: P0 dry-run: chained shadow polls keep separate cooldown"
+  else
+    echo "FAIL: P0 dry-run: chained shadow polls keep separate cooldown"; FAILED=1
+  fi
+  unset HEALTH_ALERT_DRY_RUN_STATE_DIR
+}
+
+if [ "${P0_ONLY:-}" ]; then
+  "p0_$P0_ONLY"
+  exit "$FAILED"
+fi
+p0_capacity
+p0_blind
+p0_disk
+p0_dry
 
 crit disk-read runner_pool.disk_measurement_unavailable 60
 run disk-read
