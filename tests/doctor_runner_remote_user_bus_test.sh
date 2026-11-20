@@ -35,6 +35,18 @@ D="${DOCTOR_RUNNER_UNDER_TEST:-$ROOT/doctor-runner}"
 [ -x "$D" ] || { echo "FAIL: doctor-runner not executable at $D" >&2; exit 1; }
 bash -n "$D" || { echo 'FAIL: doctor-runner has a syntax error' >&2; exit 1; }
 
+# Preflight: doctor-runner runs the remote probe under `timeout` (GNU coreutils).
+# Stock macOS ships neither `timeout` nor `gtimeout`, so without this check the
+# failure surfaces as 'healthy remote slot reported DOWN', which reads as a
+# production regression rather than a missing dev dependency. Name the real
+# cause instead of letting the assertion mislead (bead jleechan-hz5u).
+command -v timeout >/dev/null 2>&1 || {
+  echo 'FAIL: GNU `timeout` not found on PATH — doctor-runner requires it.' >&2
+  echo '      This is a missing test dependency, NOT a production defect.' >&2
+  echo '      macOS: brew install coreutils   (provides timeout/gtimeout)' >&2
+  echo '      Debian/Ubuntu: apt-get install coreutils' >&2
+  exit 1
+}
 TMP="$(mktemp -d)"
 trap 'rm -rf "${TMP:?}"' EXIT
 mkdir -p "$TMP/bin"
