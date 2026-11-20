@@ -514,6 +514,25 @@ if [ -f "$GH_TOKEN_PATH" ] && { [ "$GH_TOKEN_STATUS" = "fresh" ] || [ "$GH_TOKEN
     GH_TOKEN_STALE_CRITICAL=1
   fi
 fi
+
+# Use ezgha's OWN app token for every subsequent API call in this script.
+#
+# Before this export, each later `gh api` call rode the OPERATOR's ambient
+# `gh auth` token (usually a personal token). That is wrong for two reasons:
+#   1. an invalid or rate-limited personal token made the job map go DEGRADED,
+#      so doctor reported the fleet INCONCLUSIVE ("queue/API evidence
+#      UNPROVEN") even when ezgha's own org token had ~10k of 10.4k calls left
+#      (observed 2026-11-20: personal token 403 rate-limited, org token
+#      10005/10400 healthy, verdict still UNPROVEN because no call used it);
+#   2. each call validated a credential it was not actually supposed to use.
+# Exporting here means every downstream call exercises the token this script
+# claims to be checking, and the org's much larger budget is the one consumed.
+# Only export when the file exists; a missing/broken token must keep failing
+# loudly through the existing GH_TOKEN_STATUS paths rather than silently
+# falling back to a personal token mid-run.
+if [ -f "$GH_TOKEN_PATH" ] && [ -s "$GH_TOKEN_PATH" ]; then
+  export GH_TOKEN="$(cat "$GH_TOKEN_PATH" 2>/dev/null)"
+fi
 # --- C. GitHub-side runner fleet ----------------------------------------
 section "5. GitHub org runner fleet ($ORG)"
 RAW=$($(command -v gh) api "orgs/$ORG/actions/runners" --paginate 2>/dev/null || echo '{"runners":[]}')
