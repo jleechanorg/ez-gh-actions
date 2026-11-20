@@ -285,6 +285,17 @@ count_assignments_section() {
 if [ "$LOCAL_DISABLED" -eq 1 ]; then
   section "1-6. host lifecycle (parked host)"
   ok "$PLATFORM host intentionally DISABLED (operator opt-out) — 0 slot(s) expected, no service/daemon/colima/registrations required, and nothing contributed to the fleet contract; unset the opt-out to require proof"
+  # Use ezgha's OWN app token for every later `gh api` call -- in the parked
+  # path too. The section-4b export lives in the ACTIVE-host branch only, so a
+  # parked host previously skipped it and the job map (sections 8/10) still rode
+  # the operator's ambient `gh auth`. That is the 2026-11-20 defect: an invalid
+  # personal token made the job map report "0 in-progress + 0 queued" and forced
+  # "queue/API evidence UNPROVEN" while the org token was 10005/10400 healthy.
+  # Exported here as well so the parked path cannot silently regress.
+  GH_TOKEN_PATH_PARKED="$HOME/.config/ezgha/gh_token"
+  if [ -f "$GH_TOKEN_PATH_PARKED" ] && [ -s "$GH_TOKEN_PATH_PARKED" ]; then
+    export GH_TOKEN="$(cat "$GH_TOKEN_PATH_PARKED" 2>/dev/null)"
+  fi
   # AGENTS.md requires every suspension to carry a start date and a restore
   # condition so the opt-out cannot quietly become a permanent capacity
   # reduction. Nothing surfaced a MISSING record before this: the Mac leg sat
