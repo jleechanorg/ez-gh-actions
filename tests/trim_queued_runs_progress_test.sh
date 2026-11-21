@@ -1,0 +1,184 @@
+#!/usr/bin/env bash
+# tests/trim_queued_runs_progress_test.sh — progress must be visible DURING a pass
+#
+# Guards the heredoc-writer deadlock (bead jleechan-queue-trimmer-heredoc-deadlock):
+# a wedged pass produced ZERO output for 30+ minutes, indistinguishable from slow
+# work. Two assertions:
+#   A) structural — no heredoc writer may remain in either script (comments stripped,
+#      because trim:107 legitimately describes the old shape in a comment).
+#   B) behavioural — `scan:` is observed WHILE the worker is still running, so output
+#      flushed only at exit cannot pass.
+#
+# Usage: bash tests/trim_queued_runs_progress_test.sh
+set -euo pipefail
+# REQUIRED: BASH_ENV points at ~/.bashrc on this host; the child bash would source
+# it and prepend ~/.local/bin ahead of the stub dir, running the REAL gh.
+unset BASH_ENV || true
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$REPO_ROOT"
+
+SCRATCH_HELPER="$HOME/.claude/skills/scratch-space/scripts/scratch-dir.sh"
+if [ -x "$SCRATCH_HELPER" ]; then
+  SCRATCH="$("$SCRATCH_HELPER" ezgha-tests)" || exit 1
+else
+  SCRATCH="${TMPDIR:-/tmp}"
+fi
+[ -n "$SCRATCH" ] && [ "$SCRATCH" != / ] || {
+  echo "FAIL: unsafe or empty scratch directory" >&2
+  exit 1
+}
+WORK="$(mktemp -d "$SCRATCH/trim-queued-progress.XXXXXX")" || exit 1
+[ -n "$WORK" ] && [ -d "$WORK" ] && [ "$WORK" != / ] || {
+  echo "FAIL: unable to create safe progress fixture directory" >&2
+  exit 1
+}
+export WORK
+RUNPID=""; RUNPID_ID=""
+progress_sleep_pid=""; progress_sleep_identity=""
+stop_fixture_pids() {
+  local pid identity
+  if [ -n "$progress_sleep_pid" ] && [ -n "$progress_sleep_identity" ]; then
+    signal_owned_pid KILL "$progress_sleep_pid" "$progress_sleep_identity" || true
+  fi
+}
+cleanup() {
+  if [ -n "$RUNPID" ] && [ -n "$RUNPID_ID" ]; then
+    teardown_tree "$RUNPID" "$RUNPID_ID" || true
+    wait "$RUNPID" 2>/dev/null || true
+    RUNPID=""; RUNPID_ID=""
+  fi
+  stop_fixture_pids
+  rm -rf "${WORK:?}"
+}
+trap cleanup EXIT
+LOG="$WORK/progress.log"
+STUB_BIN="$WORK/bin"; mkdir -p "$STUB_BIN"
+FAILS=0
+pass() { printf 'PASS: %s\n' "$1"; }
+fail() { printf 'FAIL: %s\n' "$1" >&2; FAILS=$((FAILS+1)); }
+# shellcheck source=tests/lib/descendants.sh
+. "$REPO_ROOT/tests/lib/descendants.sh"
+
+# ---- A) structural: no heredoc writer remains ------------------------------
+for f in scripts/trim-queued-runs.sh scripts/cleanup-stuck-runs.sh; do
+  if sed 's/#.*$//' "$f" | grep -qE "<<'?PY'?"; then
+    fail "structural: live heredoc writer still present in $f"
+  else
+    pass "structural: no heredoc writer in $f"
+  fi
+done
+
+# ---- B) behavioural: progress visible while running ------------------------
+cat > "$STUB_BIN/gh" <<'SH'
+#!/usr/bin/env bash
+set -uo pipefail
+case "$*" in
+  *"/actions/runs?status=queued"*)
+    printf '%s\n' '{"workflow_runs":[{"id":9001,"status":"queued","name":"P","workflow_id":7,"head_branch":"feature/x","head_sha":"aaa","created_at":"2026-01-01T00:00:00Z","path":".github/workflows/p.yml"}]}'
+    exit 0 ;;
+  *"pr list"*) printf '[]\n'; exit 0 ;;
+  *"--jq .status"*) printf 'queued\n'; exit 0 ;;
+  *) printf '{}'; exit 0 ;;
+esac
+SH
+chmod +x "$STUB_BIN/gh"
+
+# git blocks ~20s in ls-remote so the pass stays running while we poll.
+cat > "$STUB_BIN/git" <<'SH'
+#!/usr/bin/env bash
+case "$*" in
+  *ls-remote*)
+    sleep 20 &
+    sleep_pid=$!
+    printf '%s\n' "$sleep_pid" > "$WORK/progress-sleep-pid"
+    wait "$sleep_pid"
+    printf 'bbb\trefs/heads/feature/x\n'
+    exit 0 ;;
+esac
+exit 0
+SH
+chmod +x "$STUB_BIN/git"
+
+RUN=( env -u BASH_ENV PATH="$STUB_BIN:$PATH" QUEUE_REPOS="acme/one"
+      bash "$REPO_ROOT/scripts/trim-queued-runs.sh" --dry-run )
+# Launch WITHOUT relying on process-group semantics.
+#
+# macOS has no `setsid`, and a backgrounded subshell INHERITS the parent's
+# PGID (verified: child pgid == parent pgid), so `kill -- -$pid` would signal
+# this test's own shell rather than the pipeline. Instead: start the pipeline,
+# then walk the descendant tree explicitly and terminate it leaf-first. That is
+# portable and does not depend on group isolation at all (review P0).
+"${RUN[@]}" </dev/null >"$LOG" 2>&1 &
+RUNPID=$!
+RUNPID_ID="$(process_identity "$RUNPID")" || fail "cleanup: worker identity could not be captured"
+
+seen=0; alive=0
+for _ in $(seq 1 20); do
+  if grep -q "\[acme/one\] scan:" "$LOG" 2>/dev/null; then
+    seen=1
+    pid_is_running "$RUNPID" && alive=1
+    break
+  fi
+  sleep 1
+done
+
+# Snapshot exact fixture descendants after the stub has started its blocking
+# sleep. The later checks include this named process and never scan host PIDs.
+for _ in $(seq 1 50); do
+  [ -s "$WORK/progress-sleep-pid" ] && break
+  sleep 0.1
+done
+[ -s "$WORK/progress-sleep-pid" ] \
+  || fail "fixture: blocking sleep 20 did not start after scan output"
+descendants_checked "$RUNPID"
+progress_sleep_pid="$(cat "$WORK/progress-sleep-pid" 2>/dev/null || true)"
+progress_sleep_identity="$(process_identity "$progress_sleep_pid")" \
+  || fail "fixture: blocking sleep 20 identity could not be captured"
+printf '%s|%s\n' "$progress_sleep_pid" "$progress_sleep_identity" > "$WORK/descendant-identities"
+for k in $DESCENDANTS_OUT; do
+  [ "$k" = "$progress_sleep_pid" ] && continue
+  child_identity="$(process_identity "$k")" || continue
+  printf '%s|%s\n' "$k" "$child_identity" >> "$WORK/descendant-identities"
+done
+if printf '%s\n' "$DESCENDANTS_OUT" | grep -Fxq "$progress_sleep_pid"; then
+  pass "fixture: blocking sleep 20 is in the captured worker tree"
+else
+  fail "fixture: blocking sleep 20 pid=$progress_sleep_pid was not captured under worker pid=$RUNPID (descendants=$DESCENDANTS_OUT)"
+fi
+
+# We terminate the worker deliberately, so `wait` returns non-zero; an unguarded
+# `wait` under `set -e` would abort BEFORE the assertions below.
+teardown_rc=0
+teardown_tree "$RUNPID" "$RUNPID_ID" || teardown_rc=$?
+wait "$RUNPID" 2>/dev/null || true
+RUNPID=""; RUNPID_ID=""
+
+# Discovery MUST have worked, otherwise the survivor check below is vacuous.
+[ "$teardown_rc" -eq 0 ] \
+  && pass "cleanup: process discovery available (survivor check is meaningful)" \
+      || fail "cleanup: teardown failed (rc=$teardown_rc); survivor check would be inconclusive"
+
+# Final accounting AFTER the leader is gone: nothing can respawn now.
+survivors=0
+while IFS='|' read -r k identity; do
+  [ -n "$k" ] && [ -n "$identity" ] && owned_pid_is_running "$k" "$identity" \
+    && survivors=$((survivors+1))
+done < "$WORK/descendant-identities"
+[ "$survivors" -eq 0 ] && pass "cleanup: no descendants survived the pass" \
+                       || fail "cleanup: $survivors descendant(s) still alive after teardown"
+owned_pid_is_running "$progress_sleep_pid" "$progress_sleep_identity" \
+  && fail "cleanup: fixture sleep 20 survived teardown (pid=$progress_sleep_pid)" \
+  || pass "cleanup: fixture sleep 20 stopped"
+
+[ "$seen" = 1 ]  && pass "behavioural: scan: emitted during the pass" \
+                 || fail "behavioural: no progress output during the pass"
+[ "$alive" = 1 ] && pass "behavioural: worker was still alive when scan: appeared" \
+                 || fail "behavioural: scan: only appeared after exit (exit-flush accepted)"
+
+echo
+if [ "$FAILS" -ne 0 ]; then
+  echo "FAILED: $FAILS assertion(s)" >&2
+  exit 1
+fi
+echo "ALL TESTS PASSED!"

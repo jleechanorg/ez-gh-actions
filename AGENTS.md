@@ -101,6 +101,15 @@ Merge commits and `git commit --no-verify` bypass the gate.
    - Daemon has built-in failsafe since commit `c6defc7` that runs `docker rm -f` before each `docker run`
 4. If slot file is wedged: `rm ~/.config/ezgha/slot_assignments.toml` then `systemctl --user restart ezgha.service`
 
+### Queued ghost workflow runs
+This is a manual operator-recovery recipe; the scheduled queue trimmer and reaper remain the automatic callers. Within each apply pass, classify a ghost only after a fresh cancellation attempt returns HTTP 409 with the expected “has not been queued yet” refusal and a fresh `/jobs` query confirms zero jobs. Other 409s, a run with jobs, or unreadable job state are cleaner failures. After that run is confirmed as a ghost, do not try other mutation endpoints for it during that pass.
+
+The cleaner does not persist a ghost skip across passes. A later scheduled pass reevaluates a still-queued run through the same cancellation-and-job-probe path. For a confirmed zero-job ghost, the available manual choices are a GitHub Support request or retaining the cohort as explicitly acknowledged. Do not recommend deleting its source branch: the linked Bead jleechan-b4pg records that this did not remove the runs.
+
+Track the acknowledged cohort, start date, and restore condition in its owning Bead. Set `EZGHA_SUSPENSION_RECORD` only when that record exists; unset keeps the cleaner fail-closed. Escalation occurs when the oldest ghost reaches 14 days or the distinct per-repository count reaches 200.
+
+Restore after every recorded ghost run ID is no longer queued; a repository-wide queue total of zero is not required. Close the Bead, remove the suspension record from both launchd templates, and reinstall both agents so the installed plists reflect the restored state.
+
 ### Service down
 ```bash
 systemctl --user restart ezgha.service
