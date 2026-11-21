@@ -22,6 +22,13 @@ labels = ["self-hosted", "self-hosted-mikey", "ezgha", "Linux", "X64", "cmux-clo
 # (docs/cloud-vm-hosts.md). Raise it only after reading that formula.
 count = 4
 image = "ezgha-runner:latest"
+# Issue 229: explicit container DNS. The VM images ship a single forwarder with
+# `timeout:1 attempts:2` and no fallback, which surfaces inside runner containers
+# as EAI_AGAIN / multi-minute download stalls under burst. The bootstrap script
+# rewrites these two lines with the host's actual forwarder detected at write
+# time; the values here are the safe defaults for a hand-copied config.
+dns = ["10.32.0.28", "1.1.1.1", "8.8.8.8"]
+dns_opts = ["timeout:2", "attempts:3"]
 # The 4 GiB Lima guest reserve is too big here (the daemon's Docker *is* this VM's
 # Docker), but zero is wrong too: dockerd, the guest OS and the daemon itself still
 # need memory. 512 MiB keeps `count x runner_floor_mb` inside the budget:

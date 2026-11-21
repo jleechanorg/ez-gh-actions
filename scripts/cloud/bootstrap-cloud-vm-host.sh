@@ -47,28 +47,137 @@ step "0. resolver fallback + timeout"
 #   getaddrinfo EAI_AGAIN results-receiver.actions.githubusercontent.com
 # A 1s timeout is also tight for a cold lookup (measured 382ms cold, 11ms warm).
 #
-# Two fallbacks plus a relaxed timeout, applied only when the file still has the known
-# single-forwarder shape. Public resolvers are reachable on TCP/53 from these VMs and are
-# consulted only when the local forwarder fails.
+# Two fallbacks plus a relaxed timeout. This step is an idempotent assert-healthy-then-
+# repair: it verifies the full healthy shape (>=3 nameservers, both public fallbacks,
+# `options timeout:2 attempts:3`, immutable bit) and only rewrites when any part is
+# missing, so a re-run against an already-repaired file is a no-op. The ONE existing
+# forwarder is preserved as the first nameserver — it is the only entry that can answer
+# for VM-local names — and the public resolvers follow purely as fallbacks. They are
+# reachable on TCP/53 from these VMs and are consulted only when the forwarder fails.
 #
 # The pin matters: freestyle-vms-agent rewrites /etc/resolv.conf back within ~10s, so a
-# plain sed silently reverts. `chattr +i` is what makes the value stick. Consequence: the
-# agent can no longer manage this file, so treat the value as deliberately maintained and
-# use `chattr -i` if the host's networking must take the file back.
+# plain rewrite silently reverts. `chattr +i` is what makes the value stick, and a failed
+# `chattr +i` is now a hard bootstrap failure (it used to be `|| true`, which reported
+# success on a fix that had already reverted). Consequence of pinning: the agent can no
+# longer manage this file, so treat the value as deliberately maintained and use
+# `chattr -i` if the host's networking must take the file back.
 RESOLV=/etc/resolv.conf
-if [ "$(grep -c '^nameserver' "$RESOLV" 2>/dev/null || echo 0)" -eq 1 ] \
-   && grep -q '^nameserver 10\.32\.0\.28$' "$RESOLV" 2>/dev/null; then
-  sudo -n cp "$RESOLV" "$RESOLV.bak-ezgha-bootstrap"
-  sudo -n sed -i "/^nameserver 10\.32\.0\.28$/a nameserver 1.1.1.1\nnameserver 8.8.8.8" "$RESOLV"
-  sudo -n sed -i 's/^options timeout:1 attempts:2$/options timeout:2 attempts:3/' "$RESOLV"
-  sudo -n chattr +i "$RESOLV" 2>/dev/null || true
-  echo "resolvers: $(grep -c '^nameserver' "$RESOLV") pinned=$(lsattr "$RESOLV" 2>/dev/null | grep -c '^----i')"
-  getent hosts results-receiver.actions.githubusercontent.com >/dev/null 2>&1 \
-    || echo "WARNING: results-receiver.actions.githubusercontent.com does not resolve"
+RESOLV_BACKUP="$RESOLV.bak-ezgha-bootstrap"
+
+# A resolver config is HEALTHY only when every one of these holds. Anything else
+# is repaired below; "mostly right" is not good enough because the failure mode
+# (a dropped UDP response with no fallback) is invisible until a job hits it.
+resolver_is_healthy() {
+  [ -e "$RESOLV" ] || return 1
+  local ns_count opts_line attrs
+  ns_count="$(grep -c '^nameserver ' "$RESOLV" 2>/dev/null || true)"
+  [ "${ns_count:-0}" -ge 3 ] || return 1
+  grep -qE '^nameserver 1\.1\.1\.1$' "$RESOLV" || return 1
+  grep -qE '^nameserver 8\.8\.8\.8$' "$RESOLV" || return 1
+  opts_line="$(grep -E '^options ' "$RESOLV" 2>/dev/null | tail -n 1 || true)"
+  [ "$opts_line" = "options timeout:2 attempts:3" ] || return 1
+  attrs="$(lsattr "$RESOLV" 2>/dev/null || true)"
+  case "$attrs" in
+    *----i*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Detect the host's own (private) resolver. NEVER invent one: a guessed address
+# would be pinned here AND handed to runner containers as `--dns`, so VM-local
+# lookups would break while the pin holds the wrong value. Search the live file
+# first, then systemd-resolved's upstream file, and fail when neither has one.
+detect_resolv_forwarder() {
+  local f addr
+  for f in "$RESOLV" /run/systemd/resolve/resolv.conf; do
+    [ -r "$f" ] || continue
+    addr="$(awk '/^nameserver[[:space:]]+/ {
+        a = $2
+        if (a != "1.1.1.1" && a != "8.8.8.8" && a != "9.9.9.9" && a !~ /^127\./) { print a; exit }
+      }' "$f" 2>/dev/null || true)"
+    if [ -n "$addr" ]; then
+      printf '%s' "$addr"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Rewrite + pin. Returns non-zero (without deciding the outcome) so the caller can
+# retry a bounded number of times and then stop loudly.
+repair_resolver() {
+  local forwarder search_lines
+  if ! forwarder="$(detect_resolv_forwarder)"; then
+    echo "FATAL: no private resolver found in $RESOLV or /run/systemd/resolve/resolv.conf." >&2
+    echo "       Refusing to invent one and pin it: a guessed address would also reach" >&2
+    echo "       runner containers as --dns and break VM-local lookups." >&2
+    return 1
+  fi
+  echo "repairing /etc/resolv.conf: forwarder=$forwarder fallbacks=1.1.1.1,8.8.8.8"
+  # Release the pin if a previous run set it; failure just means it was not pinned.
+  sudo -n chattr -i "$RESOLV" 2>/dev/null || true
+  # Back up the ORIGINAL exactly once — never overwrite a good backup with an
+  # already-repaired file on a later run.
+  if [ ! -f "$RESOLV_BACKUP" ]; then
+    sudo -n cp "$RESOLV" "$RESOLV_BACKUP"
+  fi
+  # Preserve any search/domain directive: dropping it silently changes how
+  # VM-local short names resolve, which is a different failure mode than the
+  # one this step exists to prevent.
+  search_lines="$(grep -E '^(search|domain)[[:space:]]' "$RESOLV" 2>/dev/null || true)"
+  {
+    printf 'nameserver %s\nnameserver 1.1.1.1\nnameserver 8.8.8.8\n' "$forwarder"
+    if [ -n "$search_lines" ]; then
+      printf '%s\n' "$search_lines"
+    fi
+    printf 'options timeout:2 attempts:3\n'
+  } | sudo -n tee "$RESOLV" >/dev/null
+  # FAIL CLOSED on the pin. Without the immutable bit the VM agent rewrites this
+  # file back within ~10s and every EAI_AGAIN/stall this step exists to prevent
+  # silently returns.
+  if ! sudo -n chattr +i "$RESOLV"; then
+    echo "could not pin $RESOLV immutable; without the bit the VM agent rewrites it" >&2
+    echo "within seconds and the single-forwarder EAI_AGAIN failure mode returns." >&2
+    return 1
+  fi
+  # Verify AFTER pinning: the agent can restore the old content between the write
+  # and the chattr, and the pin would then hold the WRONG file. Never report a
+  # repaired resolver that does not read back healthy.
+  if ! resolver_is_healthy; then
+    echo "resolver content did not read back healthy after pinning; the agent likely" >&2
+    echo "rewrote it mid-repair." >&2
+    return 1
+  fi
+  return 0
+}
+
+if resolver_is_healthy; then
+  echo "resolv.conf already healthy (>=3 nameservers, public fallbacks, timeout:2 attempts:3, immutable)"
 else
-  echo "resolv.conf is not the known single-forwarder shape; leaving it alone"
-  grep -E '^(nameserver|options)' "$RESOLV" 2>/dev/null || true
+  attempt=1
+  repaired=0
+  while [ "$attempt" -le 3 ]; do
+    if repair_resolver; then
+      repaired=1
+      break
+    fi
+    echo "resolver repair attempt $attempt did not verify; retrying in 2s" >&2
+    sleep 2
+    attempt=$((attempt + 1))
+  done
+  if [ "$repaired" -ne 1 ]; then
+    echo "FATAL: could not put $RESOLV into the pinned fallback shape after 3 attempts;" >&2
+    echo "       refusing to report a repaired resolver. Recovery is an operator action;" >&2
+    echo "       see the resolver-pinning section of docs/cloud-vm-hosts.md." >&2
+    exit 1
+  fi
 fi
+
+echo "resolv.conf nameservers:"
+grep -E '^(nameserver|options)' "$RESOLV" 2>/dev/null || true
+echo "resolv.conf immutable: $(lsattr "$RESOLV" 2>/dev/null | grep -c -- '----i' || true)"
+getent hosts results-receiver.actions.githubusercontent.com >/dev/null 2>&1 \
+  || echo "WARNING: results-receiver.actions.githubusercontent.com does not resolve"
 
 step "1. systemd user manager + linger (needed for --user units over SSH/exec)"
 sudo -n loginctl enable-linger "$(id -un)"
@@ -117,19 +226,58 @@ chmod 700 "$HOME/.config/ezgha"
 chmod 600 "$KEY_PATH"
 cp "$REPO_DIR/config/config.toml.cloud-vm.example" "$HOME/.config/ezgha/config.toml"
 python3 - "$HOME/.config/ezgha/config.toml" "$RUNNER_COUNT" "$NAME_PREFIX" <<'PY'
-import sys
+import re, sys
 path, count, prefix = sys.argv[1], sys.argv[2], sys.argv[3]
+
+# Issue 229: pin the container's resolver list to the host's real forwarder plus
+# two public fallbacks. Detected at write time so a host whose forwarder is not
+# 10.32.0.28 still gets the entry that can answer VM-local names first. If the
+# host exposes no private resolver, stop here instead of writing a guessed
+# address: `--dns` would then send every container lookup to the wrong server.
+forwarder = None
+for resolv_path in ("/etc/resolv.conf", "/run/systemd/resolve/resolv.conf"):
+    try:
+        for line in open(resolv_path):
+            m = re.match(r"^nameserver\s+(\S+)", line)
+            if m and m.group(1) not in ("1.1.1.1", "8.8.8.8", "9.9.9.9") \
+                    and not m.group(1).startswith("127."):
+                forwarder = m.group(1)
+                break
+    except OSError:
+        pass
+    if forwarder:
+        break
+if not forwarder:
+    sys.exit("FATAL: no private resolver found; refusing to write a guessed dns "
+             "entry into [runner] (issue 229)")
+
+dns_lines = [
+    f'dns = ["{forwarder}", "1.1.1.1", "8.8.8.8"]\n',
+    'dns_opts = ["timeout:2", "attempts:3"]\n',
+]
+
 out = []
 for line in open(path):
     if line.startswith("count = "):
         out.append(f"count = {count}\n")
     elif line.startswith("name_prefix = "):
         out.append(f'name_prefix = "{prefix}"\n')
+    elif line.startswith("dns =") or line.startswith("dns_opts ="):
+        continue  # re-inserted right after `image =` below
     else:
         out.append(line)
+        if line.startswith("image = "):
+            out.extend(dns_lines)
+
+# If the example ever drops its `image =` line the dns entries must still land in
+# [runner], so append them rather than silently omitting them.
+if not any(l.startswith("dns = ") for l in out):
+    out.extend(dns_lines)
+
 open(path, "w").writelines(out)
+print(f"runner dns forwarder={forwarder}")
 PY
-grep -E '^(count|name_prefix) =|host_containment' "$HOME/.config/ezgha/config.toml"
+grep -E '^(count|name_prefix|dns|dns_opts) =|host_containment' "$HOME/.config/ezgha/config.toml"
 
 step "6b. refuse a count the memory budget cannot hold"
 # `serve` would refuse to start anyway; fail here with the arithmetic instead of a
