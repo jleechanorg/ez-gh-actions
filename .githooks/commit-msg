@@ -15,6 +15,7 @@
 #   codex/<model-id>:     Codex CLI
 #   cursor/<model>:       Cursor / OpenCode
 #   ao/<model>:           Agent Orchestrator worker
+#   instinct:             Instinct-authored commit (no model claim)
 #   human:                Human-authored commit
 #
 # Wired via:  git config core.hooksPath .githooks
@@ -55,6 +56,7 @@ fi
 # that merely starts with "human") would incorrectly pass.
 allowed_re='^(claude|claudem|claudew|gemini|codex|cursor|ao|pi)/[a-zA-Z0-9._-]+:[[:space:]]'
 human_re='^human:[[:space:]]'
+instinct_re='^instinct:[[:space:]]'
 
 # Merge commits are produced by git itself and should be allowed through
 # regardless of exact wording (the individual squash commits inside the merge
@@ -72,7 +74,7 @@ if [[ "$subject" =~ $allowed_re ]]; then
   exit 0
 fi
 
-if [[ "$subject" =~ $human_re ]]; then
+if [[ "$subject" =~ $human_re ]] || [[ "$subject" =~ $instinct_re ]]; then
   exit 0
 fi
 
@@ -96,6 +98,7 @@ tag" rule, every commit subject MUST start with one of:
   codex/<model-id>:     Codex CLI
   cursor/<model>:       Cursor / OpenCode
   ao/<model>:           Agent Orchestrator worker
+  instinct:             Instinct-authored (no model claim)
   human:                Human-authored
 
 Examples:

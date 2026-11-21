@@ -133,6 +133,12 @@ assert_hook "codex_no_model"        "codex: missing model"           1 "REJECTED
 # the trailing 'e' was absorbed by the optional model-id character class.)
 assert_hook "humane_lookalike"      "humane: tweak"                  1 "REJECTED"
 
+# Exact neutral author label, no model claim and no prefix lookalikes.
+assert_hook "reject_instinctive" "instinctive: fix" 1 "REJECTED"
+assert_hook "reject_instinct_model" "instinct/model: fix" 1 "REJECTED"
+assert_hook "reject_instinct_nospace" "instinct:fix" 1 "REJECTED"
+assert_hook "accept_instinct" "instinct: fix: alert classification" 0
+
 # ----- (c) ACCEPT: every canonical prefix -----
 assert_hook "accept_claude_sonnet"  "claude/sonnet: chore: lint fix"      0
 assert_hook "accept_claudem_minimax" "claudem/minimax-M3: chore: hook"    0
@@ -194,7 +200,7 @@ echo "  - 3 reject cases (no prefix, 3 styles)"
 echo "  - 2 reject cases (prefix without ':' delimiter)"
 echo "  - 3 reject cases (prefix missing mandatory model-id segment)"
 echo "  - 1 reject case  (word merely starting with 'human')"
-echo "  - 8 accept cases (all canonical runtime prefixes)"
+echo "  - 9 accept cases (existing runtime prefixes plus exact instinct label)"
 echo "  - 5 accept cases (git-merge subjects bypass the gate)"
 echo "  - 1 edge case  (missing arg -> non-zero, no crash)"
 echo "  - 1 edge case  (comments-only file -> rc=2 empty-subject)"
