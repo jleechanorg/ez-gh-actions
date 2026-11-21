@@ -369,6 +369,19 @@ fi
 # CRITICALs since 2026-11-02 with no observed capacity loss; the 2026-11-07 run
 # had 15-20 Runner.Workers executing during all three false "FLEET DOWN"s).
 TRANSIENT_CRIT_KEYS=" runner_pool.memory_pressure "
+
+# A readiness/refill shortfall is only a fleet outage when nothing is serving.
+# `serve.runner_settling.ceiling` reached the FLEET_FAILS branch on 2026-11-21 at
+# 04:46:28Z and paged "[CRITICAL] ezgha runner fleet down" while the same host
+# reported 20/20 managed containers running, 20 online+busy ez-runner
+# registrations, and 14 worldarchitect.ai jobs in progress (bead jleechan-obei).
+# The policy this feeds promises the fleet "cannot run jobs"; it was running them.
+# Keys here therefore page cause=fleet ONLY when the local container probe found
+# nothing (count 0, which also covers an unreachable docker daemon). With
+# containers present they become an operational note at WARNING — recorded and
+# diagnosable, never a page, never a recovery. An unknown or future key keeps the
+# historical fail-closed page, so this cannot silently downgrade a genuine outage.
+CONTAINER_GATED_CRIT_KEYS=" serve.runner_settling.ceiling "
 OPERATIONAL_NOTE=""
 if [ "$SLACK_ESCALATE" = "1" ] && [ -f "$ALERTS_JSONL" ]; then
   # Classify EVERY qualifying recent CRITICAL, not just the newest one.
@@ -404,6 +417,15 @@ if [ "$SLACK_ESCALATE" = "1" ] && [ -f "$ALERTS_JSONL" ]; then
         # self-clears. Recorded once, never a fleet-down claim (2026-11-07 page).
         if [ -z "$OPERATIONAL_NOTE" ]; then
           OPERATIONAL_NOTE="local: daemon CRITICAL alert ${CRIT_AGE_MIN}m ago (${CRIT_KEY}) — transient admission deferral, ${CONTAINER_COUNT} container(s) present, not a fleet outage"
+        fi
+      elif printf '%s' "$CONTAINER_GATED_CRIT_KEYS" | grep -qF " ${CRIT_KEY} " \
+           && [ "${CONTAINER_COUNT:-0}" -gt 0 ] && [ "$DOCKER_UNREACHABLE" -eq 0 ]; then
+        # Readiness/refill shortfall with capacity still serving (bead
+        # jleechan-obei): the fleet is running jobs, so the "cannot run jobs"
+        # policy must not page. A count of 0 (or an unreachable docker probe,
+        # which forces the count to 0) falls through to the fail-closed page.
+        if [ -z "$OPERATIONAL_NOTE" ]; then
+          OPERATIONAL_NOTE="local: daemon CRITICAL alert ${CRIT_AGE_MIN}m ago (${CRIT_KEY}) — refill/readiness shortfall while ${CONTAINER_COUNT} container(s) are serving, not a fleet outage"
         fi
       else
         FLEET_FAILS+=("local: daemon CRITICAL alert ${CRIT_AGE_MIN}m ago (${CRIT_KEY:-unknown})")
