@@ -486,6 +486,197 @@ else
   bad "(10) concurrent-borrower rollback guard failed"
 fi
 
+# ── (11) Baked /opt/hostedtoolcache offline verification (--network=none) ──
+echo "=== (11) Baked /opt/hostedtoolcache offline verification (--network=none) ==="
+TOOLCACHE_OUT=$(docker run --rm --network=none "${IMAGE}" bash -lc '
+  set -euo pipefail
+  tool_arch="$(uname -m)"
+  case "${tool_arch}" in
+    x86_64|amd64) tool_arch="x64" ;;
+    aarch64|arm64) tool_arch="arm64" ;;
+    *) echo "unsupported arch ${tool_arch}"; exit 1 ;;
+  esac
+  for spec in \
+    "node/20.20.2:${tool_arch}/bin/node:--version" \
+    "node/22.22.0:${tool_arch}/bin/node:--version" \
+    "Python/3.12.16:${tool_arch}/bin/python3:--version" \
+    "Python/3.11.18:${tool_arch}/bin/python3:--version" \
+    "gcloud/594.0.0:${tool_arch}/bin/gcloud:--version"
+  do
+    IFS=":" read -r base_rel bin_rel flag <<< "${spec}"
+    test -f "/opt/hostedtoolcache/${base_rel}/${tool_arch}.complete"
+    "/opt/hostedtoolcache/${base_rel%:*}/${bin_rel}" "${flag}" >/dev/null
+    echo "TOOL_OK=${base_rel}"
+  done
+  echo "TOOLCACHE_OFFLINE_RC=0"
+' 2>&1)
+echo "${TOOLCACHE_OUT}" | sed 's/^/    /'
+if printf '%s\n' "${TOOLCACHE_OUT}" | grep -q "^TOOLCACHE_OFFLINE_RC=0$" \
+  && printf '%s\n' "${TOOLCACHE_OUT}" | grep -q "^TOOL_OK=node/20.20.2$" \
+  && printf '%s\n' "${TOOLCACHE_OUT}" | grep -q "^TOOL_OK=node/22.22.0$" \
+  && printf '%s\n' "${TOOLCACHE_OUT}" | grep -q "^TOOL_OK=Python/3.12.16$" \
+  && printf '%s\n' "${TOOLCACHE_OUT}" | grep -q "^TOOL_OK=Python/3.11.18$" \
+  && printf '%s\n' "${TOOLCACHE_OUT}" | grep -q "^TOOL_OK=gcloud/594.0.0$"; then
+  ok "(11) baked /opt/hostedtoolcache markers and --version checks passed offline"
+else
+  bad "(11) baked /opt/hostedtoolcache offline verification failed"
+fi
+
+# ── (12) Read-only /opt/ezgha-npm-cache:ro + runner-entrypoint.sh ──
+echo "=== (12) Read-only npm _cacache hydration, cache miss (no EROFS), and fail-open ==="
+NPM_CACHE_DIR="${WORKDIR}/npm_cache"
+NPM_FIXTURE_DIR="${WORKDIR}/npm_fixture"
+mkdir -p "${NPM_CACHE_DIR}" "${NPM_FIXTURE_DIR}"
+chmod -R a+rwx "${NPM_CACHE_DIR}" "${NPM_FIXTURE_DIR}"
+
+NPM_WARM_OUT=$(docker run --rm --network=none \
+  --user "$(id -u):$(id -g)" -e HOME=/tmp \
+  -v "${NPM_CACHE_DIR}:/out-cache" \
+  -v "${NPM_FIXTURE_DIR}:/out-fixture" \
+  "${IMAGE}" bash -lc '
+    set -euo pipefail
+    tool_arch="$(uname -m)"
+    case "${tool_arch}" in
+      x86_64|amd64) tool_arch="x64" ;;
+      aarch64|arm64) tool_arch="arm64" ;;
+    esac
+    export PATH="/opt/hostedtoolcache/node/22.22.0/${tool_arch}/bin:${PATH}"
+    mkdir -p /tmp/tarballs /tmp/p1 /tmp/p2 /tmp/proj1 /tmp/proj2
+    printf '\''{"name":"ezgha-test-pkg1","version":"1.0.0","main":"index.js"}\n'\'' > /tmp/p1/package.json
+    printf '\''module.exports = "pkg1";\n'\'' > /tmp/p1/index.js
+    printf '\''{"name":"ezgha-test-pkg2","version":"1.0.0","main":"index.js"}\n'\'' > /tmp/p2/package.json
+    printf '\''module.exports = "pkg2";\n'\'' > /tmp/p2/index.js
+    (cd /tmp/tarballs && npm pack /tmp/p1 >/dev/null && npm pack /tmp/p2 >/dev/null)
+    cp /tmp/tarballs/ezgha-test-pkg2-1.0.0.tgz /out-fixture/
+
+    python3 - <<'\''PY'\''
+import base64, functools, hashlib, http.server, json, os, socketserver, subprocess, threading
+
+handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory="/tmp/tarballs")
+class ReusableTCPServer(socketserver.TCPServer):
+    allow_reuse_address = True
+
+with ReusableTCPServer(("127.0.0.1", 0), handler) as httpd:
+    port = httpd.server_address[1]
+    t = threading.Thread(target=httpd.serve_forever, daemon=True)
+    t.start()
+    try:
+        def integrity_of(fn):
+            h = hashlib.sha512(open(f"/tmp/tarballs/{fn}", "rb").read()).digest()
+            return "sha512-" + base64.b64encode(h).decode("ascii")
+
+        for name, proj, tgz in [
+            ("ezgha-test-pkg1", "/tmp/proj1", "ezgha-test-pkg1-1.0.0.tgz"),
+            ("ezgha-test-pkg2", "/tmp/proj2", "ezgha-test-pkg2-1.0.0.tgz"),
+        ]:
+            pkg_json = {"name": f"app-{name}", "version": "1.0.0", "dependencies": {name: "1.0.0"}}
+            lock_json = {
+                "name": f"app-{name}",
+                "version": "1.0.0",
+                "lockfileVersion": 3,
+                "requires": True,
+                "packages": {
+                    "": {"name": f"app-{name}", "version": "1.0.0", "dependencies": {name: "1.0.0"}},
+                    f"node_modules/{name}": {
+                        "version": "1.0.0",
+                        "resolved": f"http://127.0.0.1:{port}/{tgz}",
+                        "integrity": integrity_of(tgz),
+                    },
+                },
+            }
+            open(f"{proj}/package.json", "w").write(json.dumps(pkg_json))
+            open(f"{proj}/package-lock.json", "w").write(json.dumps(lock_json))
+
+        subprocess.run(
+            ["npm", "ci", "--no-audit", "--no-fund", "--cache", "/out-cache"],
+            cwd="/tmp/proj1", check=True,
+        )
+        open("/out-fixture/pkg1.package.json", "w").write(open("/tmp/proj1/package.json").read())
+        open("/out-fixture/pkg1.package-lock.json", "w").write(open("/tmp/proj1/package-lock.json").read())
+        open("/out-fixture/pkg2.package.json", "w").write(open("/tmp/proj2/package.json").read())
+        open("/out-fixture/pkg2.package-lock.json", "w").write(open("/tmp/proj2/package-lock.json").read())
+        open("/out-fixture/pkg2.port", "w").write(str(port))
+    finally:
+        httpd.shutdown()
+PY
+    echo "NPM_WARM_RC=0"
+  ' 2>&1)
+echo "${NPM_WARM_OUT}" | sed 's/^/    /'
+chmod -R a+rX "${NPM_CACHE_DIR}" "${NPM_FIXTURE_DIR}"
+
+NPM_VERIFY_OUT=$(docker run --rm --network=none \
+  -v "${NPM_CACHE_DIR}:/opt/ezgha-npm-cache:ro" \
+  -v "${NPM_FIXTURE_DIR}:/fixture:ro" \
+  -e EZGHA_NPM_CACHE=/opt/ezgha-npm-cache \
+  "${IMAGE}" bash -lc '
+    set -euo pipefail
+    tool_arch="$(uname -m)"
+    case "${tool_arch}" in
+      x86_64|amd64) tool_arch="x64" ;;
+      aarch64|arm64) tool_arch="arm64" ;;
+    esac
+    export PATH="/opt/hostedtoolcache/node/22.22.0/${tool_arch}/bin:${PATH}"
+
+    echo "ENV_CACHE=${NPM_CONFIG_CACHE:-}"
+    echo "ENV_OFFLINE=${NPM_CONFIG_PREFER_OFFLINE:-}"
+
+    set +e
+    ro_out="$(touch /opt/ezgha-npm-cache/pwn 2>&1)"; ro_rc=$?
+    set -e
+    echo "RO_RC=${ro_rc} RO_OUT=${ro_out}"
+
+    # Cache hit completely offline with no server running
+    mkdir -p /tmp/hit
+    cp /fixture/pkg1.package.json /tmp/hit/package.json
+    cp /fixture/pkg1.package-lock.json /tmp/hit/package-lock.json
+    (cd /tmp/hit && npm ci --no-audit --no-fund >/tmp/hit.log 2>&1)
+    test -f /tmp/hit/node_modules/ezgha-test-pkg1/package.json && echo "NPM_HIT_OK=1"
+
+    # Cache miss served on the locked port inside container must succeed without EROFS
+    mkdir -p /tmp/miss /tmp/miss-srv
+    cp /fixture/ezgha-test-pkg2-1.0.0.tgz /tmp/miss-srv/
+    cp /fixture/pkg2.package.json /tmp/miss/package.json
+    cp /fixture/pkg2.package-lock.json /tmp/miss/package-lock.json
+    port="$(cat /fixture/pkg2.port)"
+    python3 - "${port}" <<'\''PY'\''
+import functools, http.server, socketserver, subprocess, sys, threading
+port = int(sys.argv[1])
+handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory="/tmp/miss-srv")
+class ReusableTCPServer(socketserver.TCPServer):
+    allow_reuse_address = True
+with ReusableTCPServer(("127.0.0.1", port), handler) as httpd:
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    try:
+        subprocess.run(["npm", "ci", "--no-audit", "--no-fund"], cwd="/tmp/miss", check=True)
+    finally:
+        httpd.shutdown()
+PY
+    test -f /tmp/miss/node_modules/ezgha-test-pkg2/package.json && echo "NPM_MISS_NO_EROFS_OK=1"
+  ' 2>&1)
+echo "${NPM_VERIFY_OUT}" | sed 's/^/    /'
+
+NPM_FAILOPEN_OUT=$(docker run --rm --network=none \
+  -e EZGHA_NPM_CACHE=/opt/does-not-exist \
+  "${IMAGE}" bash -lc '
+    if [ -z "${NPM_CONFIG_CACHE:-}" ]; then
+      echo "NPM_FAILOPEN_OK=1"
+    fi
+  ' 2>&1)
+echo "${NPM_FAILOPEN_OUT}" | sed 's/^/    /'
+
+if printf '%s\n' "${NPM_WARM_OUT}" | grep -q "^NPM_WARM_RC=0$" \
+  && printf '%s\n' "${NPM_VERIFY_OUT}" | grep -q "^ENV_CACHE=/tmp/ezgha-npm-cache$" \
+  && printf '%s\n' "${NPM_VERIFY_OUT}" | grep -q "^ENV_OFFLINE=true$" \
+  && printf '%s\n' "${NPM_VERIFY_OUT}" | grep -Eq "^RO_RC=[1-9][0-9]* " \
+  && printf '%s\n' "${NPM_VERIFY_OUT}" | grep -q "Read-only file system" \
+  && printf '%s\n' "${NPM_VERIFY_OUT}" | grep -q "^NPM_HIT_OK=1$" \
+  && printf '%s\n' "${NPM_VERIFY_OUT}" | grep -q "^NPM_MISS_NO_EROFS_OK=1$" \
+  && printf '%s\n' "${NPM_FAILOPEN_OUT}" | grep -q "^NPM_FAILOPEN_OK=1$"; then
+  ok "(12) read-only npm _cacache staging, offline cache hit, cache miss without EROFS, and fail-open verified"
+else
+  bad "(12) read-only npm _cacache hydration verification failed"
+fi
+
 echo
 echo "=== Summary: ${PASS} passed, ${FAIL} failed ==="
 if [ "${FAIL}" -gt 0 ]; then

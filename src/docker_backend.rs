@@ -3938,6 +3938,15 @@ fn start_one_with_generate_at_slot(
             cmd.args(["-e", "EZGHA_GIT_MIRRORS=/opt/ezgha-git-mirrors"]);
         }
     }
+    if let Some(npm_cache) = &cfg.runner.npm_cache_host_path {
+        if std::path::Path::new(npm_cache).is_dir() {
+            cmd.args([
+                "-v",
+                &format!("{}:/opt/ezgha-npm-cache:ro", npm_cache.display()),
+            ]);
+            cmd.args(["-e", "EZGHA_NPM_CACHE=/opt/ezgha-npm-cache"]);
+        }
+    }
     // Opt-in per-runner job workspace (bead jleechan-93cf): read-write mount
     // so checkouts/builds/test scratch land in a host-visible, trim-eligible
     // directory instead of the container's ephemeral writable overlay layer.
@@ -10462,6 +10471,80 @@ esac
         assert!(
             !run_line.contains("EZGHA_GIT_MIRRORS"),
             "a missing git_mirror_host_path must not set EZGHA_GIT_MIRRORS (fail-open); got: {run_line}"
+        );
+    }
+
+    #[test]
+    fn npm_cache_mount_added_when_configured_dir_exists() {
+        let _env = TestEnv::new("npm_cache_mount_present");
+        cpu_probe_overrides::set(Some(true));
+        let mut cfg = cfg_with(2, "ez-org-runner");
+        let temp_dir = env::temp_dir().join(format!("ezgha-npm-cache-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let dir = temp_dir.join("npm-cache");
+        std::fs::create_dir_all(&dir).unwrap();
+        cfg.runner.npm_cache_host_path = Some(dir.clone());
+
+        let capture = temp_dir.join("docker-args.log");
+        let script = fake_docker_capturing_args(&temp_dir, &capture);
+        *TEST_DOCKER_BIN.lock().unwrap() = Some(script.to_string_lossy().into_owned());
+
+        start_one_with_generate(&cfg, Backend::Docker, |_gh, _name, _labels, _owned| {
+            Ok(("jit".into(), 2225))
+        })
+        .expect("start_one should succeed");
+
+        let logged = std::fs::read_to_string(&capture).unwrap();
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let run_line = logged
+            .lines()
+            .find(|l| l.contains("run "))
+            .expect("a docker run invocation should have been logged");
+        assert!(
+            run_line.contains(&format!("{}:/opt/ezgha-npm-cache:ro", dir.display())),
+            "run args should mount configured npm_cache_host_path read-only; got: {run_line}"
+        );
+        assert!(
+            run_line.contains("-e EZGHA_NPM_CACHE=/opt/ezgha-npm-cache"),
+            "run args should set EZGHA_NPM_CACHE; got: {run_line}"
+        );
+    }
+
+    #[test]
+    fn npm_cache_mount_skipped_when_dir_missing() {
+        let _env = TestEnv::new("npm_cache_mount_missing_fail_open");
+        cpu_probe_overrides::set(Some(true));
+        let mut cfg = cfg_with(2, "ez-org-runner");
+        let temp_dir = env::temp_dir().join(format!(
+            "ezgha-npm-cache-missing-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let missing_npm_cache = temp_dir.join("missing-npm-cache");
+        cfg.runner.npm_cache_host_path = Some(missing_npm_cache);
+
+        let capture = temp_dir.join("docker-args.log");
+        let script = fake_docker_capturing_args(&temp_dir, &capture);
+        *TEST_DOCKER_BIN.lock().unwrap() = Some(script.to_string_lossy().into_owned());
+
+        start_one_with_generate(&cfg, Backend::Docker, |_gh, _name, _labels, _owned| {
+            Ok(("jit".into(), 2226))
+        })
+        .expect("start_one should succeed even when npm_cache_host_path is missing");
+
+        let logged = std::fs::read_to_string(&capture).unwrap();
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let run_line = logged
+            .lines()
+            .find(|l| l.contains("run "))
+            .expect("a docker run invocation should have been logged");
+        assert!(
+            !run_line.contains("/opt/ezgha-npm-cache"),
+            "a missing npm_cache_host_path must not be mounted (fail-open); got: {run_line}"
+        );
+        assert!(
+            !run_line.contains("EZGHA_NPM_CACHE"),
+            "a missing npm_cache_host_path must not set EZGHA_NPM_CACHE (fail-open); got: {run_line}"
         );
     }
 

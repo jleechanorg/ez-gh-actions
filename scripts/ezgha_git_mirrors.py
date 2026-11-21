@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Host-side bare git mirror generation staging, swap, and retention reaping."""
 
-from datetime import datetime, timezone
 import os
 import re
 import shutil
@@ -9,14 +8,22 @@ import stat
 import subprocess
 import time
 
-from ezgha_cache_common import chmod_a_rx, log, merge_env, resolve_docker_env, run_cmd, warn
+from ezgha_cache_common import (
+    chmod_a_rx,
+    log,
+    merge_env,
+    oldest_running_runner_start_epoch,
+    resolve_docker_env,
+    run_cmd,
+    warn,
+)
 
 _GIT_RESET_KEYS = (
     "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE",
     "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_COMMON_DIR",
 )
 GIT_SANITARY_ENV = {**{k: None for k in _GIT_RESET_KEYS}, "GIT_TERMINAL_PROMPT": "0"}
-DEFAULT_MIRROR_REPOS = "jleechanorg/worldarchitect.ai jleechanorg/ez-gh-actions"
+DEFAULT_MIRROR_REPOS = "jleechanorg/worldarchitect.ai jleechanorg/ez-gh-actions jleechanorg/worldai_frontend"
 
 
 def git_auth_args(url):
@@ -87,80 +94,6 @@ def next_generation_epoch(generations_dir, slug):
             if name.startswith(prefix) and name[len(prefix):].isdigit():
                 max_existing = max(max_existing, int(name[len(prefix):]))
     return max(now, max_existing + 1)
-
-
-def _parse_docker_iso_timestamp(ts_raw):
-    ts = ts_raw.strip()
-    if not ts:
-        raise ValueError("empty timestamp")
-    if ts.endswith("Z"):
-        ts = ts[:-1] + "+00:00"
-    ts = re.sub(r"\.([0-9]+)", lambda m: "." + (m.group(1) + "000000")[:6], ts)
-    dt = datetime.fromisoformat(ts)
-    return (dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)).timestamp()
-
-
-def oldest_running_runner_start_epoch(docker_env):
-    override = os.environ.get("EZGHA_CACHE_TEST_OLDEST_CONTAINER_EPOCH", "").strip()
-    if override:
-        if override.lower() == "error":
-            warn("simulated docker failure via EZGHA_CACHE_TEST_OLDEST_CONTAINER_EPOCH=error; failing closed on reap")
-            return 0.0
-        if override.lower() == "none":
-            return None
-        try:
-            return float(override)
-        except ValueError:
-            warn(f"invalid EZGHA_CACHE_TEST_OLDEST_CONTAINER_EPOCH={override!r}; failing closed on reap")
-            return 0.0
-
-    if not shutil.which("docker"):
-        warn("docker CLI not found; failing closed to preserve retired generations")
-        return 0.0
-
-    docker_proc_env = merge_env(docker_env)
-    try:
-        ps_proc = subprocess.run(
-            ["docker", "ps", "-q", "--filter", "label=ezgha=managed"],
-            env=docker_proc_env, text=True, capture_output=True, timeout=15,
-        )
-    except (subprocess.TimeoutExpired, OSError) as exc:
-        warn(f"docker ps failed ({exc}); failing closed to preserve retired generations")
-        return 0.0
-    if ps_proc.returncode != 0:
-        warn(f"docker ps exited {ps_proc.returncode}; failing closed to preserve retired generations")
-        return 0.0
-
-    ids = [ln.strip() for ln in ps_proc.stdout.splitlines() if ln.strip()]
-    if not ids:
-        return None
-
-    try:
-        inspect_proc = subprocess.run(
-            ["docker", "inspect", "--format", "{{.State.StartedAt}}", *ids],
-            env=docker_proc_env, text=True, capture_output=True, timeout=15,
-        )
-    except (subprocess.TimeoutExpired, OSError) as exc:
-        warn(f"docker inspect failed ({exc}); failing closed to preserve retired generations")
-        return 0.0
-    if inspect_proc.returncode != 0:
-        warn(f"docker inspect exited {inspect_proc.returncode}; failing closed to preserve retired generations")
-        return 0.0
-
-    epochs = []
-    for line in inspect_proc.stdout.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            epochs.append(_parse_docker_iso_timestamp(line))
-        except ValueError as exc:
-            warn(f"unparseable container StartedAt {line!r} ({exc}); failing closed to preserve retired generations")
-            return 0.0
-    if not epochs:
-        warn("docker inspect returned no StartedAt timestamps; failing closed to preserve retired generations")
-        return 0.0
-    return min(epochs)
 
 
 def reap_old_generations(generations_dir, active_dir, slug, retention_min, oldest_runner_epoch=None):

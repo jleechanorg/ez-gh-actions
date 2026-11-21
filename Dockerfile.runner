@@ -72,30 +72,71 @@ RUN chmod 0755 /usr/local/bin/git
 # owns its workspace. Never wait for the replacement runner to reclaim it.
 COPY docker/runner-post-job-workspace-prune.py /usr/local/libexec/ezgha/
 COPY docker/runner-post-job-workspace-prune.sh /usr/local/libexec/ezgha/
-RUN chmod 0755 /usr/local/libexec/ezgha/runner-post-job-workspace-prune.sh
+COPY docker/runner-entrypoint.sh /usr/local/libexec/ezgha/runner-entrypoint.sh
+RUN chmod 0755 /usr/local/libexec/ezgha/runner-post-job-workspace-prune.sh /usr/local/libexec/ezgha/runner-entrypoint.sh
 ENV ACTIONS_RUNNER_HOOK_JOB_COMPLETED=/usr/local/libexec/ezgha/runner-post-job-workspace-prune.sh
 
-# Preinstall the Node 20 runtime used by setup-node. Keep the standard runner
-# tool-cache layout and ownership so setup-node can hit this version or install
-# a later/missing version without writing into the workspace tmpfs.
-# Hashes are from https://nodejs.org/dist/v20.20.2/SHASUMS256.txt.
+# Preinstall Node 20.20.2, Node 22.22.0, Python 3.12.16, Python 3.11.18, and
+# Google Cloud SDK 594.0.0 into the standard runner tool-cache layout so
+# setup-node, setup-python, and setup-gcloud hit locally without network downloads.
 ARG TARGETARCH
 ENV RUNNER_TOOL_CACHE=/opt/hostedtoolcache
 RUN set -eux; \
     target_arch="${TARGETARCH:-$(dpkg --print-architecture)}"; \
     case "$target_arch" in \
-      amd64) node_arch=x64; node_sha256=19e56f0825510207dd904f087fe52faa0a4eb6b2aab5f0ea7a33830d04888b8b ;; \
-      arm64) node_arch=arm64; node_sha256=47ef73d543ecf6eb19435f6c03a0ac4809b3bf0dd6b26c7c571efc2a6572a74d ;; \
+      amd64) \
+        node_arch=x64; \
+        gcloud_arch=x86_64; \
+        node20_sha256=19e56f0825510207dd904f087fe52faa0a4eb6b2aab5f0ea7a33830d04888b8b; \
+        node22_sha256=c33c39ed9c80deddde77c960d00119918b9e352426fd604ba41638d6526a4744; \
+        py312_sha256=dec61ed20cd3e71143f1642ef9966945dea8ae4f3e96b306205a710da4f2191a; \
+        py311_sha256=099ef30fc27f0d7067a67be5a5fb7fd66154cfa1e4186c88f71c3a3070c81abc; \
+        gcloud_sha256=1f7233537c26bba94a3ea3f9085a60396745eaf44b21b8454fc6fdd15bb6fcde ;; \
+      arm64) \
+        node_arch=arm64; \
+        gcloud_arch=arm; \
+        node20_sha256=47ef73d543ecf6eb19435f6c03a0ac4809b3bf0dd6b26c7c571efc2a6572a74d; \
+        node22_sha256=25ba95dfb96871fa2ef977f11f95ea90818c8fa15c0f2110771db08d4ba423be; \
+        py312_sha256=86c16c393f74e4d814f9606da32aed57be85a951e772bf1c7eb80a48ef3cb664; \
+        py311_sha256=6838120f353f3bbbeb7b234843c4a6c32e5039ee5350acdcd47726c8e7067fa9; \
+        gcloud_sha256=e58fb86fff3dfd7101e1ff138f06bd4e338c7bf12a7508a7871985e7ea886275 ;; \
       *) echo "unsupported target architecture: $target_arch" >&2; exit 1 ;; \
     esac; \
-    node_archive="node-v20.20.2-linux-${node_arch}.tar.gz"; \
-    curl -fsSL "https://nodejs.org/dist/v20.20.2/${node_archive}" -o "/tmp/${node_archive}"; \
-    echo "${node_sha256}  /tmp/${node_archive}" | sha256sum -c -; \
-    node_path="${RUNNER_TOOL_CACHE}/node/20.20.2/${node_arch}"; \
-    mkdir -p "$node_path"; \
-    tar -xzf "/tmp/${node_archive}" --strip-components=1 -C "$node_path"; \
+    node20_archive="node-v20.20.2-linux-${node_arch}.tar.gz"; \
+    curl -fsSL "https://nodejs.org/dist/v20.20.2/${node20_archive}" -o "/tmp/${node20_archive}"; \
+    echo "${node20_sha256}  /tmp/${node20_archive}" | sha256sum -c -; \
+    mkdir -p "${RUNNER_TOOL_CACHE}/node/20.20.2/${node_arch}"; \
+    tar -xzf "/tmp/${node20_archive}" --strip-components=1 -C "${RUNNER_TOOL_CACHE}/node/20.20.2/${node_arch}"; \
     touch "${RUNNER_TOOL_CACHE}/node/20.20.2/${node_arch}.complete"; \
-    chown -R runner:runner "$RUNNER_TOOL_CACHE"; \
-    rm "/tmp/${node_archive}"
+    node22_archive="node-v22.22.0-linux-${node_arch}.tar.gz"; \
+    curl -fsSL "https://nodejs.org/dist/v22.22.0/${node22_archive}" -o "/tmp/${node22_archive}"; \
+    echo "${node22_sha256}  /tmp/${node22_archive}" | sha256sum -c -; \
+    mkdir -p "${RUNNER_TOOL_CACHE}/node/22.22.0/${node_arch}"; \
+    tar -xzf "/tmp/${node22_archive}" --strip-components=1 -C "${RUNNER_TOOL_CACHE}/node/22.22.0/${node_arch}"; \
+    touch "${RUNNER_TOOL_CACHE}/node/22.22.0/${node_arch}.complete"; \
+    py312_archive="python-3.12.16-linux-24.04-${node_arch}.tar.gz"; \
+    curl -fsSL "https://github.com/actions/python-versions/releases/download/3.12.16-40260402378/${py312_archive}" -o "/tmp/${py312_archive}"; \
+    echo "${py312_sha256}  /tmp/${py312_archive}" | sha256sum -c -; \
+    mkdir -p /tmp/py312; \
+    tar -xzf "/tmp/${py312_archive}" -C /tmp/py312; \
+    (cd /tmp/py312 && RUNNER_TOOL_CACHE="${RUNNER_TOOL_CACHE}" bash ./setup.sh); \
+    rm -rf /tmp/py312; \
+    py311_archive="python-3.11.18-linux-24.04-${node_arch}.tar.gz"; \
+    curl -fsSL "https://github.com/actions/python-versions/releases/download/3.11.18-40260280589/${py311_archive}" -o "/tmp/${py311_archive}"; \
+    echo "${py311_sha256}  /tmp/${py311_archive}" | sha256sum -c -; \
+    mkdir -p /tmp/py311; \
+    tar -xzf "/tmp/${py311_archive}" -C /tmp/py311; \
+    (cd /tmp/py311 && RUNNER_TOOL_CACHE="${RUNNER_TOOL_CACHE}" bash ./setup.sh); \
+    rm -rf /tmp/py311; \
+    gcloud_archive="google-cloud-cli-594.0.0-linux-${gcloud_arch}.tar.gz"; \
+    curl -fsSL "https://dl.google.com/dl/cloudsdk/channels/rapid/downloads/${gcloud_archive}" -o "/tmp/${gcloud_archive}"; \
+    echo "${gcloud_sha256}  /tmp/${gcloud_archive}" | sha256sum -c -; \
+    mkdir -p "${RUNNER_TOOL_CACHE}/gcloud/594.0.0/${node_arch}"; \
+    tar -xzf "/tmp/${gcloud_archive}" --strip-components=1 -C "${RUNNER_TOOL_CACHE}/gcloud/594.0.0/${node_arch}"; \
+    touch "${RUNNER_TOOL_CACHE}/gcloud/594.0.0/${node_arch}.complete"; \
+    chown -R runner:runner "${RUNNER_TOOL_CACHE}"; \
+    rm -f /tmp/*.tar.gz
 
 USER runner
+ENTRYPOINT ["/usr/local/libexec/ezgha/runner-entrypoint.sh"]
+CMD ["/bin/bash"]
