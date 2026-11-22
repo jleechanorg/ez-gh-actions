@@ -262,7 +262,7 @@
       "total_non_skipped_runs": 55
     },
     "cohort": "success",
-    "generated_at": "2026-11-22T14:26:57Z",
+    "generated_at": "2026-11-22T14:38:00Z",
     "ok": true,
     "overall": {
       "e2e": {
@@ -658,8 +658,8 @@
       }
     ]
   },
-  "observed_at": "2026-11-22T14:26:23Z",
-  "published_at": "2026-11-22T14:26:25Z",
+  "observed_at": "2026-11-22T14:37:26Z",
+  "published_at": "2026-11-22T14:37:28Z",
   "queue": {
     "fresh": null,
     "ghosts": null,
