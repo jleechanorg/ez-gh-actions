@@ -262,11 +262,11 @@
       "total_non_skipped_runs": 54
     },
     "cohort": "success",
-    "generated_at": "2026-11-22T12:58:47Z",
+    "generated_at": "2026-11-22T13:09:49Z",
     "ok": true,
     "overall": {
       "e2e": {
-        "avg_s": 297.6,
+        "avg_s": 305.49,
         "max_s": 3324.0,
         "n": 47,
         "p50_s": 37.0,
@@ -274,10 +274,10 @@
         "p99_s": 3005.68
       },
       "execution": {
-        "avg_s": 338.82,
+        "avg_s": 343.03,
         "max_s": 3298.0,
         "n": 89,
-        "p50_s": 95.0,
+        "p50_s": 105.0,
         "p90_s": 626.2,
         "p99_s": 2967.12
       },
@@ -462,6 +462,34 @@
       },
       {
         "e2e": {
+          "avg_s": 224.67,
+          "max_s": 589.0,
+          "n": 6,
+          "p50_s": 127.0,
+          "p90_s": 490.5,
+          "p99_s": 579.15
+        },
+        "execution": {
+          "avg_s": 147.25,
+          "max_s": 389.0,
+          "n": 4,
+          "p50_s": 83.5,
+          "p90_s": 300.8,
+          "p99_s": 380.18
+        },
+        "queue_wait": {
+          "avg_s": 2.0,
+          "max_s": 2.0,
+          "n": 4,
+          "p50_s": 2.0,
+          "p90_s": 2.0,
+          "p99_s": 2.0
+        },
+        "repo": "repo-1",
+        "workflow": "workflow-7"
+      },
+      {
+        "e2e": {
           "avg_s": 477.0,
           "max_s": 477.0,
           "n": 1,
@@ -486,7 +514,7 @@
           "p99_s": 2.0
         },
         "repo": "repo-1",
-        "workflow": "workflow-7"
+        "workflow": "workflow-8"
       },
       {
         "e2e": {
@@ -514,7 +542,7 @@
           "p99_s": 2.0
         },
         "repo": "repo-2",
-        "workflow": "workflow-8"
+        "workflow": "workflow-9"
       },
       {
         "e2e": {
@@ -542,7 +570,7 @@
           "p99_s": 1.0
         },
         "repo": "repo-1",
-        "workflow": "workflow-9"
+        "workflow": "workflow-10"
       },
       {
         "e2e": {
@@ -565,34 +593,6 @@
           "avg_s": 1.56,
           "max_s": 2.0,
           "n": 9,
-          "p50_s": 2.0,
-          "p90_s": 2.0,
-          "p99_s": 2.0
-        },
-        "repo": "repo-1",
-        "workflow": "workflow-10"
-      },
-      {
-        "e2e": {
-          "avg_s": 191.2,
-          "max_s": 589.0,
-          "n": 5,
-          "p50_s": 99.0,
-          "p90_s": 415.4,
-          "p99_s": 571.64
-        },
-        "execution": {
-          "avg_s": 66.67,
-          "max_s": 95.0,
-          "n": 3,
-          "p50_s": 72.0,
-          "p90_s": 90.4,
-          "p99_s": 94.54
-        },
-        "queue_wait": {
-          "avg_s": 2.0,
-          "max_s": 2.0,
-          "n": 3,
           "p50_s": 2.0,
           "p90_s": 2.0,
           "p99_s": 2.0
@@ -658,12 +658,12 @@
       },
       {
         "e2e": {
-          "avg_s": 14.0,
+          "avg_s": 13.67,
           "max_s": 18.0,
-          "n": 7,
-          "p50_s": 13.0,
-          "p90_s": 16.8,
-          "p99_s": 17.88
+          "n": 6,
+          "p50_s": 12.5,
+          "p90_s": 16.5,
+          "p99_s": 17.85
         },
         "execution": {
           "avg_s": 11.67,
@@ -694,32 +694,32 @@
           "p99_s": 14.0
         },
         "execution": {
-          "avg_s": 12.0,
-          "max_s": 12.0,
-          "n": 1,
-          "p50_s": 12.0,
-          "p90_s": 12.0,
-          "p99_s": 12.0
+          "avg_s": null,
+          "max_s": null,
+          "n": 0,
+          "p50_s": null,
+          "p90_s": null,
+          "p99_s": null
         },
         "queue_wait": {
-          "avg_s": 1.0,
-          "max_s": 1.0,
-          "n": 1,
-          "p50_s": 1.0,
-          "p90_s": 1.0,
-          "p99_s": 1.0
+          "avg_s": null,
+          "max_s": null,
+          "n": 0,
+          "p50_s": null,
+          "p90_s": null,
+          "p99_s": null
         },
         "repo": "repo-1",
         "workflow": "workflow-15"
       }
     ]
   },
-  "observed_at": "2026-11-22T12:58:12Z",
-  "published_at": "2026-11-22T12:58:13Z",
+  "observed_at": "2026-11-22T13:09:15Z",
+  "published_at": "2026-11-22T13:09:17Z",
   "queue": {
     "fresh": null,
     "ghosts": null,
-    "in_progress_runs": 2,
+    "in_progress_runs": 1,
     "ok": true,
     "oldest_fresh_wait_minutes": null,
     "partial": true,
@@ -739,12 +739,12 @@
   },
   "reconciliation": {
     "active_job_slots_occupied": 0,
-    "active_workflow_runs": 2,
+    "active_workflow_runs": 1,
     "available_pools": 1,
     "configured_slots": 20,
     "cycling_slots": 0,
     "down_slots": 0,
-    "explanation": "2 active GitHub workflow runs | 0 occupied local runner slots; queue partial: 89 unverified.",
+    "explanation": "1 active GitHub workflow runs | 0 occupied local runner slots; queue partial: 89 unverified.",
     "fresh_queued_runs": null,
     "idle_slots": 20,
     "inert_ghosts": null,
