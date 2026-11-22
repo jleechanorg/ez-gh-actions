@@ -262,27 +262,27 @@
       "total_non_skipped_runs": 55
     },
     "cohort": "success",
-    "generated_at": "2026-11-22T15:22:10Z",
+    "generated_at": "2026-11-22T15:33:11Z",
     "ok": true,
     "overall": {
       "e2e": {
-        "avg_s": 292.2,
+        "avg_s": 295.69,
         "max_s": 3360.0,
         "n": 49,
-        "p50_s": 37.0,
+        "p50_s": 38.0,
         "p90_s": 453.8,
         "p99_s": 3342.72
       },
       "execution": {
-        "avg_s": 469.84,
+        "avg_s": 471.81,
         "max_s": 3351.0,
         "n": 75,
-        "p50_s": 113.0,
+        "p50_s": 114.0,
         "p90_s": 1349.6,
         "p99_s": 3311.78
       },
       "queue_wait": {
-        "avg_s": 1.59,
+        "avg_s": 1.6,
         "max_s": 3.0,
         "n": 75,
         "p50_s": 2.0,
@@ -378,34 +378,6 @@
       },
       {
         "e2e": {
-          "avg_s": 155.33,
-          "max_s": 452.0,
-          "n": 12,
-          "p50_s": 70.0,
-          "p90_s": 407.3,
-          "p99_s": 447.27
-        },
-        "execution": {
-          "avg_s": 148.88,
-          "max_s": 447.0,
-          "n": 8,
-          "p50_s": 36.5,
-          "p90_s": 417.6,
-          "p99_s": 444.06
-        },
-        "queue_wait": {
-          "avg_s": 2.25,
-          "max_s": 3.0,
-          "n": 8,
-          "p50_s": 2.0,
-          "p90_s": 3.0,
-          "p99_s": 3.0
-        },
-        "repo": "repo-1",
-        "workflow": "workflow-4"
-      },
-      {
-        "e2e": {
           "avg_s": 175.67,
           "max_s": 461.0,
           "n": 3,
@@ -414,20 +386,48 @@
           "p99_s": 452.6
         },
         "execution": {
-          "avg_s": 172.67,
+          "avg_s": 240.0,
           "max_s": 457.0,
-          "n": 3,
-          "p50_s": 38.0,
-          "p90_s": 373.2,
-          "p99_s": 448.62
+          "n": 2,
+          "p50_s": 240.0,
+          "p90_s": 413.6,
+          "p99_s": 452.66
         },
         "queue_wait": {
-          "avg_s": 1.67,
+          "avg_s": 2.0,
           "max_s": 2.0,
-          "n": 3,
+          "n": 2,
           "p50_s": 2.0,
           "p90_s": 2.0,
           "p99_s": 2.0
+        },
+        "repo": "repo-1",
+        "workflow": "workflow-4"
+      },
+      {
+        "e2e": {
+          "avg_s": 158.0,
+          "max_s": 452.0,
+          "n": 13,
+          "p50_s": 99.0,
+          "p90_s": 405.6,
+          "p99_s": 446.84
+        },
+        "execution": {
+          "avg_s": 153.0,
+          "max_s": 447.0,
+          "n": 9,
+          "p50_s": 38.0,
+          "p90_s": 413.4,
+          "p99_s": 443.64
+        },
+        "queue_wait": {
+          "avg_s": 2.22,
+          "max_s": 3.0,
+          "n": 9,
+          "p50_s": 2.0,
+          "p90_s": 3.0,
+          "p99_s": 3.0
         },
         "repo": "repo-1",
         "workflow": "workflow-5"
@@ -462,35 +462,7 @@
       },
       {
         "e2e": {
-          "avg_s": 18.0,
-          "max_s": 18.0,
-          "n": 1,
-          "p50_s": 18.0,
-          "p90_s": 18.0,
-          "p99_s": 18.0
-        },
-        "execution": {
-          "avg_s": null,
-          "max_s": null,
-          "n": 0,
-          "p50_s": null,
-          "p90_s": null,
-          "p99_s": null
-        },
-        "queue_wait": {
-          "avg_s": null,
-          "max_s": null,
-          "n": 0,
-          "p50_s": null,
-          "p90_s": null,
-          "p99_s": null
-        },
-        "repo": "repo-1",
-        "workflow": "workflow-7"
-      },
-      {
-        "e2e": {
-          "avg_s": 10.38,
+          "avg_s": 10.31,
           "max_s": 18.0,
           "n": 13,
           "p50_s": 9.0,
@@ -514,7 +486,7 @@
           "p99_s": 2.92
         },
         "repo": "repo-1",
-        "workflow": "workflow-8"
+        "workflow": "workflow-7"
       },
       {
         "e2e": {
@@ -542,12 +514,12 @@
           "p99_s": null
         },
         "repo": "repo-2",
-        "workflow": "workflow-9"
+        "workflow": "workflow-8"
       }
     ]
   },
-  "observed_at": "2026-11-22T15:21:37Z",
-  "published_at": "2026-11-22T15:21:39Z",
+  "observed_at": "2026-11-22T15:32:38Z",
+  "published_at": "2026-11-22T15:32:39Z",
   "queue": {
     "fresh": null,
     "ghosts": null,
