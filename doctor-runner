@@ -247,6 +247,38 @@ if [ -z "$RUNNER_NAME_PREFIX" ]; then
   # Legacy / missing config: fall back to `ez-org-runner` (the pre-#8143 default).
   RUNNER_NAME_PREFIX="ez-org-runner"
 fi
+
+# ── Credential resolution: ONE place, before any host-path branch ─────────
+# Every `gh` call in this script must use ezgha's own GitHub App token, never the
+# operator's ambient credential. Resolve it here, once, so neither the parked path
+# nor the active path can skip it. An export inside only one branch was the
+# 2026-11-20 defect: a parked host returned early and its job map reported degraded
+# zeros while the org token sat unused at 10005/10400.
+#
+# `unset GH_TOKEN` alone is NOT sufficient to drop the operator's identity: `gh`
+# falls back to GITHUB_TOKEN, GH_ENTERPRISE_TOKEN, and finally the stored
+# ~/.config/gh/hosts.yml credential (verified: with GH_TOKEN unset, `gh auth
+# status` still reports "Logged in ... jleechan2015"). So when the app token is
+# missing or empty we record App-backed evidence as UNAVAILABLE and let the
+# sections that need it say so explicitly, instead of silently authenticating as
+# the operator. GH_TOKEN is still unset so nothing inherits it by accident.
+EZGHA_APP_TOKEN_PATH="$HOME/.config/ezgha/gh_token"
+EZGHA_APP_TOKEN_AVAILABLE=0
+unset GH_TOKEN
+if [ -f "$EZGHA_APP_TOKEN_PATH" ] && [ -s "$EZGHA_APP_TOKEN_PATH" ]; then
+  EZGHA_APP_TOKEN="$(cat "$EZGHA_APP_TOKEN_PATH" 2>/dev/null)"
+  if [ -n "$EZGHA_APP_TOKEN" ]; then
+    export GH_TOKEN="$EZGHA_APP_TOKEN"
+    EZGHA_APP_TOKEN_AVAILABLE=1
+  fi
+fi
+unset EZGHA_APP_TOKEN
+# With no App token, also drop the other ambient credential sources so `gh` cannot
+# authenticate as somebody else through a different variable.
+if [ "$EZGHA_APP_TOKEN_AVAILABLE" -eq 0 ]; then
+  unset GITHUB_TOKEN GH_ENTERPRISE_TOKEN
+fi
+
 # Seed the verdict inputs that the parked-host gate would otherwise leave unset
 # (`set -u` aborted with `SERVICE_STATE: unbound variable`). A parked host owns no
 # service and no VM, so "disabled/absent" is the truthful observation; the verdict
@@ -285,6 +317,13 @@ count_assignments_section() {
 if [ "$LOCAL_DISABLED" -eq 1 ]; then
   section "1-6. host lifecycle (parked host)"
   ok "$PLATFORM host intentionally DISABLED (operator opt-out) — 0 slot(s) expected, no service/daemon/colima/registrations required, and nothing contributed to the fleet contract; unset the opt-out to require proof"
+  # Use ezgha's OWN app token for every later `gh api` call -- in the parked
+  # path too. The section-4b export lives in the ACTIVE-host branch only, so a
+  # parked host previously skipped it and the job map (sections 8/10) still rode
+  # the operator's ambient `gh auth`. That is the 2026-11-20 defect: an invalid
+  # personal token made the job map report "0 in-progress + 0 queued" and forced
+  # "queue/API evidence UNPROVEN" while the org token was 10005/10400 healthy.
+  # GH_TOKEN was resolved once, before this branch (see "Credential resolution").
   # AGENTS.md requires every suspension to carry a start date and a restore
   # condition so the opt-out cannot quietly become a permanent capacity
   # reduction. Nothing surfaced a MISSING record before this: the Mac leg sat
@@ -502,10 +541,32 @@ fi
 # ezgha's own app token, so none of them actually exercise gh_token's
 # validity; explicitly override GH_TOKEN for this one call so it tests what
 # section 4b claims to test.
-if [ -f "$GH_TOKEN_PATH" ] && { [ "$GH_TOKEN_STATUS" = "fresh" ] || [ "$GH_TOKEN_STATUS" = "warn" ]; }; then
+if [ "$EZGHA_APP_TOKEN_AVAILABLE" -eq 0 ]; then
+  # The probe would pass GH_TOKEN="" here, and `gh` then falls back to
+  # GITHUB_TOKEN or the stored hosts.yml login -- so the "live check" would
+  # validate the OPERATOR's credential while reporting on the App token's
+  # freshness (review finding: a fresh-but-empty file reached this block).
+  bad "gh_token live-check UNAVAILABLE: token file missing, empty, or unreadable — refusing to probe with a fallback identity"
+  GH_TOKEN_STATUS="live_check_unavailable"
+  GH_TOKEN_STALE_CRITICAL=1
+elif [ -f "$GH_TOKEN_PATH" ] && { [ "$GH_TOKEN_STATUS" = "fresh" ] || [ "$GH_TOKEN_STATUS" = "warn" ]; }; then
   # awk NR==1 (no exit) consumes gh's full output — `| head -1` here made gh
   # take SIGPIPE under pipefail and killed the whole script with exit 141.
-  GH_TOKEN_LIVE_HTTP=$(GH_TOKEN="$(cat "$GH_TOKEN_PATH" 2>/dev/null)" gh api -i "orgs/$ORG/actions/runners?per_page=1" 2>/dev/null | awk 'NR==1{print $2}')
+  # `|| GH_TOKEN_LIVE_HTTP=""` is load-bearing: under `set -euo pipefail` a gh
+  # that exits nonzero (401/403 on a dead or under-scoped token) would abort the
+  # whole script here -- before the BAD/status branch below could print WHICH
+  # failure it was, and before any local diagnostic ran. Observed 2026-11-20:
+  # with a 401 the script died at this assignment with rc=1 and no output, so a
+  # genuinely dead token produced no actionable diagnosis at all. Catching the
+  # status locally routes it to the existing diagnosis instead of aborting.
+  # Do NOT re-read the token file here. The earlier resolution already loaded and
+  # exported the App token; re-reading it inline meant that if the file were
+  # emptied or truncated AFTER resolution, this call would pass GH_TOKEN="" and
+  # `gh` would fall back to GITHUB_TOKEN or the stored hosts.yml login -- so the
+  # "live check" would validate somebody else's credential (review finding,
+  # reproduced: loaded synthetic token + emptied file => stub received an empty
+  # token and doctor still reported success). Use the already-resolved token.
+  GH_TOKEN_LIVE_HTTP=$(gh api -i "orgs/$ORG/actions/runners?per_page=1" 2>/dev/null | awk 'NR==1{print $2}') || GH_TOKEN_LIVE_HTTP=""
   if [ "$GH_TOKEN_LIVE_HTTP" = "200" ]; then
     ok "gh_token live-check: 200 against orgs/$ORG/actions/runners (mtime freshness confirmed by a real call, not just a clock)"
   else
@@ -514,9 +575,45 @@ if [ -f "$GH_TOKEN_PATH" ] && { [ "$GH_TOKEN_STATUS" = "fresh" ] || [ "$GH_TOKEN
     GH_TOKEN_STALE_CRITICAL=1
   fi
 fi
+
+# Use ezgha's OWN app token for every subsequent API call in this script.
+#
+# Before this export, each later `gh api` call rode the OPERATOR's ambient
+# `gh auth` token (usually a personal token). That is wrong for two reasons:
+#   1. an invalid or rate-limited personal token made the job map go DEGRADED,
+#      so doctor reported the fleet INCONCLUSIVE ("queue/API evidence
+#      UNPROVEN") even when ezgha's own org token had ~10k of 10.4k calls left
+#      (observed 2026-11-20: personal token 403 rate-limited, org token
+#      10005/10400 healthy, verdict still UNPROVEN because no call used it);
+#   2. each call validated a credential it was not actually supposed to use.
+# Exporting here means every downstream call exercises the token this script
+# claims to be checking, and the org's much larger budget is the one consumed.
+# A missing/broken token must keep failing loudly through the existing
+# GH_TOKEN_STATUS paths, and it must NOT leave the operator's ambient token in
+# scope: `if [ -f ... ]; then export ...` alone skips the export when the file
+# is absent, so an inherited GH_TOKEN would stay set and every gh api call below
+# would silently ride the personal credential this section exists to avoid
+# (found in review). Unset first, then export only on success, so downstream
+# calls run unauthenticated (fail loudly) rather than with the wrong identity.
+# GH_TOKEN was already resolved once, before the parked/active split, so this
+# branch cannot diverge. Do NOT re-export here: two resolution sites is exactly
+# how the parked path drifted from the active one.
+if [ "$EZGHA_APP_TOKEN_AVAILABLE" -eq 0 ]; then
+  bad "App-token evidence UNAVAILABLE: $EZGHA_APP_TOKEN_PATH missing or empty — GitHub-backed sections below report UNPROVEN rather than authenticating as the operator"
+fi
 # --- C. GitHub-side runner fleet ----------------------------------------
 section "5. GitHub org runner fleet ($ORG)"
+# Gated on App-token availability. Without it, `gh` would fall back to
+# GITHUB_TOKEN or the stored ~/.config/gh/hosts.yml login and answer as the
+# operator -- exactly the identity confusion this PR removes. Better to report
+# the census as unavailable than to authenticate as somebody else.
+if [ "$EZGHA_APP_TOKEN_AVAILABLE" -eq 0 ]; then
+  bad "GitHub runner census UNAVAILABLE (no App token) — not querying as the operator"
+  RAW='{"runners":[]}'
+  : > /dev/null
+else
 RAW=$($(command -v gh) api "orgs/$ORG/actions/runners" --paginate 2>/dev/null || echo '{"runners":[]}')
+fi
 TOTAL=$(echo "$RAW" | jq '.total_count // (.runners | length)')
 ONLINE=$(echo "$RAW" | jq '[.runners[] | select(.status=="online")] | length')
 OFFLINE=$(echo "$RAW" | jq '[.runners[] | select(.status=="offline")] | length')
@@ -666,6 +763,12 @@ if [ "$LOCAL_DISABLED" -eq 1 ]; then
   # attributed to it. Requiring execution proof from a deliberately empty fleet
   # is the same defect as requiring it from a DOWN slot: state the truth instead.
   ok "real job-execution proof NOT REQUIRED — $PLATFORM leg intentionally DISABLED (operator opt-out), so it has no runners to execute on; unset the opt-out to require proof"
+elif [ "$EZGHA_APP_TOKEN_AVAILABLE" -eq 0 ]; then
+  # No App token: refuse to query. `gh` would fall back to GITHUB_TOKEN or the
+  # stored ~/.config/gh/hosts.yml login and attribute runs to the operator's
+  # identity instead of the App's (review finding: this block called
+  # `gh run list` ungated, and G1 -- which parks the host -- could not see it).
+  bad "real job-execution proof UNAVAILABLE (no App token) — not querying as the operator"
 else
 while read -r rid; do
   [ -z "$rid" ] && continue
@@ -689,7 +792,10 @@ fi
 # then confirms the runner_name matches the configured prefix and conclusion=success.
 # This is the strongest "handled for real, right now" proof.
 CANARY_OK=""
-if [ "$PROVE" = "1" ]; then
+if [ "$PROVE" = "1" ] && [ "$EZGHA_APP_TOKEN_AVAILABLE" -eq 0 ]; then
+  section "7b. live canary (dispatch + verify a job runs on our fleet NOW)"
+  bad "live canary UNAVAILABLE: --prove needs the App token; refusing to dispatch as the operator via a stored gh login"
+elif [ "$PROVE" = "1" ]; then
   section "7b. live canary (dispatch + verify a job runs on our fleet NOW)"
   before=$($(command -v gh) run list -R "$EZGHA_REPO" -w ezgha-selftest -L 1 --json databaseId --jq '.[0].databaseId // 0' 2>/dev/null)
   $(command -v gh) workflow run ezgha-selftest -R "$EZGHA_REPO" >/dev/null 2>&1
@@ -770,6 +876,13 @@ build_runner_job_index() {
     fresh_cutoff=$(date -u -v-"${STALE_HOURS:-8}"H +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)
   else
     fresh_cutoff=$(date -u -d "${STALE_HOURS:-8} hours ago" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)
+  fi
+  # No App token => do not query the job map at all. `gh` would fall back to
+  # GITHUB_TOKEN or the stored hosts.yml login, so the map would be built from
+  # the operator's identity rather than the App's.
+  if [ "${EZGHA_APP_TOKEN_AVAILABLE:-0}" -eq 0 ]; then
+    echo "app-token-unavailable" >> "$JOBMAP_ERRORS_FILE"
+    return 0
   fi
   for repo in $EXPLICIT_WORK_REPOS; do
     for status in in_progress queued; do
@@ -1151,10 +1264,21 @@ remote_docker_env() {
     if [ -f ~/Library/LaunchAgents/org.jleechanorg.ezgha.plist ]; then
       plutil -extract EnvironmentVariables.DOCKER_HOST raw ~/Library/LaunchAgents/org.jleechanorg.ezgha.plist 2>/dev/null || exit 1
     elif command -v systemctl >/dev/null 2>&1; then
+      # A non-interactive ssh command has neither XDG_RUNTIME_DIR nor
+      # DBUS_SESSION_BUS_ADDRESS, so `systemctl --user` fails with
+      # "Failed to connect to bus: No medium found" (rc=1) even though the
+      # unit is loaded and running. Without these exports this function
+      # returned 1 for a healthy host, and every Linux slot was then reported
+      # "Docker endpoint unresolved — counted DOWN without a Docker probe"
+      # (2026-11-18: 20/20 Linux slots falsely DOWN while 15 were executing).
+      export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+      export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/$(id -u)/bus}"
       unit_load_state=$(systemctl --user show ezgha.service -p LoadState --value 2>/dev/null) || exit 1
       [ "$unit_load_state" = loaded ] || exit 1
       service_env=$(systemctl --user show ezgha.service -p Environment --value 2>/dev/null) || exit 1
       # Parse quoted systemctl assignments as data, never as shell code.
+      # DOCKER_HOST_OVERRIDE is the ezgha-owned pointer and outranks a plain
+      # DOCKER_HOST; when neither is set, fall back to the native socket.
       endpoint=$(printf "%s\n" "$service_env" | python3 -c "import shlex,sys; items=shlex.split(sys.stdin.read()); print(next((x.split(\"=\",1)[1] for x in items if x.startswith(\"DOCKER_HOST_OVERRIDE=\")),\"\"),end=\"\")") || exit 1
       case "$endpoint" in
         *[![:space:]]*) printf "%s" "$endpoint" ;;

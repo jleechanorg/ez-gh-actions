@@ -383,6 +383,13 @@ pub struct RunnerConfig {
     /// correctness-required dependency. Default `None`.
     #[serde(default)]
     pub pip_cache_host_path: Option<std::path::PathBuf>,
+    /// Optional host-side directory of read-only bare git mirror generations,
+    /// bind-mounted read-only into each container at `/opt/ezgha-git-mirrors`
+    /// with `EZGHA_GIT_MIRRORS=/opt/ezgha-git-mirrors` so the container git
+    /// wrapper can hydrate checkouts from local objects. Fail-open: missing
+    /// directory is silently skipped. Default `None`.
+    #[serde(default)]
+    pub git_mirror_host_path: Option<std::path::PathBuf>,
     /// Host-side parent directory for per-runner job workspaces
     /// (`{workspace_host_path}/{runner_name}`), bind-mounted read-write into
     /// each container at `/home/runner/_work` -- the actions/runner default
@@ -454,6 +461,30 @@ pub struct Limits {
     /// `Err` and `Serve` bails before mutating any runner. Default `false`.
     #[serde(default)]
     pub cpu_burst: bool,
+    /// Opt-in: permit unprivileged user namespaces inside runner containers
+    /// (`unshare -Urn`) by spawning with `--security-opt seccomp=unconfined`.
+    ///
+    /// Docker's built-in seccomp profile denies `clone(CLONE_NEWUSER)`, so a
+    /// CI step that isolates itself with `unshare -Urn` fails
+    /// `Operation not permitted` even on a host that allows user namespaces
+    /// (bead jleechan-5khv: reproduced on BOTH fleets, with AppArmor disabled
+    /// on one of them, which rules AppArmor out as the cause).
+    ///
+    /// Default `false` keeps the hardened profile. Turning it on is a real
+    /// isolation relaxation on a host that runs untrusted PR code -- the
+    /// trade is deliberate and must be set by an operator who has weighed it,
+    /// never inferred or auto-enabled. Use `seccomp_profile` instead when a
+    /// custom profile that allows only CLONE_NEWUSER is available.
+    #[serde(default)]
+    pub allow_userns: bool,
+    /// Opt-in: path to a custom seccomp profile for runner containers
+    /// (`--security-opt seccomp=<path>`). This is the narrower alternative to
+    /// `allow_userns`: a profile can allow `clone` with `CLONE_NEWUSER` while
+    /// keeping every other default denial intact. When both are set the
+    /// explicit profile wins and `allow_userns` is not applied (an unconfined
+    /// profile must never silently override a narrower one).
+    #[serde(default)]
+    pub seccomp_profile: Option<String>,
 }
 
 fn default_min_free_disk_gb() -> u64 {
@@ -674,6 +705,7 @@ impl Config {
                 runner_floor_mb: default_runner_floor_mb(),
                 wheelhouse_host_path: None,
                 pip_cache_host_path: None,
+                git_mirror_host_path: None,
                 workspace_host_path: None,
             },
             limits: Limits {
@@ -683,6 +715,8 @@ impl Config {
                 min_free_disk_gb: default_min_free_disk_gb(),
                 cgroup_parent: None,
                 cpu_burst: false,
+                allow_userns: false,
+                seccomp_profile: None,
             },
             policy: Policy {
                 minimum_isolation: IsolationLevel::Container,
@@ -757,10 +791,20 @@ impl Config {
         if let Some(parent) = &self.limits.cgroup_parent {
             validate_cgroup_parent(parent)?;
         }
+        // Bead jleechan-5khv: an empty `seccomp_profile` would render as
+        // `--security-opt seccomp=` and Docker would start a container with an
+        // undefined security option -- a fail-open on the one setting that
+        // must never be ambiguous. Refuse rather than guess.
+        if let Some(profile) = &self.limits.seccomp_profile {
+            require_non_empty_path(
+                "limits.seccomp_profile",
+                &Some(std::path::PathBuf::from(profile)),
+            )?;
+        }
         require_at_least_one("limits.min_free_disk_gb", self.limits.min_free_disk_gb)?;
-        if self.runner.count < 1 {
+        if self.runner.count == 0 && self.limits.cgroup_parent.is_some() {
             anyhow::bail!(
-                "runner.count must be at least 1 (got {})",
+                "runner.count must be at least 1 when limits.cgroup_parent is set (got {})",
                 self.runner.count
             );
         }
@@ -861,6 +905,22 @@ impl Config {
             anyhow::bail!("canary.poll_interval_seconds must be <= canary.poll_timeout_seconds");
         }
         require_non_empty_path("canary.history_path", &self.canary.history_path)?;
+        require_non_empty_path(
+            "runner.git_mirror_host_path",
+            &self.runner.git_mirror_host_path,
+        )?;
+        if let Some(path) = &self.runner.git_mirror_host_path {
+            let raw = path.to_string_lossy();
+            if raw.trim().is_empty() {
+                anyhow::bail!("runner.git_mirror_host_path must not be empty when configured");
+            }
+            if raw.as_ref() != raw.trim() || !path.is_absolute() {
+                anyhow::bail!(
+                    "runner.git_mirror_host_path must be an absolute path without leading '~' (got {:?})",
+                    path
+                );
+            }
+        }
         // A FUSE-backed runner workspace breaks every job before it starts; see
         // `validate_workspace_filesystem` for the 2026-10-28 incident.
         if let Some(workspace_host_path) = &self.runner.workspace_host_path {
@@ -1167,6 +1227,53 @@ minimum_isolation = "container"
     }
 
     #[test]
+    fn config_parses_git_mirror_host_path() {
+        let with_path = r#"
+version = 1
+[github]
+scope = "org"
+target = "jleechanorg"
+[runner]
+labels = ["self-hosted"]
+count = 1
+image = "ezgha-runner:latest"
+git_mirror_host_path = "/tmp/mirrors"
+[limits]
+memory_mb = 4096
+cpus = 2.0
+pids = 512
+[policy]
+minimum_isolation = "container"
+"#;
+        let parsed: Config =
+            toml::from_str(with_path).expect("config with git_mirror_host_path parses");
+        assert_eq!(
+            parsed.runner.git_mirror_host_path,
+            Some(std::path::PathBuf::from("/tmp/mirrors"))
+        );
+
+        let without_path = r#"
+version = 1
+[github]
+scope = "org"
+target = "jleechanorg"
+[runner]
+labels = ["self-hosted"]
+count = 1
+image = "ezgha-runner:latest"
+[limits]
+memory_mb = 4096
+cpus = 2.0
+pids = 512
+[policy]
+minimum_isolation = "container"
+"#;
+        let omitted: Config =
+            toml::from_str(without_path).expect("config without git_mirror_host_path parses");
+        assert_eq!(omitted.runner.git_mirror_host_path, None);
+    }
+
+    #[test]
     fn serve_tick_honors_configured_value_and_clamps_floor() {
         let mut cfg_runner = RunnerConfig {
             labels: vec!["self-hosted".into()],
@@ -1180,6 +1287,7 @@ minimum_isolation = "container"
             runner_floor_mb: default_runner_floor_mb(),
             wheelhouse_host_path: None,
             pip_cache_host_path: None,
+            git_mirror_host_path: None,
             workspace_host_path: None,
         };
         assert_eq!(cfg_runner.serve_tick(), std::time::Duration::from_secs(20));
@@ -1536,7 +1644,37 @@ host_containment = "bare-metal"
     fn reject_zero_count() {
         let mut cfg = valid_config();
         cfg.runner.count = 0;
+        // Deliberately parked configs without a cgroup slice (e.g. macOS) allow count = 0.
+        cfg.limits.cgroup_parent = None;
+        assert!(cfg.validate().is_ok());
+
+        cfg.limits.cgroup_parent = Some("actions.slice".into());
         assert!(cfg.validate().is_err());
+    }
+
+    /// Bead jleechan-5khv: `seccomp_profile` renders into
+    /// `--security-opt seccomp=<path>`. An empty value would produce a
+    /// dangling option on the one setting that must never be ambiguous, so it
+    /// must be rejected rather than silently accepted.
+    #[test]
+    fn reject_empty_seccomp_profile() {
+        let mut cfg = valid_config();
+        cfg.limits.seccomp_profile = Some(String::new());
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            format!("{err:#}").contains("seccomp_profile"),
+            "expected an empty-seccomp_profile rejection, got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn userns_opt_ins_default_off() {
+        let cfg = valid_config();
+        assert!(!cfg.limits.allow_userns, "allow_userns must default off");
+        assert!(
+            cfg.limits.seccomp_profile.is_none(),
+            "seccomp_profile must default unset"
+        );
     }
 
     #[test]
@@ -2017,5 +2155,24 @@ slack_channel = "C0AJ3SD5C79"
             .expect_err("a blank workspace path must be rejected")
             .to_string();
         assert!(err.contains("must not be empty"), "{err}");
+    }
+
+    #[test]
+    fn config_validate_enforces_absolute_git_mirror_host_path() {
+        for bad in ["", "   ", "~/.cache/ezgha/git-mirrors", "relative/mirrors"] {
+            let mut cfg = valid_config();
+            cfg.runner.git_mirror_host_path = Some(PathBuf::from(bad));
+            let err = cfg
+                .validate()
+                .expect_err(&format!("git_mirror_host_path={bad:?} must be rejected"))
+                .to_string();
+            assert!(err.contains("runner.git_mirror_host_path"), "{err}");
+        }
+
+        let mut ok_cfg = valid_config();
+        ok_cfg.runner.git_mirror_host_path = Some(PathBuf::from("/var/cache/ezgha/git-mirrors"));
+        ok_cfg
+            .validate()
+            .expect("absolute git_mirror_host_path must be accepted");
     }
 }

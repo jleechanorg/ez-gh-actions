@@ -3881,6 +3881,21 @@ fn start_one_with_generate_at_slot(
     cmd.args(["--cpus", &format!("{:.2}", cpus)]);
     cmd.args(["--pids-limit", &format!("{}", cfg.limits.pids)]);
     cmd.args(["--security-opt", "no-new-privileges"]);
+    // Bead jleechan-5khv: Docker's built-in seccomp profile denies
+    // clone(CLONE_NEWUSER), so any CI step that isolates itself with
+    // `unshare -Urn` dies with `Operation not permitted` on BOTH fleets --
+    // including the host where AppArmor is entirely disabled, which rules
+    // AppArmor out and leaves seccomp as the common denial. Both opt-ins are
+    // off by default: the hardened profile stays in place unless an operator
+    // deliberately widens it.
+    if let Some(profile) = &cfg.limits.seccomp_profile {
+        // Narrower route wins. A custom profile can allow clone(CLONE_NEWUSER)
+        // while keeping every other default denial, so it must never be
+        // silently replaced by `seccomp=unconfined`.
+        cmd.args(["--security-opt", &format!("seccomp={profile}")]);
+    } else if cfg.limits.allow_userns {
+        cmd.args(["--security-opt", "seccomp=unconfined"]);
+    }
     if let Some(parent) = &cfg.limits.cgroup_parent {
         cmd.args(["--cgroup-parent", parent]);
     }
@@ -3912,6 +3927,15 @@ fn start_one_with_generate_at_slot(
                 &format!("{}:/home/runner/.cache/pip", pip_cache.display()),
             ]);
             cmd.args(["-e", "PIP_CACHE_DIR=/home/runner/.cache/pip"]);
+        }
+    }
+    if let Some(git_mirrors) = &cfg.runner.git_mirror_host_path {
+        if std::path::Path::new(git_mirrors).is_dir() {
+            cmd.args([
+                "-v",
+                &format!("{}:/opt/ezgha-git-mirrors:ro", git_mirrors.display()),
+            ]);
+            cmd.args(["-e", "EZGHA_GIT_MIRRORS=/opt/ezgha-git-mirrors"]);
         }
     }
     // Opt-in per-runner job workspace (bead jleechan-93cf): read-write mount
@@ -10367,6 +10391,81 @@ esac
     }
 
     #[test]
+    fn git_mirror_mount_emits_ro_bind_and_env_when_dir_exists() {
+        let _env = TestEnv::new("git_mirror_mount_present");
+        cpu_probe_overrides::set(Some(true));
+        let mut cfg = cfg_with(2, "ez-org-runner");
+        let temp_dir =
+            env::temp_dir().join(format!("ezgha-git-mirror-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let dir = temp_dir.join("mirrors");
+        std::fs::create_dir_all(&dir).unwrap();
+        cfg.runner.git_mirror_host_path = Some(dir.clone());
+
+        let capture = temp_dir.join("docker-args.log");
+        let script = fake_docker_capturing_args(&temp_dir, &capture);
+        *TEST_DOCKER_BIN.lock().unwrap() = Some(script.to_string_lossy().into_owned());
+
+        start_one_with_generate(&cfg, Backend::Docker, |_gh, _name, _labels, _owned| {
+            Ok(("jit".into(), 2223))
+        })
+        .expect("start_one should succeed");
+
+        let logged = std::fs::read_to_string(&capture).unwrap();
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let run_line = logged
+            .lines()
+            .find(|l| l.contains("run "))
+            .expect("a docker run invocation should have been logged");
+        assert!(
+            run_line.contains(&format!("{}:/opt/ezgha-git-mirrors:ro", dir.display())),
+            "run args should mount configured git_mirror_host_path read-only; got: {run_line}"
+        );
+        assert!(
+            run_line.contains("-e EZGHA_GIT_MIRRORS=/opt/ezgha-git-mirrors"),
+            "run args should set EZGHA_GIT_MIRRORS; got: {run_line}"
+        );
+    }
+
+    #[test]
+    fn git_mirror_mount_skipped_when_dir_missing() {
+        let _env = TestEnv::new("git_mirror_mount_missing_fail_open");
+        cpu_probe_overrides::set(Some(true));
+        let mut cfg = cfg_with(2, "ez-org-runner");
+        let temp_dir = env::temp_dir().join(format!(
+            "ezgha-git-mirror-missing-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let missing_mirrors = temp_dir.join("missing-mirrors");
+        cfg.runner.git_mirror_host_path = Some(missing_mirrors);
+
+        let capture = temp_dir.join("docker-args.log");
+        let script = fake_docker_capturing_args(&temp_dir, &capture);
+        *TEST_DOCKER_BIN.lock().unwrap() = Some(script.to_string_lossy().into_owned());
+
+        start_one_with_generate(&cfg, Backend::Docker, |_gh, _name, _labels, _owned| {
+            Ok(("jit".into(), 2224))
+        })
+        .expect("start_one should succeed even when git_mirror_host_path is missing");
+
+        let logged = std::fs::read_to_string(&capture).unwrap();
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let run_line = logged
+            .lines()
+            .find(|l| l.contains("run "))
+            .expect("a docker run invocation should have been logged");
+        assert!(
+            !run_line.contains("/opt/ezgha-git-mirrors"),
+            "a missing git_mirror_host_path must not be mounted (fail-open); got: {run_line}"
+        );
+        assert!(
+            !run_line.contains("EZGHA_GIT_MIRRORS"),
+            "a missing git_mirror_host_path must not set EZGHA_GIT_MIRRORS (fail-open); got: {run_line}"
+        );
+    }
+
+    #[test]
     fn workspace_mount_added_when_configured_root_exists() {
         let _env = TestEnv::new("workspace_mount_present");
         cpu_probe_overrides::set(Some(true));
@@ -10491,6 +10590,99 @@ esac
              workspace mount so /usr/local/bin/tar knows to guard extractions; \
              got: {run_line}"
         );
+    }
+
+    /// Bead jleechan-5khv: a CI step that isolates itself with `unshare -Urn`
+    /// fails `Operation not permitted` inside runner containers because
+    /// Docker's built-in seccomp profile denies clone(CLONE_NEWUSER). Proven
+    /// on both fleets, with AppArmor disabled on one -- so seccomp, not the
+    /// LSM, is the common denial. These three cases pin the contract: the
+    /// hardened default is untouched, an explicit profile is emitted, and an
+    /// explicit profile always wins over `allow_userns`.
+    #[test]
+    fn userns_seccomp_flags_are_opt_in_and_narrow_profile_wins() {
+        fn run_args_for(cfg: &crate::config::Config, tag: &str) -> String {
+            // NOTE: the fake docker helper writes this path into a shell script
+            // unquoted, so the directory name must be shell-safe -- no `{:?}`
+            // of a ThreadId (it renders as `ThreadId(2)` and breaks the script).
+            let temp_dir = env::temp_dir().join(format!(
+                "ezgha-userns-seccomp-{}-{}",
+                std::process::id(),
+                tag
+            ));
+            std::fs::create_dir_all(&temp_dir).unwrap();
+            let capture = temp_dir.join("docker-args.log");
+            let script = fake_docker_capturing_args(&temp_dir, &capture);
+            *TEST_DOCKER_BIN.lock().unwrap() = Some(script.to_string_lossy().into_owned());
+            start_one_with_generate(cfg, Backend::Docker, |_gh, _name, _labels, _owned| {
+                Ok(("jit".into(), 7_777))
+            })
+            .expect("start_one should succeed");
+            let logged = std::fs::read_to_string(&capture).unwrap();
+            logged
+                .lines()
+                .find(|l| l.contains("run "))
+                .expect("a docker run invocation should have been logged")
+                .to_string()
+        }
+
+        // 1. Default: hardened profile, no unconfined, no custom seccomp.
+        {
+            let _env = TestEnv::new("seccomp_default_hardened");
+            const CASE: &str = "default-hardened";
+            cpu_probe_overrides::set(Some(true));
+            let cfg = cfg_with(1, "ez-org-runner");
+            let args = run_args_for(&cfg, CASE);
+            assert!(
+                args.contains("--security-opt no-new-privileges"),
+                "no-new-privileges must stay by default; got: {args}"
+            );
+            assert!(
+                !args.contains("seccomp=unconfined"),
+                "seccomp must NOT be relaxed by default; got: {args}"
+            );
+            assert!(
+                !args.contains("seccomp="),
+                "no seccomp profile should be passed by default; got: {args}"
+            );
+        }
+
+        // 2. allow_userns alone -> the deliberate unconfined relaxation.
+        {
+            let _env = TestEnv::new("seccomp_allow_userns");
+            const CASE: &str = "allow-userns";
+            cpu_probe_overrides::set(Some(true));
+            let mut cfg = cfg_with(1, "ez-org-runner");
+            cfg.limits.allow_userns = true;
+            let args = run_args_for(&cfg, CASE);
+            assert!(
+                args.contains("--security-opt seccomp=unconfined"),
+                "allow_userns should request seccomp=unconfined; got: {args}"
+            );
+            assert!(
+                args.contains("--security-opt no-new-privileges"),
+                "no-new-privileges must survive the relaxation; got: {args}"
+            );
+        }
+
+        // 3. A custom profile is narrower than unconfined and must win.
+        {
+            let _env = TestEnv::new("seccomp_custom_profile_wins");
+            const CASE: &str = "custom-profile";
+            cpu_probe_overrides::set(Some(true));
+            let mut cfg = cfg_with(1, "ez-org-runner");
+            cfg.limits.allow_userns = true;
+            cfg.limits.seccomp_profile = Some("/etc/ezgha/userns.json".into());
+            let args = run_args_for(&cfg, CASE);
+            assert!(
+                args.contains("--security-opt seccomp=/etc/ezgha/userns.json"),
+                "the explicit profile must be emitted; got: {args}"
+            );
+            assert!(
+                !args.contains("seccomp=unconfined"),
+                "an explicit profile must never be widened to unconfined; got: {args}"
+            );
+        }
     }
 
     #[test]

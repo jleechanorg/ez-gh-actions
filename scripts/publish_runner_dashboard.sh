@@ -249,20 +249,110 @@ build_site() {
     else
       QUEUE_PROBE_CMD=(python3 "$SCRIPT_DIR/queue_probe.py")
     fi
-    if ! timeout "${EZGHA_DASHBOARD_QUEUE_TIMEOUT:-240}" \
+    QUEUE_MAX_REQUESTS="${EZGHA_DASHBOARD_QUEUE_MAX_REQUESTS:-80}"
+    if [[ "$QUEUE_MAX_REQUESTS" =~ ^0*([0-9]+)$ ]]; then
+      QUEUE_MAX_REQUESTS="${BASH_REMATCH[1]}"
+      if (( ${#QUEUE_MAX_REQUESTS} > 9 )) || (( 10#$QUEUE_MAX_REQUESTS > 80 )); then
+        QUEUE_MAX_REQUESTS=80
+      elif (( 10#$QUEUE_MAX_REQUESTS < 1 )); then
+        QUEUE_MAX_REQUESTS=1
+      else
+        QUEUE_MAX_REQUESTS=$(( 10#$QUEUE_MAX_REQUESTS ))
+      fi
+    else
+      QUEUE_MAX_REQUESTS=80
+    fi
+    queue_rc=0
+    timeout "${EZGHA_DASHBOARD_QUEUE_TIMEOUT:-240}" \
         "${QUEUE_PROBE_CMD[@]}" \
         --repo jleechanorg/worldarchitect.ai \
         --repo jleechanorg/worldai_frontend \
-        --output "$WORK_DIR/queue.json"; then
-      echo "queue probe failed; publishing capacity with queue unavailable" >&2
+        --max-requests "$QUEUE_MAX_REQUESTS" \
+        --output "$WORK_DIR/queue.json" || queue_rc=$?
+    if [[ -s "$WORK_DIR/queue.json" ]] && python3 - "$WORK_DIR/queue.json" >/dev/null 2>&1 <<'PY'
+import json, math, sys
+from pathlib import Path
+def _reject(token):
+    raise ValueError(token)
+def _finite_float(s):
+    v = float(s)
+    if not math.isfinite(v):
+        raise ValueError(s)
+    return v
+try:
+    doc = json.loads(
+        Path(sys.argv[1]).read_text(encoding="utf-8"),
+        parse_constant=_reject,
+        parse_float=_finite_float,
+    )
+except (OSError, UnicodeDecodeError, ValueError):
+    sys.exit(1)
+if not isinstance(doc, dict) or type(doc.get("schema_version")) is not int or doc["schema_version"] != 1:
+    sys.exit(1)
+raw = doc.get("queue") if isinstance(doc.get("queue"), dict) else doc
+repos = raw.get("repos")
+if not isinstance(repos, list) or not all(isinstance(item, dict) for item in repos):
+    sys.exit(1)
+PY
+    then
+      if (( queue_rc != 0 )); then
+        python3 - "$WORK_DIR/queue.json" <<'PY'
+import json, sys
+from pathlib import Path
+p = Path(sys.argv[1])
+doc = json.loads(p.read_text(encoding="utf-8"))
+doc["ok"] = False
+doc["partial"] = True
+if isinstance(doc.get("queue"), dict):
+    doc["queue"]["ok"] = False
+    doc["queue"]["partial"] = True
+p.write_text(json.dumps(doc), encoding="utf-8")
+PY
+        echo "queue probe exited non-zero with partial payload; preserving diagnostics" >&2
+      fi
+    elif [[ -e "$WORK_DIR/queue.json" ]] || (( queue_rc != 0 )); then
+      # Keep the uncertainty: the builder maps repos:null to queue.ok=false, partial=true.
+      printf '{"schema_version":1,"ok":false,"partial":true,"repos":null}\n' > "$WORK_DIR/queue.json"
+      echo "queue probe invalid or failed; publishing capacity with queue unavailable (partial)" >&2
     fi
   fi
   queue_args=()
   [[ -s "$WORK_DIR/queue.json" ]] && queue_args=(--queue "$WORK_DIR/queue.json")
+  if [[ "${EZGHA_DASHBOARD_LATENCY_PROBE:-1}" != "0" ]]; then
+    if [[ -n "${EZGHA_DASHBOARD_LATENCY_PROBE_CMD:-}" ]]; then
+      read -r -a LATENCY_PROBE_CMD <<< "$EZGHA_DASHBOARD_LATENCY_PROBE_CMD"
+    else
+      LATENCY_PROBE_CMD=(python3 "$SCRIPT_DIR/ci_latency_probe.py")
+    fi
+    if ! timeout "${EZGHA_DASHBOARD_LATENCY_TIMEOUT:-120}" \
+        "${LATENCY_PROBE_CMD[@]}" \
+        --repo jleechanorg/worldarchitect.ai \
+        --repo jleechanorg/worldai_frontend \
+        --limit 30 \
+        --job-run-limit 20 \
+        --output "$WORK_DIR/latency.json"; then
+      rm -f "$WORK_DIR/latency.json"
+      echo "latency probe failed; publishing capacity with latency unavailable" >&2
+    fi
+  fi
+  latency_args=()
+  [[ -s "$WORK_DIR/latency.json" ]] && latency_args=(--latency "$WORK_DIR/latency.json")
+  cmux_args=()
+  if [[ -n "${EZGHA_DASHBOARD_CMUX_PROBE_CMD:-}" ]]; then
+    read -r -a CMUX_PROBE_CMD <<< "$EZGHA_DASHBOARD_CMUX_PROBE_CMD"
+    if ! timeout "${EZGHA_DASHBOARD_CMUX_TIMEOUT:-60}" \
+        "${CMUX_PROBE_CMD[@]}" > "$WORK_DIR/cmux.json"; then
+      rm -f "$WORK_DIR/cmux.json"
+      echo "cmux probe failed; publishing capacity without cmux pool" >&2
+    fi
+    [[ -s "$WORK_DIR/cmux.json" ]] && cmux_args=(--cmux "$WORK_DIR/cmux.json")
+  fi
   python3 "$SNAPSHOT_BUILDER" \
     --mac-host "$WORK_DIR/mac.json" \
     --linux-host "$WORK_DIR/linux.json" \
-    "${queue_args[@]}" \
+    ${queue_args[@]+"${queue_args[@]}"} \
+    ${latency_args[@]+"${latency_args[@]}"} \
+    ${cmux_args[@]+"${cmux_args[@]}"} \
     --observed-at "$observed_at" \
     --published-at "$published_at" \
     --output "$output_dir/status.json"

@@ -115,18 +115,64 @@ if [[ -z "$EZGHA_BIN" ]]; then
     fail "cargo test --no-run failed (binary won't compile; patch missing?)"
   fi
   # Locate the freshly-built test binary under the (possibly override)
-  # target directory. cargo emits the path in its build summary; fall
-  # back to a glob.
+  # target directory. Cargo 1.9x (`build-dir`) emits unit-test binaries
+  # under `target/debug/build/<pkg>/<hash>/out/ezgha-<hash>` rather than
+  # `target/debug/deps/ezgha-<hash>`; query Cargo's JSON artifact stream
+  # and `Executable unittests (...)` output first, then fall back to
+  # executable regular files in both layouts.
   TARGET_DIR="${CARGO_TARGET_DIR:-$REPO_ROOT/target}"
-  # shellcheck disable=SC2010  # ls+grep is intentional: cargo emits
-  # binaries like ezgha-277d5c377f378c21 (no fixed suffix); the simple
-  # glob `ezgha-*` matches the binary AND its `.d` dep-info file. ls
-  # sorted by mtime (newest first) gives us the most-recently-built
-  # test binary, which is what the next `cargo test` invocation will
-  # reuse -- the one we just compiled in `--no-run`.
-  EZGHA_BIN="$(ls -t "$TARGET_DIR/debug/deps/ezgha-"* 2>/dev/null | grep -v '\.d$' | head -n1 || true)"
-  if [[ -z "$EZGHA_BIN" || ! -x "$EZGHA_BIN" ]]; then
-    fail "could not locate a built ezgha test binary under $TARGET_DIR/debug/deps/"
+  EZGHA_BIN=""
+  if command -v python3 >/dev/null 2>&1; then
+    EZGHA_BIN="$(
+      CARGO_JSON_OUT="$(cargo test --bin ezgha --no-run --message-format=json 2>/dev/null || true)" \
+      CARGO_TEXT_OUT="$CARGO_TEST_OUTPUT" \
+      REPO_ROOT_ENV="$REPO_ROOT" \
+      python3 - <<'PY'
+import json, os, re
+
+repo_root = os.environ["REPO_ROOT_ENV"]
+candidates = []
+for raw in os.environ.get("CARGO_JSON_OUT", "").splitlines():
+    raw = raw.strip()
+    if not raw.startswith("{"):
+        continue
+    try:
+        msg = json.loads(raw)
+    except ValueError:
+        continue
+    exe = msg.get("executable")
+    target = msg.get("target") or {}
+    profile = msg.get("profile") or {}
+    if msg.get("reason") == "compiler-artifact" and exe and target.get("name") == "ezgha" and profile.get("test"):
+        candidates.append(exe)
+
+for m in re.finditer(r"Executable unittests [^\n]*\(([^)\n]+)\)", os.environ.get("CARGO_TEXT_OUT", "")):
+    p = m.group(1).strip()
+    candidates.append(p if os.path.isabs(p) else os.path.join(repo_root, p))
+
+for c in reversed(candidates):
+    if os.path.isfile(c) and os.access(c, os.X_OK):
+        print(c)
+        break
+PY
+    )"
+  fi
+  if [[ -z "$EZGHA_BIN" || ! -f "$EZGHA_BIN" || ! -x "$EZGHA_BIN" ]]; then
+    newest_mtime=-1
+    for cand in \
+      "$TARGET_DIR"/debug/deps/ezgha-* \
+      "$TARGET_DIR"/debug/build/*/out/ezgha-* \
+      "$TARGET_DIR"/debug/build/*/*/out/ezgha-*; do
+      [[ -f "$cand" && -x "$cand" && "$cand" != *.d ]] || continue
+      mtime="$(python3 -c 'import os,sys; print(int(os.stat(sys.argv[1]).st_mtime_ns))' "$cand" 2>/dev/null || echo 0)"
+      if (( mtime > newest_mtime )); then
+        newest_mtime="$mtime"
+        EZGHA_BIN="$cand"
+      fi
+    done
+  fi
+  if [[ -z "$EZGHA_BIN" || ! -f "$EZGHA_BIN" || ! -x "$EZGHA_BIN" ]]; then
+    fail "could not locate a built ezgha test binary under $TARGET_DIR (checked cargo JSON/output, debug/deps/, and debug/build/**/out/)"
   fi
 fi
 log "Using ezgha test binary: $EZGHA_BIN"

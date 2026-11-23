@@ -4,6 +4,8 @@ set -uo pipefail
 
 HOST_CLASS=""
 SERVICE_STATE_ONLY=false
+FORCE_PARKED=false
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --host-class)
@@ -14,8 +16,12 @@ while [[ $# -gt 0 ]]; do
       SERVICE_STATE_ONLY=true
       shift
       ;;
+    --parked)
+      FORCE_PARKED=true
+      shift
+      ;;
     -h|--help)
-      echo "usage: $0 --host-class mac|linux | --service-state"
+      echo "usage: $0 --host-class mac|linux [--parked] | --service-state"
       exit 0
       ;;
     *)
@@ -37,7 +43,7 @@ STATE_STALE_SECONDS="${EZGHA_WATCHDOG_STATE_STALE_SECONDS:-480}"
 RESPAWN_EVIDENCE_WINDOW_MIN="${EZGHA_DASHBOARD_RESPAWN_WINDOW_MIN:-3}"
 
 read_config() {
-  python3 - "$CONFIG_FILE" <<'PY'
+  python3 - "$CONFIG_FILE" "${1:-0}" <<'PY'
 import sys
 try:
     import tomllib
@@ -47,7 +53,9 @@ try:
     prefix = config["runner"]["name_prefix"]
     image = config["runner"]["image"]
     disk_floor = config["limits"]["min_free_disk_gb"]
-    if type(count) is not int or count <= 0:
+    allow_zero = len(sys.argv) > 2 and sys.argv[2] == "1"
+    min_count = 0 if allow_zero else 1
+    if type(count) is not int or count < min_count:
         raise ValueError("invalid runner.count")
     if not isinstance(prefix, str) or not prefix:
         raise ValueError("invalid runner.name_prefix")
@@ -174,11 +182,27 @@ recent_respawn_evidence() {
   grep -q "respawned ephemeral runner $name$" <<<"$logs"
 }
 
+PARKED=false
+PARKED_REASON=""
+PARKED_SLOTS=0
+if [[ "$FORCE_PARKED" == true ]]; then
+  PARKED=true
+elif [[ "$HOST_CLASS" == "mac" && ( "${MAC_RUNNER_DISABLED:-0}" == "1" || "${EZGHA_DASHBOARD_MAC_DISABLED:-0}" == "1" ) ]]; then
+  PARKED=true
+elif [[ "$HOST_CLASS" == "linux" && "${REMOTE_LINUX_DISABLED:-0}" == "1" ]]; then
+  PARKED=true
+fi
+
+ALLOW_ZERO_COUNT=0
+if [[ "$PARKED" == true && "$HOST_CLASS" == "mac" ]]; then
+  ALLOW_ZERO_COUNT=1
+fi
+
 CONFIG_OK=false
 TARGET=""
 PREFIX=""
 DISK_FLOOR_GB=""
-config_output="$(read_config 2>/dev/null || true)"
+config_output="$(read_config "$ALLOW_ZERO_COUNT" 2>/dev/null || true)"
 if [[ "$(printf '%s\n' "$config_output" | awk 'NF { count++ } END { print count + 0 }')" -eq 3 ]]; then
   TARGET="$(printf '%s\n' "$config_output" | sed -n '1p')"
   PREFIX="$(printf '%s\n' "$config_output" | sed -n '2p')"
@@ -196,7 +220,55 @@ IDLE=""
 CYCLING=""
 DOWN=""
 RESERVED=""
-if [[ "$CONFIG_OK" == true ]] && command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+SLOTS_META=""
+
+slot_phase_and_elapsed() {
+  local name="$1" state="$2" detail_table=""
+  if [[ "$state" != "EXECUTING" ]]; then
+    printf '\t\n'
+    return 0
+  fi
+  detail_table="$(docker top "$name" -eo pid,etimes,comm,args 2>/dev/null || true)"
+  python3 - "$detail_table" "$SCRIPT_DIR" <<'PY'
+import sys
+
+table = sys.argv[1]
+sys.path.insert(0, sys.argv[2])
+import ci_latency_probe
+
+elapsed_s = None
+phase = ""
+for line in table.splitlines()[1:]:
+    parts = line.strip().split(None, 3)
+    if len(parts) < 3:
+        continue
+    if "Runner.Worker" in line and parts[1].isdigit():
+        elapsed_s = int(parts[1])
+    rest = parts[3] if len(parts) == 4 else parts[2]
+    matched = ci_latency_probe.classify_phase(rest)
+    if matched:
+        phase = matched
+elapsed_min = round(elapsed_s / 60.0, 1) if elapsed_s is not None else ""
+print(f"{elapsed_min}\t{phase}")
+PY
+}
+
+if [[ "$PARKED" == true && "$CONFIG_OK" == true ]]; then
+  PARKED_REASON="operator_disabled"
+  PARKED_SLOTS="$TARGET"
+  # Keep service/docker/process probes truthful: do not mark unexecuted checks ok.
+  if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+    DOCKER_OK=true
+  fi
+  EXECUTING=0
+  IDLE=0
+  CYCLING=0
+  DOWN=0
+  RESERVED=0
+  for ((slot=1; slot<=TARGET; slot++)); do
+    SLOTS_META+="${slot}|PARKED||operator_disabled"$'\n'
+  done
+elif [[ "$CONFIG_OK" == true ]] && command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
   DOCKER_OK=true
   PROCESS_OK=true
   EXECUTING=0
@@ -207,32 +279,53 @@ if [[ "$CONFIG_OK" == true ]] && command -v docker >/dev/null 2>&1 && docker inf
   [[ "$RESERVED" =~ ^[0-9]+$ ]] || RESERVED=""
 
   down_candidates=()
+  declare -a slot_states=()
+  declare -a slot_elapsed=()
+  declare -a slot_phase=()
   for ((slot=1; slot<=TARGET; slot++)); do
     name="${PREFIX}-${slot}"
     if ! state="$(classify_slot "$name")"; then
       PROCESS_OK=false
       break
     fi
+    slot_states[slot]="$state"
+    slot_elapsed[slot]=""
+    slot_phase[slot]=""
     case "$state" in
-      EXECUTING) EXECUTING=$((EXECUTING + 1)) ;;
+      EXECUTING)
+        EXECUTING=$((EXECUTING + 1))
+        meta="$(slot_phase_and_elapsed "$name" "EXECUTING" 2>/dev/null || true)"
+        slot_elapsed[slot]="${meta%%$'\t'*}"
+        slot_phase[slot]="${meta#*$'\t'}"
+        ;;
       IDLE) IDLE=$((IDLE + 1)) ;;
-      DOWN) down_candidates+=("$name") ;;
+      DOWN) down_candidates+=("$slot:$name") ;;
     esac
   done
 
   if [[ "$PROCESS_OK" == true && "${#down_candidates[@]}" -gt 0 ]]; then
     sleep "$DOWN_WAIT_SECONDS"
-    for name in "${down_candidates[@]}"; do
+    for entry in "${down_candidates[@]}"; do
+      slot="${entry%%:*}"
+      name="${entry#*:}"
       if ! state="$(classify_slot "$name")"; then
         PROCESS_OK=false
         break
       fi
+      slot_states[slot]="$state"
       case "$state" in
-        EXECUTING) EXECUTING=$((EXECUTING + 1)) ;;
+        EXECUTING)
+          EXECUTING=$((EXECUTING + 1))
+          meta="$(slot_phase_and_elapsed "$name" "EXECUTING" 2>/dev/null || true)"
+          slot_elapsed[slot]="${meta%%$'\t'*}"
+          slot_phase[slot]="${meta#*$'\t'}"
+          ;;
         IDLE) IDLE=$((IDLE + 1)) ;;
         DOWN)
           if recent_respawn_evidence "$name"; then
             CYCLING=$((CYCLING + 1))
+            slot_states[slot]="CYCLING"
+            slot_phase[slot]="respawning"
           else
             DOWN=$((DOWN + 1))
           fi
@@ -240,13 +333,20 @@ if [[ "$CONFIG_OK" == true ]] && command -v docker >/dev/null 2>&1 && docker inf
       esac
     done
   fi
+
+  if [[ "$PROCESS_OK" == true ]]; then
+    for ((slot=1; slot<=TARGET; slot++)); do
+      SLOTS_META+="${slot}|${slot_states[$slot]}|${slot_elapsed[$slot]}|${slot_phase[$slot]}"$'\n'
+    done
+  fi
 fi
 
-if [[ "$PROCESS_OK" != true ]]; then
+if [[ "$PARKED" != true && "$PROCESS_OK" != true ]]; then
   EXECUTING=""
   IDLE=""
   CYCLING=""
   DOWN=""
+  SLOTS_META=""
 fi
 
 DISK_OK=false
@@ -268,7 +368,7 @@ if [[ "$CONFIG_OK" == true ]]; then
     # not gate admission and this dashboard does not need to mirror.
   fi
   DAEMON_DISK_CONTAINER=""
-  if [[ "$DOCKER_OK" == true ]]; then
+  if [[ "$DOCKER_OK" == true && "$PARKED" != true ]]; then
     for ((slot=1; slot<=TARGET; slot++)); do
       candidate="${PREFIX}-${slot}"
       if [[ "$(docker inspect -f '{{.State.Running}}' "$candidate" 2>/dev/null || true)" == "true" ]]; then
@@ -296,6 +396,24 @@ if [[ "$CONFIG_OK" == true ]]; then
     else
       DISK_STATUS="critical"
     fi
+  elif [[ "$PARKED" == true && "$HOST_FREE_KB" =~ ^[0-9]+$ ]]; then
+    DISK_OK=true
+    if (( HOST_FREE_KB >= HOST_DISK_FLOOR_GB * 1024 * 1024 )); then
+      DISK_STATUS="healthy"
+    else
+      DISK_STATUS="critical"
+    fi
+  fi
+fi
+
+PAUSE_REASON=""
+if [[ "$PARKED" != true && "$DISK_STATUS" == "critical" && "${DOWN:-0}" =~ ^[0-9]+$ && "${DOWN:-0}" -gt 0 ]]; then
+  if [[ "$(uname -s)" == "Linux" ]] && \
+      journalctl --user -u ezgha.service --since "$RESPAWN_EVIDENCE_WINDOW_MIN minutes ago" --no-pager 2>/dev/null \
+        | grep -q "refusing to spawn runners"; then
+    PAUSE_REASON="disk_floor_paused"
+  else
+    PAUSE_REASON="disk_critical_with_down"
   fi
 fi
 
@@ -323,6 +441,8 @@ fi
 
 HOST_CLASS="$HOST_CLASS" TARGET="$TARGET" EXECUTING="$EXECUTING" IDLE="$IDLE" \
 CYCLING="$CYCLING" DOWN="$DOWN" RESERVED="$RESERVED" DISK_STATUS="$DISK_STATUS" \
+PARKED="$PARKED" PARKED_SLOTS="$PARKED_SLOTS" PARKED_REASON="$PARKED_REASON" \
+PAUSE_REASON="$PAUSE_REASON" SLOTS_META="$SLOTS_META" \
 WATCHDOG_MISSES="$WATCHDOG_MISSES" WATCHDOG_THRESHOLD="$WATCHDOG_THRESHOLD" \
 CONFIG_OK="$CONFIG_OK" SERVICE_OK="$SERVICE_OK" \
 DOCKER_OK="$DOCKER_OK" PROCESS_OK="$PROCESS_OK" DISK_OK="$DISK_OK" WATCHDOG_OK="$WATCHDOG_OK" \
@@ -334,9 +454,34 @@ def count(name):
     value = os.environ.get(name, "")
     return int(value) if value.isdigit() else None
 
+host_class = os.environ["HOST_CLASS"]
+pause_reason = os.environ.get("PAUSE_REASON") or None
+slots = []
+for raw in os.environ.get("SLOTS_META", "").splitlines():
+    if not raw.strip():
+        continue
+    parts = raw.split("|")
+    if len(parts) < 4:
+        continue
+    slot_num = int(parts[0])
+    state = parts[1]
+    elapsed = float(parts[2]) if parts[2] else None
+    phase = parts[3] or (pause_reason if state == "DOWN" and pause_reason else None)
+    slots.append({
+        "slot_id": f"{host_class}-{slot_num}",
+        "slot": slot_num,
+        "state": state,
+        "elapsed_minutes": elapsed,
+        "phase_badge": phase,
+    })
+
 payload = {
     "schema_version": 1,
-    "host_class": os.environ["HOST_CLASS"],
+    "host_class": host_class,
+    "parked": os.environ["PARKED"] == "true",
+    "parked_slots": count("PARKED_SLOTS") or 0,
+    "parked_reason": os.environ.get("PARKED_REASON") or None,
+    "pause_reason": pause_reason,
     "sources": {
         "config": {"ok": os.environ["CONFIG_OK"] == "true"},
         "service": {"ok": os.environ["SERVICE_OK"] == "true"},
@@ -358,6 +503,7 @@ payload = {
         "consecutive_misses": count("WATCHDOG_MISSES"),
         "restart_after": count("WATCHDOG_THRESHOLD"),
     },
+    "slots": slots,
 }
 print(json.dumps(payload, sort_keys=True))
 PY
