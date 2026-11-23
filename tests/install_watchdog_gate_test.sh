@@ -14,11 +14,12 @@
 # Usage: bash tests/install_watchdog_gate_test.sh
 
 set -euo pipefail
+unset BASH_ENV
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 INSTALL_SCRIPT="${INSTALL_SCRIPT:-${REPO_ROOT}/install.sh}"
 
-WORK=$(mktemp -d)
+WORK=$(mktemp -d /tmp/ezgha-wd.XXXXXX)
 trap 'rm -rf "${WORK}"' EXIT
 
 PASS=true

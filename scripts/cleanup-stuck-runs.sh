@@ -40,6 +40,13 @@
 #   UNSCHED_MIN_AGE_MIN=15                     # only report unschedulable runs queued at least this long
 set -euo pipefail
 
+if [[ -z "${GH_TOKEN:-}" && -n "${HOME:-}" && -f "${HOME}/.config/ezgha/gh_token" && -r "${HOME}/.config/ezgha/gh_token" ]]; then
+  ezgha_tok="$(<"${HOME}/.config/ezgha/gh_token")" 2>/dev/null || ezgha_tok=""
+  if [[ -n "$ezgha_tok" ]]; then
+    export GH_TOKEN="$ezgha_tok"
+  fi
+fi
+
 DEFAULT_QUEUE_REPOS="jleechanorg/worldarchitect.ai jleechanorg/ai_universe jleechanorg/worldai_claw jleechanorg/mctrl_test jleechanorg/jleechanclaw jleechanorg/ai_universe_living_blog jleechanorg/agent-orchestrator jleechanorg/dark-factory jleechanorg/ez-gh-actions jleechanorg/user_scope"
 QUEUE_REPOS="${QUEUE_REPOS:-${QUEUE_REPO:-$DEFAULT_QUEUE_REPOS}}"
 STALE_HOURS="${STALE_HOURS:-8}"
