@@ -133,15 +133,26 @@ for field in ("wheelhouse_host_path", "git_mirror_host_path"):
             f"FAIL: runner.{field} must be an absolute path without leading '~' (got {val!r})"
         )
 
+npm_val = runner.get("npm_cache_host_path")
+if npm_val is not None:
+    if not isinstance(npm_val, str) or not npm_val.strip():
+        raise SystemExit(f"FAIL: runner.npm_cache_host_path must not be empty in {path}")
+    if npm_val != npm_val.strip() or npm_val.startswith("~") or not os.path.isabs(npm_val):
+        raise SystemExit(
+            f"FAIL: runner.npm_cache_host_path must be an absolute path without leading '~' (got {npm_val!r})"
+        )
+
 print(runner["wheelhouse_host_path"])
 print(runner["git_mirror_host_path"])
 print(str(runner.get("image") or "ezgha-runner:latest").strip() or "ezgha-runner:latest")
+print(npm_val or "")
 PY
 )"
 
 WHEELHOUSE_PATH="$(printf '%s\n' "${PARSED_INFO}" | sed -n '1p')"
 GIT_MIRROR_PATH="$(printf '%s\n' "${PARSED_INFO}" | sed -n '2p')"
 RUNNER_IMAGE="$(printf '%s\n' "${PARSED_INFO}" | sed -n '3p')"
+NPM_CACHE_PATH="$(printf '%s\n' "${PARSED_INFO}" | sed -n '4p')"
 [ -n "${RUNNER_IMAGE}" ] || RUNNER_IMAGE="ezgha-runner:latest"
 
 [ -n "${WHEELHOUSE_PATH}" ] && [ -d "${WHEELHOUSE_PATH}" ] \
@@ -173,10 +184,16 @@ if [ "${PLATFORM}" = "macos" ] && [ -z "${DOCKER_HOST:-}" ] && [ ! -S /var/run/d
 fi
 docker info --format '{{.ServerVersion}}' >/dev/null || { echo "FAIL: docker daemon unreachable" >&2; exit 1; }
 
+DOCKER_EXTRA_ARGS=()
+if [ -n "${NPM_CACHE_PATH}" ] && [ -d "${NPM_CACHE_PATH}" ]; then
+  DOCKER_EXTRA_ARGS+=(-v "${NPM_CACHE_PATH}:/opt/ezgha-npm-cache:ro" -e EZGHA_NPM_CACHE=/opt/ezgha-npm-cache)
+fi
+
 CONTAINER_OUTPUT="$(
   docker run --rm \
     -v "${WHEELHOUSE_PATH}:/opt/wheelhouse:ro" \
     -v "${GIT_MIRROR_PATH}:/opt/ezgha-git-mirrors:ro" \
+    "${DOCKER_EXTRA_ARGS[@]+"${DOCKER_EXTRA_ARGS[@]}"}" \
     -e PIP_FIND_LINKS=/opt/wheelhouse \
     -e EZGHA_GIT_MIRRORS=/opt/ezgha-git-mirrors \
     -e VERIFY_REPO="${VERIFY_REPO}" \
@@ -212,6 +229,21 @@ for line in open(\"/proc/net/dev\"):
       python3 -m venv /tmp/v
       /tmp/v/bin/pip install --quiet "${PKGS[@]}"
       /tmp/v/bin/python -m playwright install chromium
+      tool_arch="$(uname -m)"
+      case "${tool_arch}" in
+        x86_64|amd64) tool_arch="x64" ;;
+        aarch64|arm64) tool_arch="arm64" ;;
+      esac
+      test -f "/opt/hostedtoolcache/node/20.20.2/${tool_arch}.complete"
+      "/opt/hostedtoolcache/node/20.20.2/${tool_arch}/bin/node" --version >/dev/null
+      test -f "/opt/hostedtoolcache/node/22.22.0/${tool_arch}.complete"
+      "/opt/hostedtoolcache/node/22.22.0/${tool_arch}/bin/node" --version >/dev/null
+      test -f "/opt/hostedtoolcache/Python/3.12.16/${tool_arch}.complete"
+      "/opt/hostedtoolcache/Python/3.12.16/${tool_arch}/bin/python3" --version >/dev/null
+      test -f "/opt/hostedtoolcache/Python/3.11.18/${tool_arch}.complete"
+      "/opt/hostedtoolcache/Python/3.11.18/${tool_arch}/bin/python3" --version >/dev/null
+      test -f "/opt/hostedtoolcache/gcloud/594.0.0/${tool_arch}.complete"
+      "/opt/hostedtoolcache/gcloud/594.0.0/${tool_arch}/bin/gcloud" --version >/dev/null
       RX_AFTER="$(read_rx)"
       echo "RX_BEFORE=${RX_BEFORE}"
       echo "RX_AFTER=${RX_AFTER}"

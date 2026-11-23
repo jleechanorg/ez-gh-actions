@@ -390,6 +390,13 @@ pub struct RunnerConfig {
     /// directory is silently skipped. Default `None`.
     #[serde(default)]
     pub git_mirror_host_path: Option<std::path::PathBuf>,
+    /// Optional host-side npm cache directory, bind-mounted read-only into each
+    /// container at `/opt/ezgha-npm-cache` with
+    /// `EZGHA_NPM_CACHE=/opt/ezgha-npm-cache`. Fail-open: missing directory is
+    /// silently skipped. On macOS/Colima, must live under a Colima `virtiofs`
+    /// mount (e.g. `~/.cache/...`). Default `None`.
+    #[serde(default)]
+    pub npm_cache_host_path: Option<std::path::PathBuf>,
     /// Host-side parent directory for per-runner job workspaces
     /// (`{workspace_host_path}/{runner_name}`), bind-mounted read-write into
     /// each container at `/home/runner/_work` -- the actions/runner default
@@ -669,6 +676,25 @@ fn require_non_empty_path(field: &str, path: &Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
+/// Shared `validate()` guard: an optional host-side cache path must be non-empty,
+/// free of leading/trailing whitespace, and absolute (no leading `~`).
+fn require_absolute_host_path(field: &str, path: &Option<PathBuf>) -> Result<()> {
+    require_non_empty_path(field, path)?;
+    if let Some(p) = path {
+        let raw = p.to_string_lossy();
+        if raw.trim().is_empty() {
+            anyhow::bail!("{field} must not be empty when configured");
+        }
+        if raw.as_ref() != raw.trim() || !p.is_absolute() {
+            anyhow::bail!(
+                "{field} must be an absolute path without leading '~' (got {:?})",
+                p
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Shared `validate()` guard: an unsigned field must be at least 1.
 fn require_at_least_one(field: &str, value: u64) -> Result<()> {
     if value == 0 {
@@ -725,6 +751,7 @@ impl Config {
                 wheelhouse_host_path: None,
                 pip_cache_host_path: None,
                 git_mirror_host_path: None,
+                npm_cache_host_path: None,
                 workspace_host_path: None,
                 dns: None,
                 dns_opts: None,
@@ -926,22 +953,14 @@ impl Config {
             anyhow::bail!("canary.poll_interval_seconds must be <= canary.poll_timeout_seconds");
         }
         require_non_empty_path("canary.history_path", &self.canary.history_path)?;
-        require_non_empty_path(
+        require_absolute_host_path(
             "runner.git_mirror_host_path",
             &self.runner.git_mirror_host_path,
         )?;
-        if let Some(path) = &self.runner.git_mirror_host_path {
-            let raw = path.to_string_lossy();
-            if raw.trim().is_empty() {
-                anyhow::bail!("runner.git_mirror_host_path must not be empty when configured");
-            }
-            if raw.as_ref() != raw.trim() || !path.is_absolute() {
-                anyhow::bail!(
-                    "runner.git_mirror_host_path must be an absolute path without leading '~' (got {:?})",
-                    path
-                );
-            }
-        }
+        require_absolute_host_path(
+            "runner.npm_cache_host_path",
+            &self.runner.npm_cache_host_path,
+        )?;
         // A FUSE-backed runner workspace breaks every job before it starts; see
         // `validate_workspace_filesystem` for the 2026-10-28 incident.
         if let Some(workspace_host_path) = &self.runner.workspace_host_path {
@@ -1295,6 +1314,53 @@ minimum_isolation = "container"
     }
 
     #[test]
+    fn config_parses_npm_cache_host_path() {
+        let with_path = r#"
+version = 1
+[github]
+scope = "org"
+target = "jleechanorg"
+[runner]
+labels = ["self-hosted"]
+count = 1
+image = "ezgha-runner:latest"
+npm_cache_host_path = "/tmp/npm-cache"
+[limits]
+memory_mb = 4096
+cpus = 2.0
+pids = 512
+[policy]
+minimum_isolation = "container"
+"#;
+        let parsed: Config =
+            toml::from_str(with_path).expect("config with npm_cache_host_path parses");
+        assert_eq!(
+            parsed.runner.npm_cache_host_path,
+            Some(std::path::PathBuf::from("/tmp/npm-cache"))
+        );
+
+        let without_path = r#"
+version = 1
+[github]
+scope = "org"
+target = "jleechanorg"
+[runner]
+labels = ["self-hosted"]
+count = 1
+image = "ezgha-runner:latest"
+[limits]
+memory_mb = 4096
+cpus = 2.0
+pids = 512
+[policy]
+minimum_isolation = "container"
+"#;
+        let omitted: Config =
+            toml::from_str(without_path).expect("config without npm_cache_host_path parses");
+        assert_eq!(omitted.runner.npm_cache_host_path, None);
+    }
+
+    #[test]
     fn serve_tick_honors_configured_value_and_clamps_floor() {
         let mut cfg_runner = RunnerConfig {
             labels: vec!["self-hosted".into()],
@@ -1309,6 +1375,7 @@ minimum_isolation = "container"
             wheelhouse_host_path: None,
             pip_cache_host_path: None,
             git_mirror_host_path: None,
+            npm_cache_host_path: None,
             workspace_host_path: None,
             dns: None,
             dns_opts: None,
@@ -2197,5 +2264,32 @@ slack_channel = "C0AJ3SD5C79"
         ok_cfg
             .validate()
             .expect("absolute git_mirror_host_path must be accepted");
+    }
+
+    #[test]
+    fn config_validate_enforces_absolute_npm_cache_host_path() {
+        for bad in ["", "  ", "relative/npm", "~/npm", " /leading", "/trailing "] {
+            let mut cfg = valid_config();
+            cfg.runner.npm_cache_host_path = Some(PathBuf::from(bad));
+            let err = cfg
+                .validate()
+                .expect_err(&format!("npm_cache_host_path={bad:?} must be rejected"))
+                .to_string();
+            assert!(err.contains("runner.npm_cache_host_path"), "{err}");
+            if !bad.trim().is_empty() {
+                assert!(
+                    err.contains(
+                        "runner.npm_cache_host_path must be an absolute path without leading '~'"
+                    ),
+                    "{err}"
+                );
+            }
+        }
+
+        let mut ok_cfg = valid_config();
+        ok_cfg.runner.npm_cache_host_path = Some(PathBuf::from("/var/cache/ezgha/npm-cache"));
+        ok_cfg
+            .validate()
+            .expect("absolute npm_cache_host_path must be accepted");
     }
 }

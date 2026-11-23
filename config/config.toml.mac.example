@@ -51,6 +51,15 @@ guest_reserve_mb = 2048
 # arbitrary path.
 # git_mirror_host_path = "/Users/jleechan/.cache/ezgha-git-mirrors"
 
+# Opt-in host-side npm cache: mounted read-only into every runner container at
+# /opt/ezgha-npm-cache with EZGHA_NPM_CACHE pointed at it (fail-open if absent).
+# Warmed on a schedule by scripts/refresh_runner_caches.sh (org.jleechanorg.ezgha-cache-warm).
+#
+# CRITICAL on Colima/Mac: same virtiofs-allowlist requirement as
+# wheelhouse_host_path above -- use a subdirectory of ~/.cache, not an
+# arbitrary path.
+# npm_cache_host_path = "/Users/jleechan/.cache/ezgha-npm-cache"
+
 # Opt-in per-runner job workspace (bead jleechan-93cf): mounted read-write
 # into each container at /home/runner/_work (the actions/runner default
 # workspace root) at {workspace_host_path}/{runner_name}, so checkouts,
