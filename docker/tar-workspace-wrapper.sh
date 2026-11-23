@@ -194,6 +194,11 @@ for arg in "$@"; do
     -x|--extract|--get)
       extract=1
       ;;
+    --*)
+      # Long options other than --extract/--get/--directory must not fall
+      # through to the short-option cluster branch below (e.g. --exclude,
+      # --exclude-vcs, --xz, --xattrs).
+      ;;
     -*)
       case "${arg}" in
         *x*) extract=1 ;;
