@@ -381,6 +381,59 @@ else
   bad "guarded tar mishandled multiple -C occurrences: native=${MULTIC_NATIVE_OUT}; guarded=${MULTIC_GUARDED_OUT}"
 fi
 
+echo "=== 7. Regression: long options containing 'x' (--exclude, --xz) do not trigger extract mode ==="
+CREATE_LONGOPT_HOST="${WORKDIR}/host-create-longopt"
+mkdir -p "${CREATE_LONGOPT_HOST}/some-owner/some-repo/dir"
+printf 'keep\n' > "${CREATE_LONGOPT_HOST}/some-owner/some-repo/dir/keep.txt"
+printf 'skip\n' > "${CREATE_LONGOPT_HOST}/some-owner/some-repo/dir/foo"
+CREATE_LONGOPT_OUT=$(docker run --rm \
+  -e EZGHA_VIRTIOFS_WORKSPACE=1 \
+  -v "${CREATE_LONGOPT_HOST}:/home/runner/_work" \
+  "${IMAGE}" sh -c '
+    set -eu
+    cd /home/runner/_work/some-owner/some-repo
+    tar -czf out.tgz --exclude=foo dir
+    listing="$(/usr/bin/tar -tzf out.tgz)"
+    printf "tgz=%s\n" "$(printf "%s" "${listing}" | tr "\n" ",")"
+    cd /tmp
+    tar -C /home/runner/_work/some-owner/some-repo -czf /tmp/out-c.tgz --exclude=foo dir
+    listing_c="$(/usr/bin/tar -tzf /tmp/out-c.tgz)"
+    printf "tgz_c=%s\n" "$(printf "%s" "${listing_c}" | tr "\n" ",")"
+    if command -v xz >/dev/null 2>&1; then
+      cd /home/runner/_work/some-owner/some-repo
+      tar --xz -cf out.tar.xz dir
+      listing_xz="$(/usr/bin/tar -tJf out.tar.xz)"
+      printf "txz=%s\n" "$(printf "%s" "${listing_xz}" | tr "\n" ",")"
+      cd /tmp
+      tar --xz -C /home/runner/_work/some-owner/some-repo -cf /tmp/out-c.tar.xz dir
+      listing_xz_c="$(/usr/bin/tar -tJf /tmp/out-c.tar.xz)"
+      printf "txz_c=%s\n" "$(printf "%s" "${listing_xz_c}" | tr "\n" ",")"
+    else
+      printf "txz=SKIP_NO_XZ\n"
+    fi
+  ' 2>&1)
+echo "${CREATE_LONGOPT_OUT}" | sed 's/^/    /'
+TGZ_LINE="$(printf '%s\n' "${CREATE_LONGOPT_OUT}" | grep '^tgz=' || true)"
+TGZ_C_LINE="$(printf '%s\n' "${CREATE_LONGOPT_OUT}" | grep '^tgz_c=' || true)"
+TXZ_LINE="$(printf '%s\n' "${CREATE_LONGOPT_OUT}" | grep '^txz=' || true)"
+TXZ_C_LINE="$(printf '%s\n' "${CREATE_LONGOPT_OUT}" | grep '^txz_c=' || true)"
+if printf '%s' "${TGZ_LINE}" | grep -q 'dir/keep.txt' \
+  && ! printf '%s' "${TGZ_LINE}" | grep -q 'dir/foo' \
+  && printf '%s' "${TGZ_C_LINE}" | grep -q 'dir/keep.txt' \
+  && ! printf '%s' "${TGZ_C_LINE}" | grep -q 'dir/foo'; then
+  ok "tar -czf out.tgz --exclude=foo dir (and -C variant) succeeded without triggering extract mode"
+else
+  bad "tar -czf --exclude=foo failed or included excluded file: ${CREATE_LONGOPT_OUT}"
+fi
+if [ "${TXZ_LINE}" = "txz=SKIP_NO_XZ" ]; then
+  info "xz binary not installed in ${IMAGE}; skipped tar --xz -cf check"
+elif printf '%s' "${TXZ_LINE}" | grep -q 'dir/keep.txt' \
+  && printf '%s' "${TXZ_C_LINE}" | grep -q 'dir/keep.txt'; then
+  ok "tar --xz -cf out.tar.xz dir (and -C variant) succeeded without triggering extract mode"
+else
+  bad "tar --xz -cf out.tar.xz dir failed: ${CREATE_LONGOPT_OUT}"
+fi
+
 echo
 echo "=== Summary: ${PASS} passed, ${FAIL} failed ==="
 if [ "${FAIL}" -gt 0 ]; then

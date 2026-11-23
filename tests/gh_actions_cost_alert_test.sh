@@ -71,6 +71,10 @@ case "$*" in
     fi
     cat "${BILLING_FIXTURE:?}"
     ;;
+  *"/orgs/"*"/repos?type=public"*)
+    if [ -n "${PUBLIC_REPOS_FAIL:-}" ]; then exit 1; fi
+    if [ -n "${PUBLIC_REPOS_FIXTURE:-}" ]; then cat "$PUBLIC_REPOS_FIXTURE"; else printf '[]\n'; fi
+    ;;
   *"orgs/"*"/repos"*)
     cat "${REPOS_FIXTURE:?}"
     ;;
@@ -142,6 +146,30 @@ STUB
 chmod +x "$TMP/bin/gh" "$TMP/bin/gcloud"
 
 run_alert() {
+  local state_file="$1" gcloud_log="$2" gh_log="$3"
+  shift 3
+  # Scenarios 1-27 pin the pre-calibration trip points so each keeps exercising its own mechanism
+  # (unpriced-label minute counting, fallback pricing, cooldown, ...); scenario 28 covers the
+  # shipped defaults end to end.
+  HOME="$TMP/home" \
+  GH_BIN="$TMP/bin/gh" \
+  GCLOUD_BIN="$TMP/bin/gcloud" \
+  STATE_FILE="$state_file" \
+  BILLING_FIXTURE="${BILLING_FIXTURE:-$TMP/billing.json}" \
+  GCLOUD_LOG="$gcloud_log" \
+  GH_CALL_LOG="$gh_log" \
+  POLICY_CAPTURE="$TMP/policy.json" \
+  POLICY_HISTORY="$TMP/policy-history.jsonl" \
+  NOW_ISO="${NOW_ISO:-2026-11-18T12:00:00Z}" \
+  TARGET_DATE_UTC="${TARGET_DATE_UTC:-2026-11-18}" \
+  DAILY_GROSS_WARN_USD="${TEST_DAILY_GROSS_WARN_USD:-25}" \
+  DAILY_MACOS_MIN_WARN="${TEST_DAILY_MACOS_MIN_WARN:-60}" \
+  MTD_GROSS_WARN_USD="${TEST_MTD_GROSS_WARN_USD:-250}" \
+  "$SCRIPT" "$@"
+}
+
+# Runs the script with its shipped defaults (no threshold overrides), for calibration coverage.
+run_shipped_defaults() {
   local state_file="$1" gcloud_log="$2" gh_log="$3"
   shift 3
   HOME="$TMP/home" \
@@ -762,6 +790,7 @@ rollover_fail_out="$(
   HOME="$TMP/home" GH_BIN="$TMP/bin/gh" GCLOUD_BIN="$TMP/bin/gcloud" \
   STATE_FILE="$TMP/state-rollover-fail.json" GCLOUD_LOG="$TMP/gcloud-rollover-fail.log" \
   GH_CALL_LOG="$TMP/gh-rollover-fail.log" POLICY_CAPTURE="$TMP/policy.json" POLICY_HISTORY="$TMP/policy-history.jsonl" \
+  DAILY_GROSS_WARN_USD=25 DAILY_MACOS_MIN_WARN=60 MTD_GROSS_WARN_USD=250 \
   "$SCRIPT"
 )"
 [ "$(error_count "$TMP/gcloud-rollover-fail.log")" = 1 ] || fail "simultaneous breaches must emit exactly 1 combined ERROR log (avoiding 300s rate-limit drop)"
@@ -1408,3 +1437,137 @@ grep -q '"macos_minutes":75' "$TMP/gcloud-xcode.log" || \
 grep -q '"gross_usd":0' "$TMP/gcloud-xcode.log" || \
   fail "xcode-27 unpriced hosted label must keep gross_usd=0"
 pass "Round-22 fixes: prior-month sku/unitType/repositoryName validation and xcode-* fallback macOS detection hold"
+
+# 28. Shipped-default calibration (operator ask 2026-11-20): ordinary baseline hosted usage must stay
+#     silent, while the 2026-11-17 incident and MTD gross runaway keep paging.
+cat > "$TMP/billing-cal-baseline.json" <<'JSON'
+{"usageItems":[
+ {"date":"2026-11-19T00:00:00Z","product":"actions","sku":"Actions macOS 3-core","quantity":1083.0,"unitType":"Minutes","pricePerUnit":0.062,"grossAmount":67.15,"discountAmount":67.15,"netAmount":0.0,"organizationName":"jleechanorg","repositoryName":"disk_magician"},
+ {"date":"2026-11-19T00:00:00Z","product":"actions","sku":"Actions Linux","quantity":1369.0,"unitType":"Minutes","pricePerUnit":0.006,"grossAmount":8.21,"discountAmount":8.02,"netAmount":0.19,"organizationName":"jleechanorg","repositoryName":"worldarchitect.ai"},
+ {"date":"2026-11-19T00:00:00Z","product":"actions","sku":"Actions storage","quantity":100.0,"unitType":"GigabyteHours","pricePerUnit":0.00033602,"grossAmount":0.03,"discountAmount":0.01,"netAmount":0.02,"organizationName":"jleechanorg","repositoryName":"worldarchitect.ai"}
+]}
+JSON
+BILLING_FIXTURE="$TMP/billing-cal-baseline.json" TARGET_DATE_UTC=2026-11-19 \
+  run_shipped_defaults "$TMP/state-cal-baseline.json" "$TMP/gcloud-cal-baseline.log" "$TMP/gh-cal-baseline.log" >/dev/null
+[ "$(error_count "$TMP/gcloud-cal-baseline.log")" = 0 ] || \
+  fail "2026-11-19 baseline (1083 macOS min, \$75.57 gross, \$0.21 net) must not alert at shipped defaults"
+pass "shipped defaults stay silent on the 2026-11-19 baseline (1083 macOS min, \$75.57 gross)"
+
+cat > "$TMP/billing-cal-spike.json" <<'JSON'
+{"usageItems":[
+ {"date":"2026-11-17T00:00:00Z","product":"actions","sku":"Actions macOS 3-core","quantity":2389.0,"unitType":"Minutes","pricePerUnit":0.062,"grossAmount":148.12,"discountAmount":148.12,"netAmount":0.0,"organizationName":"jleechanorg","repositoryName":"disk_magician"}
+]}
+JSON
+BILLING_FIXTURE="$TMP/billing-cal-spike.json" TARGET_DATE_UTC=2026-11-18 \
+  run_shipped_defaults "$TMP/state-cal-spike.json" "$TMP/gcloud-cal-spike.log" "$TMP/gh-cal-spike.log" >/dev/null
+[ "$(error_count "$TMP/gcloud-cal-spike.log")" = 1 ] || \
+  fail "2026-11-17 incident (2389 macOS min, \$148.12 gross) must still emit exactly 1 ERROR at shipped defaults"
+grep -q '"status":"COST_SPIKE"' "$TMP/gcloud-cal-spike.log" || \
+  fail "2026-11-17 incident must keep status=COST_SPIKE at shipped defaults"
+pass "shipped defaults still page on the 2026-11-17 incident (2389 macOS min, \$148.12 gross)"
+
+# 10 x \$92.75/day = \$927.50 MTD (the real 2026-11 MTD on 2026-11-20) stays below both gross gates.
+{
+  printf '{"usageItems":['
+  for d in 01 02 03 04 05 06 07 08 09 10; do
+    printf '{"date":"2026-11-%sT00:00:00Z","product":"actions","sku":"Actions macOS 3-core","quantity":1496.0,"unitType":"Minutes","pricePerUnit":0.062,"grossAmount":92.752,"discountAmount":92.752,"netAmount":0.0,"organizationName":"jleechanorg","repositoryName":"disk_magician"}' "$d"
+    [ "$d" = 10 ] || printf ','
+  done
+  printf ']}\n'
+} > "$TMP/billing-cal-mtd.json"
+BILLING_FIXTURE="$TMP/billing-cal-mtd.json" TARGET_DATE_UTC=2026-11-20 \
+  run_shipped_defaults "$TMP/state-cal-mtd.json" "$TMP/gcloud-cal-mtd.log" "$TMP/gh-cal-mtd.log" >/dev/null
+[ "$(error_count "$TMP/gcloud-cal-mtd.log")" = 0 ] || \
+  fail "MTD \$927.43-equivalent (10 x \$92.75/day) must stay under DAILY_GROSS_WARN_USD=100 and MTD_GROSS_WARN_USD=1500"
+pass "shipped defaults keep November MTD (10 x \$92.75/day) informational"
+
+cat > "$TMP/billing-cal-mtd-breach.json" <<'JSON'
+{"usageItems":[
+ {"date":"2026-11-18T00:00:00Z","product":"actions","sku":"Actions macOS 3-core","quantity":25000.0,"unitType":"Minutes","pricePerUnit":0.062,"grossAmount":1550.0,"discountAmount":1550.0,"netAmount":0.0,"organizationName":"jleechanorg","repositoryName":"disk_magician"}
+]}
+JSON
+BILLING_FIXTURE="$TMP/billing-cal-mtd-breach.json" TARGET_DATE_UTC=2026-11-19 \
+  run_shipped_defaults "$TMP/state-cal-mtd-breach.json" "$TMP/gcloud-cal-mtd-breach.log" "$TMP/gh-cal-mtd-breach.log" >/dev/null
+[ "$(error_count "$TMP/gcloud-cal-mtd-breach.log")" = 1 ] || \
+  fail "MTD gross \$1550 (>= MTD_GROSS_WARN_USD=1500) must emit exactly 1 combined ERROR at shipped defaults"
+grep -q 'MTD GROSS usage breach' "$TMP/gcloud-cal-mtd-breach.log" || \
+  fail "MTD gross runaway must keep the MTD GROSS usage breach text"
+grep -q '"status":"MULTI_BREACH"' "$TMP/gcloud-cal-mtd-breach.log" || \
+  fail "simultaneous COST_SPIKE + MTD gross breach must report status=MULTI_BREACH"
+pass "shipped defaults still page on MTD gross runaway (\$1550) as a combined MULTI_BREACH"
+
+# 29. Free public standard usage is informational, not a cash-spend emergency.
+# Private, unknown visibility/SKU, larger runners, net/storage and BLIND stay alertable.
+cat > "$TMP/public-repos.json" <<'JSON'
+[{"name":"disk_magician","private":false,"visibility":"public","owner":{"login":"jleechanorg"}}]
+JSON
+cat > "$TMP/free-public-billing.json" <<'JSON'
+{"usageItems":[
+ {"date":"2026-11-17T00:00:00Z","product":"actions","sku":"Actions macOS 3-core","quantity":13020,"unitType":"Minutes","grossAmount":807.24,"netAmount":0,"repositoryName":"disk_magician"},
+ {"date":"2026-11-18T00:00:00Z","product":"actions","sku":"Actions storage","quantity":2000,"unitType":"GigabyteHours","grossAmount":0.7,"netAmount":0.7,"repositoryName":"disk_magician"}
+]}
+JSON
+PUBLIC_REPOS_FIXTURE="$TMP/public-repos.json" BILLING_FIXTURE="$TMP/free-public-billing.json" \
+ run_alert "$TMP/state-free-public.json" "$TMP/gcloud-free-public.log" "$TMP/gh-free-public.log" >/dev/null
+[ "$(error_count "$TMP/gcloud-free-public.log")" = 0 ] || fail "free public standard minutes plus sub-threshold storage must not emit ERROR"
+grep -q 'severity=INFO' "$TMP/gcloud-free-public.log" || fail "free usage must stay visible as INFO"
+grep -q 'FREE_PUBLIC_USAGE' "$TMP/gcloud-free-public.log" || fail "free public usage must be labelled informational"
+# Passing six-hour cooldown cannot turn unchanged allowed free usage back into a page.
+PUBLIC_REPOS_FIXTURE="$TMP/public-repos.json" BILLING_FIXTURE="$TMP/free-public-billing.json" NOW_EPOCH=1999999999 \
+ run_alert "$TMP/state-free-public.json" "$TMP/gcloud-free-public.log" "$TMP/gh-free-public.log" >/dev/null
+[ "$(error_count "$TMP/gcloud-free-public.log")" = 0 ] || fail "historical free usage must not page after cooldown"
+# New free public usage is permitted too; this is not just a historical suppression.
+jq '.usageItems[0].date="2026-11-18T12:00:00Z" | .usageItems[0].quantity=14000 | .usageItems[0].grossAmount=868' "$TMP/free-public-billing.json" > "$TMP/new-free-billing.json"
+PUBLIC_REPOS_FIXTURE="$TMP/public-repos.json" BILLING_FIXTURE="$TMP/new-free-billing.json" \
+ run_alert "$TMP/state-new-free.json" "$TMP/gcloud-new-free.log" "$TMP/gh-new-free.log" >/dev/null
+[ "$(error_count "$TMP/gcloud-new-free.log")" = 0 ] || fail "new allowed free standard public usage must not page"
+# No metadata proof, lookup failure, private object, and wrong-owner data all fail closed.
+for case_name in unknown failed private wrong-owner larger paid storage; do
+  cp "$TMP/free-public-billing.json" "$TMP/case-billing.json"
+  cp "$TMP/public-repos.json" "$TMP/case-public.json"
+  lookup_fail=""
+  case "$case_name" in
+    unknown) printf '[]\n' > "$TMP/case-public.json" ;;
+    failed) lookup_fail=1 ;;
+    private) jq '.[0].private=true | .[0].visibility="private"' "$TMP/public-repos.json" > "$TMP/case-public.json" ;;
+    wrong-owner) jq '.[0].owner.login="other-org"' "$TMP/public-repos.json" > "$TMP/case-public.json" ;;
+    larger) jq '.usageItems[0].sku="Actions macOS 12-core"' "$TMP/free-public-billing.json" > "$TMP/case-billing.json" ;;
+    paid) jq '.usageItems[0].netAmount=15' "$TMP/free-public-billing.json" > "$TMP/case-billing.json" ;;
+    storage) jq '.usageItems[1].grossAmount=45 | .usageItems[1].netAmount=45' "$TMP/free-public-billing.json" > "$TMP/case-billing.json" ;;
+  esac
+  PUBLIC_REPOS_FIXTURE="$TMP/case-public.json" PUBLIC_REPOS_FAIL="$lookup_fail" BILLING_FIXTURE="$TMP/case-billing.json" \
+   run_alert "$TMP/state-case-$case_name.json" "$TMP/gcloud-case-$case_name.log" "$TMP/gh-case-$case_name.log" >/dev/null
+  [ "$(error_count "$TMP/gcloud-case-$case_name.log")" = 1 ] || fail "$case_name must retain one combined charge/unknown-risk ERROR"
+done
+# Documented billing shape uses lowercase unitType and owner/repo repositoryName; both must classify.
+jq '.usageItems[0].unitType="minutes" | .usageItems[0].repositoryName="jleechanorg/disk_magician"' \
+  "$TMP/free-public-billing.json" > "$TMP/doc-shape-billing.json"
+PUBLIC_REPOS_FIXTURE="$TMP/public-repos.json" BILLING_FIXTURE="$TMP/doc-shape-billing.json" \
+ run_alert "$TMP/state-doc-shape.json" "$TMP/gcloud-doc-shape.log" "$TMP/gh-doc-shape.log" >/dev/null
+[ "$(error_count "$TMP/gcloud-doc-shape.log")" = 0 ] || fail "documented billing shape (minutes + owner/repo) must stay exempt"
+grep -q 'FREE_PUBLIC_USAGE' "$TMP/gcloud-doc-shape.log" || fail "documented billing shape must still log INFO"
+# Owner comparison is case-insensitive, but a different owner stays alertable.
+jq '.usageItems[0].unitType="minutes" | .usageItems[0].repositoryName="JLeeChanOrg/disk_magician"' \
+  "$TMP/free-public-billing.json" > "$TMP/doc-shape-case-billing.json"
+PUBLIC_REPOS_FIXTURE="$TMP/public-repos.json" BILLING_FIXTURE="$TMP/doc-shape-case-billing.json" \
+ run_alert "$TMP/state-doc-shape-case.json" "$TMP/gcloud-doc-shape-case.log" "$TMP/gh-doc-shape-case.log" >/dev/null
+[ "$(error_count "$TMP/gcloud-doc-shape-case.log")" = 0 ] || fail "same-org owner case variant must stay exempt"
+jq '.usageItems[0].unitType="minutes" | .usageItems[0].repositoryName="other-org/disk_magician"' \
+  "$TMP/free-public-billing.json" > "$TMP/doc-shape-foreign-billing.json"
+PUBLIC_REPOS_FIXTURE="$TMP/public-repos.json" BILLING_FIXTURE="$TMP/doc-shape-foreign-billing.json" \
+ run_alert "$TMP/state-doc-shape-foreign.json" "$TMP/gcloud-doc-shape-foreign.log" "$TMP/gh-doc-shape-foreign.log" >/dev/null
+[ "$(error_count "$TMP/gcloud-doc-shape-foreign.log")" = 1 ] || fail "foreign-owner qualified repo must remain alertable"
+# The informational line names the remaining net charge instead of hiding it behind exempt gross.
+grep -q 'MTD net charges (still alertable): disk_magician Actions storage' "$TMP/gcloud-free-public.log" || \
+  fail "INFO must attribute the nonzero net charge"
+# Only validated public rows may lower severity. Exhausting the five-page bound is safe.
+python3 - "$TMP/public-repos.json" "$TMP/public-100.json" <<'PYREPOS'
+import json,sys
+row=json.load(open(sys.argv[1]))[0]
+json.dump([dict(row,name="public-repo-"+str(i)) for i in range(100)],open(sys.argv[2],"w"))
+PYREPOS
+PUBLIC_REPOS_FIXTURE="$TMP/public-100.json" BILLING_FIXTURE="$TMP/free-public-billing.json" \
+ run_alert "$TMP/state-public-cap.json" "$TMP/gcloud-public-cap.log" "$TMP/gh-public-cap.log" >/dev/null
+[ "$(grep -c '/repos?type=public' "$TMP/gh-public-cap.log")" = 5 ] || fail "public lookup must be capped at five pages"
+[ "$(error_count "$TMP/gcloud-public-cap.log")" = 1 ] || fail "unseen repo after page cap must remain alertable"
+pass "free public standard usage stays INFO across cooldown/new usage; private, unknown, larger, paid and storage stay ERROR; visibility lookup bounded"

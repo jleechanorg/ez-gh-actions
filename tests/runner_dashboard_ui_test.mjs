@@ -233,3 +233,249 @@ test('repeated refresh does not re-announce unchanged state', () => {
   assert.equal(elements.get('linux-target').textContent, '10');
   delete globalThis.document;
 });
+
+test('real 4-mac parked and 20-linux fleet classifies cleanly without false critical', () => {
+  const snapshot = structuredClone(HEALTHY);
+  snapshot.fleets.mac.fleet = {
+    configured: 4,
+    executing: 0,
+    idle: 0,
+    cycling: 0,
+    down: 0,
+    reserved: 0,
+  };
+  snapshot.fleets.mac.parked = true;
+  snapshot.fleets.mac.parked_slots = 4;
+  snapshot.fleets.mac.parked_reason = 'operator_disabled';
+  snapshot.fleets.linux.fleet = {
+    configured: 20,
+    executing: 20,
+    idle: 0,
+    cycling: 0,
+    down: 0,
+    reserved: 20,
+  };
+  const status = classifySnapshot(snapshot, NOW);
+  assert.notEqual(status.state, 'stale');
+  assert.notEqual(status.state, 'critical');
+  assert.match(status.detail, /parked/i);
+});
+
+test('renders reconciliation banner, slot chips, cmux pool, and latency panel', () => {
+  const created = [];
+  const elements = new Map();
+  globalThis.document = {
+    createElement(tag) {
+      const node = {
+        tagName: tag.toUpperCase(),
+        className: '',
+        textContent: '',
+        dataset: {},
+        children: [],
+        appendChild(child) {
+          this.children.push(child);
+        },
+        replaceChildren(...args) {
+          this.children = args;
+        },
+      };
+      created.push(node);
+      return node;
+    },
+    getElementById(id) {
+      if (!elements.has(id)) {
+        elements.set(id, {
+          dataset: {},
+          textContent: '',
+          children: [],
+          classList: { add() {}, remove() {} },
+          appendChild(child) {
+            this.children.push(child);
+          },
+          replaceChildren(...args) {
+            this.children = args;
+          },
+        });
+      }
+      return elements.get(id);
+    },
+  };
+
+  const snapshot = structuredClone(HEALTHY);
+  snapshot.fleets.mac.fleet = {
+    configured: 4,
+    executing: 0,
+    idle: 0,
+    cycling: 0,
+    down: 0,
+    reserved: 0,
+  };
+  snapshot.fleets.mac.parked = true;
+  snapshot.fleets.mac.parked_slots = 4;
+  snapshot.fleets.mac.slots = [
+    { slot_id: 'mac-1', state: 'PARKED', phase_badge: 'operator_disabled' },
+  ];
+  snapshot.fleets.linux.fleet = {
+    configured: 20,
+    executing: 13,
+    idle: 0,
+    cycling: 0,
+    down: 7,
+    reserved: 20,
+  };
+  snapshot.fleets.linux.disk = { status: 'critical', free_gb: 25.0, floor_gb: 30 };
+  snapshot.fleets.linux.pause_reason = 'disk_floor_paused';
+  snapshot.fleets.linux.slots = [
+    {
+      slot_id: 'linux-1',
+      state: 'EXECUTING',
+      elapsed_minutes: 33.3,
+      repo_short: 'worldarchitect.ai',
+      phase_badge: 'playwright',
+    },
+    {
+      slot_id: 'linux-6',
+      state: 'DOWN',
+      phase_badge: 'disk_floor_paused',
+    },
+  ];
+  snapshot.cmux = {
+    ok: true,
+    configured: 25,
+    executing: 21,
+    idle: 0,
+    cycling: 4,
+    down: 0,
+    vms: [
+      {
+        vm_id: 'cmux-dreamy',
+        configured: 3,
+        executing: 2,
+        idle: 0,
+        cycling: 1,
+        down: 0,
+        disk_free_gb: 12.0,
+        disk_floor_gb: 10,
+        slots: [{ slot_id: 'cmux-dreamy-2', state: 'EXECUTING', elapsed_minutes: 28, phase_badge: 'jest' }],
+      },
+    ],
+  };
+  snapshot.reconciliation = {
+    active_workflow_runs: 15,
+    active_job_slots_occupied: 34,
+    idle_slots: 0,
+    cycling_slots: 4,
+    down_slots: 7,
+    parked_slots: 4,
+    fresh_queued_runs: 50,
+    inert_ghosts: 149,
+    explanation: '15 active workflow runs fan out across 34 occupied job slots.',
+  };
+  snapshot.latency = {
+    ok: true,
+    overall: {
+      queue_wait: { n: 186, avg_s: 416, p50_s: 339.5, p90_s: 874.5, p99_s: 1502.4 },
+      execution: { n: 186, avg_s: 197, p50_s: 47, p90_s: 505, p99_s: 1849.7 },
+      e2e: { n: 174, avg_s: 697, p50_s: 453, p90_s: 1561.2, p99_s: 4198.2 },
+    },
+    cancellation: { cancelled_runs: 183, total_non_skipped_runs: 381, cancelled_rate_pct: 48.0 },
+    workflows: [
+      {
+        workflow: 'Self-Hosted MVP Shards',
+        queue_wait: { n: 32, avg_s: 339, p50_s: 323, p90_s: 637, p99_s: 900 },
+        execution: { n: 32, avg_s: 413, p50_s: 32.5, p90_s: 1639, p99_s: 2050 },
+        e2e: { n: 32, avg_s: 752, p50_s: 500, p90_s: 1900, p99_s: 2500 },
+      },
+    ],
+  };
+
+  render(snapshot, NOW);
+  assert.equal(elements.get('reconcile-runs').textContent, '15');
+  assert.equal(elements.get('reconcile-slots').textContent, '34');
+  assert.equal(elements.get('cmux-target').textContent, '25');
+  assert.equal(elements.get('latency-queue-p50').textContent, '5m 40s');
+  assert.equal(elements.get('latency-exec-p50').textContent, '47s');
+  assert.ok(elements.get('linux-slots').children.length >= 2);
+  assert.ok(elements.get('cmux-slots').children.length >= 1);
+  assert.ok(elements.get('latency-workflows').children.length >= 1);
+  const wfMetricsText = elements.get('latency-workflows').children[0].children[1].textContent;
+  assert.match(wfMetricsText, /Q avg 5m 39s.*p99 15m/);
+  assert.match(wfMetricsText, /E avg 6m 53s.*p99 34m 10s/);
+  assert.match(wfMetricsText, /E2E avg 12m 32s.*p99 41m 40s/);
+
+  const partialSnap = structuredClone(snapshot);
+  partialSnap.queue = {
+    ...(partialSnap.queue || {}),
+    ok: true,
+    fresh: 3,
+    ghosts: 0,
+    partial: true,
+    unverified_runs: 2,
+  };
+  partialSnap.latency.partial = true;
+  render(partialSnap, NOW);
+  assert.match(elements.get('queue-summary').textContent, /counted as waiting/);
+  assert.doesNotMatch(elements.get('queue-summary').textContent, /real waiting work/);
+  assert.match(elements.get('queue-summary').textContent, /partial: 2 unverified/);
+  assert.equal(elements.get('queue-fresh-label').textContent, 'FRESH — WAITING (UPPER BOUND)');
+  assert.match(elements.get('queue-fresh-note').textContent, /Upper-bound waiting count/);
+  assert.match(elements.get('queue-oldest-note').textContent, /includes unverified runs/);
+  assert.match(elements.get('latency-summary').textContent, /partial sample/);
+
+  const truncatedQueueSnap = structuredClone(snapshot);
+  truncatedQueueSnap.queue = {
+    ok: true,
+    fresh: null,
+    ghosts: null,
+    oldest_fresh_wait_minutes: 5,
+    in_progress_runs: 1,
+    partial: true,
+    unverified_runs: 100,
+    repos: [],
+  };
+  render(truncatedQueueSnap, NOW);
+  assert.equal(elements.get('queue-fresh').textContent, '—');
+  assert.equal(elements.get('queue-ghosts').textContent, '—');
+  assert.equal(elements.get('queue-fresh-label').textContent, 'FRESH — WAITING (UPPER BOUND)');
+  assert.match(elements.get('queue-summary').textContent, /100 unverified/);
+  assert.match(elements.get('queue-fresh-note').textContent, /Upper-bound waiting count/);
+  assert.match(elements.get('queue-oldest-note').textContent, /includes unverified runs/);
+
+  render(snapshot, NOW);
+  assert.equal(elements.get('queue-fresh-label').textContent, 'FRESH — ACTUALLY WAITING');
+  assert.equal(elements.get('queue-fresh-note').textContent, 'Queued runs that own at least one job.');
+  assert.equal(elements.get('queue-oldest-note').textContent, 'Age of the longest-waiting run that has real work.');
+
+  // Honest skipped-probe provenance on parked host still classifies as degraded (parked), never stale,
+  // and an unavailable host displays UNAVAILABLE badge rather than ONLINE.
+  const parkedTruth = structuredClone(snapshot);
+  parkedTruth.fleets.linux.disk = { status: 'healthy' };
+  parkedTruth.fleets.mac.sources.service.ok = false;
+  parkedTruth.fleets.mac.sources.docker.ok = false;
+  parkedTruth.fleets.mac.sources.process_probe.ok = false;
+  assert.equal(classifySnapshot(parkedTruth, NOW).state, 'degraded');
+
+  // Parked Mac with PR #240 runner.count=0 must still validate as degraded (parked), while unparked count=0 is stale.
+  const parkedZeroMac = structuredClone(parkedTruth);
+  parkedZeroMac.fleets.mac.parked_slots = 0;
+  parkedZeroMac.fleets.mac.fleet = {
+    configured: 0, executing: 0, idle: 0, cycling: 0, down: 0, reserved: 0,
+  };
+  assert.equal(classifySnapshot(parkedZeroMac, NOW).state, 'degraded');
+  const unparkedZeroMac = structuredClone(parkedZeroMac);
+  unparkedZeroMac.fleets.mac.parked = false;
+  assert.equal(classifySnapshot(unparkedZeroMac, NOW).state, 'stale');
+
+  const unavail = structuredClone(snapshot);
+  unavail.sources.linux_host.ok = false;
+  unavail.reconciliation = { active_workflow_runs: 31, fresh_queued_runs: 7, inert_ghosts: 2 };
+  unavail.queue = { ok: false, partial: true, fresh: 7, ghosts: 2, in_progress_runs: 31, repos: [] };
+  unavail.cmux = { ok: false };
+  render(unavail, NOW);
+  assert.equal(elements.get('linux-state-badge').textContent, 'UNAVAILABLE');
+  assert.equal(elements.get('reconcile-runs').textContent, '—');
+  assert.equal(elements.get('reconcile-fresh').textContent, '—');
+  assert.equal(elements.get('reconcile-ghosts').textContent, '—');
+  assert.equal(elements.get('reconcile-slots').textContent, '0');
+  delete globalThis.document;
+});

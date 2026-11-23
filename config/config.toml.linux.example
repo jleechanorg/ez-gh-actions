@@ -38,6 +38,22 @@ cpus = 1.6
 pids = 512
 min_free_disk_gb = 10
 cgroup_parent = "actions.slice"
+# Opt-in (bead jleechan-5khv): Docker's built-in seccomp profile denies
+# clone(CLONE_NEWUSER), so any CI step that isolates itself with
+# `unshare -Urn` fails `Operation not permitted` inside the runner container,
+# even on a host that permits user namespaces. Leave BOTH settings off to keep
+# the hardened default. Prefer `seccomp_profile` (a custom JSON profile that
+# allows only CLONE_NEWUSER); `allow_userns` applies `seccomp=unconfined`,
+# which is broader and is a deliberate, operator-chosen isolation relaxation
+# for a host that runs untrusted PR code.
+#
+# seccomp_profile expects a profile DERIVED FROM YOUR ENGINE'S OWN DEFAULT
+# (moby/profiles seccomp/default.json at the matching release) with only the
+# user-namespace clone granted. Do NOT hand-write a minimal "allow clone"
+# profile: a profile is a complete whitelist, so anything omitted is BLOCKED
+# and every job breaks.
+# seccomp_profile = "/etc/ezgha/seccomp-userns.json"
+# allow_userns = false
 
 [policy]
 # Native linux docker = container isolation. "vm" only if daemon is VM-contained

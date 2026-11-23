@@ -41,6 +41,9 @@ jobs:
       - name: Runner dashboard contract tests
         run: |
           python3 -m unittest tests/runner_dashboard_snapshot_test.py
+          python3 -m unittest tests/ci_latency_probe_test.py
+          python3 -m unittest tests/fleet_live_dashboard_test.py
+          python3 -m unittest tests/queue_probe_test.py
           node --test tests/runner_dashboard_ui_test.mjs
           bash tests/runner_dashboard_host_probe_test.sh
           bash tests/runner_dashboard_publisher_test.sh
@@ -96,6 +99,8 @@ jobs:
           bash tests/doctor_runner_remote_config_and_queue_test.sh
           bash tests/doctor_runner_remote_optout_test.sh
           bash tests/doctor_runner_service_docker_endpoint_test.sh
+          bash tests/doctor_runner_api_token_test.sh
+          bash tests/doctor_runner_remote_user_bus_test.sh
           bash tests/doctor_runner_unreachable_remote_test.sh
           bash tests/doctor_runner_verdict_line_test.sh
           bash tests/doctor_sh_deprecation_stub_test.sh
@@ -127,6 +132,7 @@ jobs:
           bash tests/integrate_pr_payload_regression_test.sh
           bash tests/launchd_docker_host_consumers_test.sh
           bash tests/refresh_gh_app_token_timeout_test.sh
+          bash tests/tar_workspace_wrapper_test.sh
           bash tests/verify_other_error_report.sh
           bash tests/verify_exit_gate0_test.sh
       - name: Install Python test-only dependencies

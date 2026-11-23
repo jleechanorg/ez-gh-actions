@@ -29,6 +29,7 @@ DASHBOARD_SCRIPTS=(
   runner_dashboard_host_probe.sh
   build_runner_dashboard_snapshot.py
   queue_probe.py
+  ci_latency_probe.py
 )
 DASHBOARD_ASSETS=(index.html style.css dashboard.js)
 DASHBOARD_TRANSACTION_ACTIVE=false
@@ -285,6 +286,10 @@ install_scripts() {
     fi
     install -m 0755 "$script" "${SCRIPTS_DIR}/${script_name}"
   done
+  if [[ -f "${REPO_PATH}/scripts/fleet_live_dashboard_template.html" ]]; then
+    install -m 0644 "${REPO_PATH}/scripts/fleet_live_dashboard_template.html" \
+      "${SCRIPTS_DIR}/fleet_live_dashboard_template.html"
+  fi
   for asset in index.html style.css dashboard.js; do
     install -m 0644 "${REPO_PATH}/dashboard/${asset}" "${DASHBOARD_DIR}/${asset}"
   done
