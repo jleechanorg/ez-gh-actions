@@ -51,4 +51,19 @@ export GH_TOKEN_LOG="$tmpdir/case3.log"
 env -u GH_TOKEN ./scripts/cleanup-stuck-runs.sh --superseded >/dev/null
 [[ "$(cat "$GH_TOKEN_LOG")" == "UNSET" ]]
 
+# Case 4: unreadable token file (chmod 000) when GH_TOKEN unset -> does not crash, leaves GH_TOKEN unset
+if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+  printf 'secret-unreadable\n' >"$fake_home/.config/ezgha/gh_token"
+  chmod 000 "$fake_home/.config/ezgha/gh_token"
+  export GH_TOKEN_LOG="$tmpdir/case4.log"
+  env -u GH_TOKEN ./scripts/cleanup-stuck-runs.sh --superseded >/dev/null
+  chmod 600 "$fake_home/.config/ezgha/gh_token"
+  [[ "$(cat "$GH_TOKEN_LOG")" == "UNSET" ]]
+fi
+
+# Case 5: unset HOME when GH_TOKEN unset -> does not fail under set -u
+export GH_TOKEN_LOG="$tmpdir/case5.log"
+env -u GH_TOKEN -u HOME ./scripts/cleanup-stuck-runs.sh --superseded >/dev/null
+[[ "$(cat "$GH_TOKEN_LOG")" == "UNSET" ]]
+
 echo "cleanup-stuck-runs app token loader test passed"
