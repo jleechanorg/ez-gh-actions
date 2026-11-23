@@ -410,6 +410,25 @@ pub struct RunnerConfig {
     /// directory instead of failing loudly.
     #[serde(default)]
     pub workspace_host_path: Option<String>,
+    /// Explicit DNS servers for runner containers, passed straight through to
+    /// `docker run --dns`. Opt-in (`None` by default): unset means the
+    /// container inherits the host's `/etc/resolv.conf` exactly as today, so
+    /// hosts that do not opt in see no behavior change at all.
+    ///
+    /// Background (issue/bead 229): the cloud-VM fleet ships a single
+    /// forwarding resolver with `timeout:1 attempts:2` and no fallback. Under
+    /// burst that surfaces inside runner containers as `getaddrinfo EAI_AGAIN`
+    /// and multi-minute download stalls, well before the container itself is
+    /// unhealthy. Listing the host forwarder first and public resolvers after
+    /// it lets the second, third, ... entry absorb a dropped UDP response.
+    #[serde(default)]
+    pub dns: Option<Vec<String>>,
+    /// Extra resolver options handed to `docker run --dns-opt` (e.g.
+    /// `timeout:2`, `attempts:3`). Same opt-in contract as `dns` above: unset
+    /// keeps the image/host defaults untouched. Relevant to issue/bead 229 —
+    /// a 1s timeout is tighter than a cold lookup should be treated as.
+    #[serde(default)]
+    pub dns_opts: Option<Vec<String>>,
 }
 
 impl RunnerConfig {
@@ -707,6 +726,8 @@ impl Config {
                 pip_cache_host_path: None,
                 git_mirror_host_path: None,
                 workspace_host_path: None,
+                dns: None,
+                dns_opts: None,
             },
             limits: Limits {
                 memory_mb: mem,
@@ -1289,6 +1310,8 @@ minimum_isolation = "container"
             pip_cache_host_path: None,
             git_mirror_host_path: None,
             workspace_host_path: None,
+            dns: None,
+            dns_opts: None,
         };
         assert_eq!(cfg_runner.serve_tick(), std::time::Duration::from_secs(20));
         // A typo'd 0 (or anything under the floor) must not hot-loop the
