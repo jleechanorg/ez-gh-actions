@@ -21,6 +21,10 @@ set -uo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SCRIPT="$REPO/scripts/ezgha-host-health-alert.sh"
 [ -f "$SCRIPT" ] || { echo "FAIL: missing $SCRIPT"; exit 1; }
+STATE_DIR="$(mktemp -d)"
+trap 'rm -rf "${STATE_DIR:?}"' EXIT
+export HEALTH_ALERT_STATE_DIR="$STATE_DIR" HEALTH_ALERT_PEER_OK=1
+export HEALTH_ALERT_ALERTS_FILE="$STATE_DIR/no-daemon-alerts.jsonl"
 
 # The launchd job runs /bin/bash (bash 3.2 on macOS, where `set -u` + an empty
 # "${A[@]}" is an unbound-variable error). Use the SAME interpreter so that

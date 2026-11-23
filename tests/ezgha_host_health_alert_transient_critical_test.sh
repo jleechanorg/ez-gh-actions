@@ -11,8 +11,8 @@
 # The contract asserted here:
 #   1. A transient admission-deferral CRITICAL never produces cause=fleet.
 #   2. It is still recorded (not silently dropped) — at WARNING, on its own cause.
-#   3. A genuine capacity CRITICAL still pages cause=fleet (no over-suppression).
-#   4. An unknown CRITICAL key keeps the historical fail-closed page.
+#   3. Only measured zero capacity pages cause=fleet.
+#   4. An unknown CRITICAL key remains an operational diagnostic.
 #
 # Everything is driven by the script's HEALTH_ALERT_* audit hooks; no docker,
 # ssh, systemctl or gcloud is contacted.
@@ -80,50 +80,42 @@ grep -q 'memory_pressure' "$(log_of mem)" \
   || fail "the record must name the CRITICAL key so it is diagnosable"
 pass "the transient CRITICAL is still recorded (WARNING, cause=operational, key named)"
 
-# ── 3. A genuine capacity CRITICAL still pages cause=fleet ────────────────
-# NOTE: containers=18 (not 0). With 0 containers the independent 0-container
-# probe forces paging on its own, so the assertion would pass even if the key
-# classification were broken (found in review). Positive containers isolate the
-# key-classification behaviour under test.
+# ── 3. Repeated disk measurement failures have a dedicated page ──────────────
 crit_file "$W/alerts-cap.jsonl" "runner_pool.disk_measurement_unavailable"
 run cap 100 18 HEALTH_ALERT_ALERTS_FILE="$W/alerts-cap.jsonl"
-[ "$(fleet_cause cap)" = 1 ] \
-  || { cat "$(log_of cap)" >&2; fail "a capacity CRITICAL with 0 containers must still page cause=fleet"; }
-[ "$(errors cap)" = 1 ] || fail "a capacity CRITICAL must page at ERROR"
-pass "genuine capacity CRITICAL still pages cause=fleet (no over-suppression)"
+[ "$(fleet_cause cap)" = 0 ] || fail "disk measurement failure cannot prove zero capacity"
+[ "$(errors cap)" = 1 ] || fail "persistent blind telemetry must page"
+grep -q '"cause":"blind"' "$(log_of cap)" || fail "the page must name blind telemetry"
+pass "persistent disk measurement failure pages through cause=blind"
 
-# ── 4. An unknown key keeps the historical fail-closed page ───────────────
+# ── 4. Unknown keys remain operational diagnostics ───────────────────────────
 crit_file "$W/alerts-unk.jsonl" "runner_pool.some_future_capacity_key"
 run unk 100 18 HEALTH_ALERT_ALERTS_FILE="$W/alerts-unk.jsonl"
-[ "$(fleet_cause unk)" = 1 ] \
-  || { cat "$(log_of unk)" >&2; fail "an unrecognized CRITICAL key must not be silently downgraded"; }
-pass "unrecognized CRITICAL key keeps the fail-closed cause=fleet page"
+[ "$(fleet_cause unk)" = 0 ] && [ "$(warnings unk)" = 1 ] \
+  || fail "unrecognized CRITICAL must emit a warning without claiming a fleet outage"
+pass "unrecognized CRITICAL key remains visible without a fleet page"
 
 # ── 5. Zero containers + transient key: the 0-container probe still pages ──
 # The transient exemption must not mask a genuinely empty fleet.
 run mem0 100 0 HEALTH_ALERT_ALERTS_FILE="$W/alerts-mem.jsonl"
 [ "$(errors mem0)" = 1 ] \
   || { cat "$(log_of mem0)" >&2; fail "0 containers must page regardless of the transient key"; }
-grep -q '0 ezgha runner containers running' "$(log_of mem0)" \
+grep -q '0 ezgha runner processes ready' "$(log_of mem0)" \
   || fail "the 0-container probe must be the reason cited"
 pass "0-container truth still pages even with a transient CRITICAL present"
 
-# ── 6. A later transient event must NOT mask an earlier capacity CRITICAL ───
-# P0 found in review: classification read only the NEWEST CRITICAL, so a fresh
-# memory_pressure hid an admission/headroom capacity CRITICAL from the window and
-# the fleet page vanished. The daemon fires some capacity alerts once per
-# episode, so this would have suppressed it for the whole window.
+# ── 6. A later transient event must preserve an earlier blind page ──────────
 MIXED="$W/alerts-mixed.jsonl"
 printf '{"body":"x","event_key":"runner_pool.disk_measurement_unavailable","severity":"CRITICAL","subject":"cap","ts_unix":%s}\n' "$(( NOW - 120 ))" > "$MIXED"
 printf '{"body":"x","event_key":"runner_pool.memory_pressure","severity":"CRITICAL","subject":"mem","ts_unix":%s}\n' "$(( NOW - 60 ))" >> "$MIXED"
 run mixed 100 18 HEALTH_ALERT_ALERTS_FILE="$MIXED"
 [ "$(errors mixed)" -ge 1 ] \
-  || { cat "$(log_of mixed)" >&2; fail "a later transient CRITICAL must not mask an earlier capacity CRITICAL"; }
-grep -q '"cause":"fleet"' "$(log_of mixed)" \
-  || { cat "$(log_of mixed)" >&2; fail "the capacity CRITICAL must still page as cause=fleet"; }
+  || { cat "$(log_of mixed)" >&2; fail "a later transient CRITICAL must preserve an earlier blind page"; }
+grep -q '"cause":"blind"' "$(log_of mixed)" \
+  || { cat "$(log_of mixed)" >&2; fail "the measurement failure must still page with cause=blind"; }
 grep -q 'disk_measurement_unavailable' "$(log_of mixed)" \
-  || fail "the page must name the capacity key that triggered it"
-pass "a later transient CRITICAL does not mask an earlier capacity CRITICAL"
+  || fail "the page must name the measurement failure that triggered it"
+pass "a later transient CRITICAL preserves the earlier blind page"
 
 # ── 7. A note must not discard a pending recovery ──────────────────────────
 # P2 found in review: DOWN -> NOTE -> OK emitted no RECOVERED at all.
