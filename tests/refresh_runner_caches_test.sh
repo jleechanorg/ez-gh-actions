@@ -682,6 +682,46 @@ with mock.patch("ezgha_npm_cache.oldest_running_runner_start_epoch", side_effect
     ezgha_npm_cache.refresh_npm_cache(npm_refresh_dir, "ezgha-runner:latest", reap_only=True)
     assert len(reap_epochs) == 1
 
+# Timeout cleanup: run_cmd TimeoutExpired removes named container before pruning and skips manifest write
+npm_timeout_dir = os.path.join(work_dir, "npm_refresh_timeout")
+timeout_events = []
+seen_container_names = []
+def _timeout_run_cmd(cmd, timeout=None, env=None, capture=False, input_text=None):
+    assert "--name" in cmd, f"missing --name in docker run cmd: {cmd}"
+    cname = cmd[cmd.index("--name") + 1]
+    assert cname.startswith("ezgha-npm-warm-"), cname
+    seen_container_names.append(cname)
+    raise subprocess.TimeoutExpired(cmd, timeout or 900)
+
+def _fake_rm_subprocess_run(cmd, **kwargs):
+    timeout_events.append(("rm", cmd, (kwargs.get("env") or {}).get("DOCKER_HOST")))
+    return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+def _fake_prune(*args, **kwargs):
+    timeout_events.append(("prune", args[0]))
+    return 0
+
+with mock.patch.dict(os.environ, {"EZGHA_NPM_LOCKFILES": lock_file_p}, clear=False), \
+     mock.patch("ezgha_npm_cache.resolve_docker_env", return_value={"DOCKER_HOST": "unix:///test.sock"}), \
+     mock.patch("ezgha_npm_cache.inspect_docker_image_id", return_value="sha256:fakeimg123"), \
+     mock.patch("ezgha_npm_cache.oldest_running_runner_start_epoch", return_value=None), \
+     mock.patch("ezgha_npm_cache.run_cmd", side_effect=_timeout_run_cmd), \
+     mock.patch("ezgha_npm_cache.subprocess.run", side_effect=_fake_rm_subprocess_run), \
+     mock.patch("ezgha_npm_cache.prune_old_npm_cache", side_effect=_fake_prune):
+    try:
+        ezgha_npm_cache.refresh_npm_cache(npm_timeout_dir, "ezgha-runner:latest")
+    except subprocess.TimeoutExpired:
+        pass
+    else:
+        raise AssertionError("expected TimeoutExpired to propagate")
+
+assert len(seen_container_names) == 1
+assert timeout_events == [
+    ("rm", ["docker", "rm", "-f", seen_container_names[0]], "unix:///test.sock"),
+    ("prune", npm_timeout_dir),
+], f"unexpected timeout cleanup sequence: {timeout_events}"
+assert not os.path.exists(os.path.join(npm_timeout_dir, ".manifest.sha256"))
+
 cfg_skip_npm = os.path.join(work_dir, "cfg_skip_npm.toml")
 open(cfg_skip_npm, "w", encoding="utf-8").write(f'version = 1\n[runner]\nnpm_cache_host_path = "{npm_refresh_dir}"\n[limits]\nmin_free_disk_gb = 1\n')
 with mock.patch.dict(os.environ, {"EZGHA_CACHE_STATE_DIR": work_dir, "EZGHA_CACHE_TEST_FREE_GB": "100"}, clear=False), \
@@ -743,9 +783,24 @@ pass "(e) verify_live_cache_savings.sh hermetic <25 MiB PASS, >=25 MiB FAIL, and
 bash -n "${INSTALL_SCRIPT}"
 bash -n "${REFRESH_SCRIPT}"
 bash -n "${VERIFY_SCRIPT}"
+bash -n "${REPO_ROOT}/docker/runner-entrypoint.sh"
+if [ ! -e /tmp/ezgha-npm-cache ]; then
+  ep_src="${WORK}/entrypoint_ro_cache"
+  mkdir -p "${ep_src}/_cacache/index-v5" "${ep_src}/_cacache/content-v2"
+  printf 'x\n' > "${ep_src}/_cacache/index-v5/entry"
+  ep_out="$(env -u NPM_CONFIG_CACHE EZGHA_NPM_CACHE="${ep_src}" bash -c '
+    cp() { return 1; }
+    export -f cp
+    exec bash "$1" env
+  ' _ "${REPO_ROOT}/docker/runner-entrypoint.sh")"
+  if printf '%s\n' "${ep_out}" | grep -q '^NPM_CONFIG_CACHE='; then
+    fail "runner-entrypoint.sh exported NPM_CONFIG_CACHE despite cp failure"
+  fi
+  [ ! -e /tmp/ezgha-npm-cache ] || fail "runner-entrypoint.sh published /tmp/ezgha-npm-cache despite cp failure"
+fi
 [ -f "${REPO_ROOT}/systemd/ezgha-cache-warm.service" ] || fail "missing systemd/ezgha-cache-warm.service"
 [ -f "${REPO_ROOT}/systemd/ezgha-cache-warm.timer" ] || fail "missing systemd/ezgha-cache-warm.timer"
 bash "${REPO_ROOT}/tests/install_cache_warm_agent_test.sh" >/dev/null
-pass "(c) syntax checks and behavioral install_cache_warm_agent_test.sh verified"
+pass "(c) syntax checks, entrypoint staging fail-closed guard, and behavioral install_cache_warm_agent_test.sh verified"
 
 echo "ALL CACHE TESTS PASS"

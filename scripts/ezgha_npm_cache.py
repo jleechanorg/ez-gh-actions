@@ -10,6 +10,7 @@ import platform
 import re
 import subprocess
 import time
+import uuid
 
 from ezgha_cache_common import (
     atomic_write_text,
@@ -319,15 +320,31 @@ def refresh_npm_cache(npm_cache_path, image, git_mirror_path=None, reap_only=Fal
         return
 
     payload = json.dumps({"sources": [{"source": s, "package_json": p, "package_lock": lck} for s, p, lck in sources]})
-    docker_cmd = ["docker", "run", "--rm", "-i", "-v", f"{npm_cache_path}:/npm-cache"]
+    container_name = f"ezgha-npm-warm-{os.getpid()}-{uuid.uuid4().hex[:12]}"
+    docker_cmd = ["docker", "run", "--rm", "--name", container_name, "-i", "-v", f"{npm_cache_path}:/npm-cache"]
     if platform.system() == "Linux":
         docker_cmd.extend(["--user", f"{os.getuid()}:{os.getgid()}", "-e", "HOME=/tmp"])
     docker_cmd.extend(["--entrypoint", "python3", image, "-c", CONTAINER_NPM_STAGE_SCRIPT])
 
     log(f"refreshing npm cache via {image} ({len(sources)} lockfile source(s))")
+    warm_completed = False
     try:
         run_cmd(docker_cmd, timeout=900, env=docker_env, input_text=payload)
+        warm_completed = True
     finally:
+        if not warm_completed:
+            try:
+                rm_proc = subprocess.run(
+                    ["docker", "rm", "-f", container_name],
+                    env=merge_env(docker_env),
+                    text=True,
+                    capture_output=True,
+                    timeout=30,
+                )
+                if rm_proc.returncode != 0 and "no such container" not in (rm_proc.stderr or "").lower():
+                    warn(f"could not remove npm cache warming container {container_name}: {(rm_proc.stderr or '').strip()}")
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                warn(f"could not remove npm cache warming container {container_name}: {exc}")
         prune_old_npm_cache(npm_cache_path, oldest_runner_epoch=oldest_running_runner_start_epoch(docker_env))
         chmod_a_rx(npm_cache_path)
 

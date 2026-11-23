@@ -8,17 +8,16 @@ if [ -n "${EZGHA_NPM_CACHE:-}" ] && [ -d "${EZGHA_NPM_CACHE}/_cacache" ] && [ -z
     tmp_stage="${stage_dir}.tmp.$$"
     rm -rf "${tmp_stage}" 2>/dev/null || true
     if (
-      set -e
-      mkdir -p "${tmp_stage}/_cacache"
+      mkdir -p "${tmp_stage}/_cacache" || exit 1
       if [ -d "${EZGHA_NPM_CACHE}/_cacache/index-v5" ]; then
-        cp -a "${EZGHA_NPM_CACHE}/_cacache/index-v5" "${tmp_stage}/_cacache/"
-        chmod -R u+rwX "${tmp_stage}/_cacache/index-v5"
+        cp -a "${EZGHA_NPM_CACHE}/_cacache/index-v5" "${tmp_stage}/_cacache/" || exit 1
+        chmod -R u+rwX "${tmp_stage}/_cacache/index-v5" || exit 1
       fi
       if [ -d "${EZGHA_NPM_CACHE}/_cacache/content-v2" ]; then
-        cp -rs "${EZGHA_NPM_CACHE}/_cacache/content-v2" "${tmp_stage}/_cacache/"
+        cp -rs "${EZGHA_NPM_CACHE}/_cacache/content-v2" "${tmp_stage}/_cacache/" || exit 1
       fi
-      find "${tmp_stage}/_cacache" -type d -exec chmod u+rwx {} +
-      touch "${tmp_stage}/_cacache/.ezgha-staged"
+      find "${tmp_stage}/_cacache" -type d -exec chmod u+rwx {} + || exit 1
+      touch "${tmp_stage}/_cacache/.ezgha-staged" || exit 1
     ) >/dev/null 2>&1; then
       rm -rf "${stage_dir}" 2>/dev/null || true
       mv "${tmp_stage}" "${stage_dir}" 2>/dev/null || rm -rf "${tmp_stage}" 2>/dev/null || true
