@@ -71,21 +71,21 @@ stop_fixture_pids() {
     fi
   done
   for pid in "$LEAF" "$FPID" "$F2" "$SENTINEL" "$PS_PROBE_PID" "$FINAL_PID"; do
-    [ -n "$pid" ] && wait "$pid" 2>/dev/null || true
+    [ -n "$pid" ] && ! pid_is_running "$pid" && wait "$pid" 2>/dev/null || true
   done
 }
 cleanup() {
   stop_fixture_markers
   [ -n "$FINAL_PID" ] && [ -n "$FINAL_PID_ID" ] \
-    && { teardown_tree "$FINAL_PID" "$FINAL_PID_ID" || true; wait "$FINAL_PID" 2>/dev/null || true; } \
+    && { teardown_tree "$FINAL_PID" "$FINAL_PID_ID" || true; pid_is_running "$FINAL_PID" || wait "$FINAL_PID" 2>/dev/null || true; } \
     || true
   FINAL_PID=""; FINAL_PID_ID=""
   [ -n "$FPID" ] && [ -n "$FPID_ID" ] \
-    && { teardown_tree "$FPID" "$FPID_ID" || true; wait "$FPID" 2>/dev/null || true; } \
+    && { teardown_tree "$FPID" "$FPID_ID" || true; pid_is_running "$FPID" || wait "$FPID" 2>/dev/null || true; } \
     || true
   FPID=""; FPID_ID=""
   [ -n "$F2" ] && [ -n "$F2_ID" ] \
-    && { teardown_tree "$F2" "$F2_ID" || true; wait "$F2" 2>/dev/null || true; } \
+    && { teardown_tree "$F2" "$F2_ID" || true; pid_is_running "$F2" || wait "$F2" 2>/dev/null || true; } \
     || true
   F2=""; F2_ID=""
   stop_fixture_pids
@@ -274,7 +274,7 @@ descendants_checked "$FPID"
 
 teardown_rc=0
 teardown_tree "$FPID" "$FPID_ID" || teardown_rc=$?
-wait "$FPID" 2>/dev/null || true
+pid_is_running "$FPID" || wait "$FPID" 2>/dev/null || true
 FPID=""; FPID_ID=""
 [ "$teardown_rc" -eq 0 ] && pass "5b teardown completed with discovery available" \
                          || fail "5b teardown failed (rc=$teardown_rc)"
@@ -360,7 +360,7 @@ sleep 20 &
 child=$!
 printf '%s\n' "$child" > "$W/old-child-pid"
 LC_ALL=C ps -o lstart= -p "$child" | tr -s ' ' > "$W/old-child-identity"
-touch "$W/late-child-ready"
+touch "$W/old-late-child-ready"
 wait
 F
 chmod +x "$W/forker2.sh"
@@ -375,7 +375,7 @@ old_teardown() {  # original snapshot logic with a deterministic late-child rele
   done
   touch "$W/late-start"
   for _ in $(seq 1 100); do
-    [ -f "$W/late-child-ready" ] && break
+    [ -f "$W/old-late-child-ready" ] && break
     sleep 0.01
   done
   while IFS='|' read -r k identity; do
@@ -417,6 +417,39 @@ done < "$W/owned-pids2-finished"
 [ "$survivors" -gt 0 ] \
   && pass "6 snapshot-only regression leaves the exact late child alive" \
   || fail "6 snapshot-only regression did not leave the recorded child alive"
+
+# ---- 9. refused KILL when identity lookup fails mid-teardown must return 5 without hanging ---
+bash -c 'trap "" TERM; while [ ! -f "$1" ]; do sleep 0.05; done' _ "$W/ps-fail-stop" &
+PS_FAIL_PID=$!
+PS_FAIL_ID="$(process_identity "$PS_FAIL_PID")" || fail "9 fixture identity could not be captured"
+: > "$W/ps-fail-calls"
+process_identity() {
+  local pid="$1" identity n=0
+  [ -f "$W/ps-fail-calls" ] && n="$(wc -l < "$W/ps-fail-calls" | tr -d ' ')"
+  printf 'x\n' >> "$W/ps-fail-calls"
+  if [ "$n" -ge 3 ]; then
+    return 1
+  fi
+  kill -0 "$pid" 2>/dev/null || return 1
+  identity="$(LC_ALL=C ps -o lstart= -p "$pid" 2>/dev/null)" || return 1
+  identity="$(printf '%s' "$identity" | tr -s ' ' | sed 's/^ *//;s/ *$//')"
+  [ -n "$identity" ] || return 1
+  printf '%s\n' "$identity"
+}
+rc_ps_fail=0
+teardown_tree "$PS_FAIL_PID" "$PS_FAIL_ID" || rc_ps_fail=$?
+# shellcheck source=tests/lib/descendants.sh
+. "$ROOT/tests/lib/descendants.sh"
+[ "$rc_ps_fail" -eq 5 ] \
+  && pass "9 refused KILL with mid-teardown lookup failure returned 5 without hanging" \
+  || fail "9 refused KILL with mid-teardown lookup failure returned rc=$rc_ps_fail (expected 5)"
+pid_is_running "$PS_FAIL_PID" \
+  && pass "9 refused-KILL fixture remains alive for verified cleanup" \
+  || fail "9 refused-KILL fixture exited unexpectedly"
+touch "$W/ps-fail-stop" 2>/dev/null || true
+signal_owned_pid CONT "$PS_FAIL_PID" "$PS_FAIL_ID" || true
+signal_owned_pid KILL "$PS_FAIL_PID" "$PS_FAIL_ID" || true
+wait "$PS_FAIL_PID" 2>/dev/null || true
 
 stop_fixture_pids
 SENTINEL=""; SENTINEL_ID=""

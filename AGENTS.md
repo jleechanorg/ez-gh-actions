@@ -108,7 +108,7 @@ The cleaner does not persist a ghost skip across passes. A later scheduled pass 
 
 Track the acknowledged cohort, start date, and restore condition in its owning Bead. Set `EZGHA_SUSPENSION_RECORD` only when that record exists; unset keeps the cleaner fail-closed. Escalation occurs when the oldest ghost reaches 14 days or the distinct per-repository count reaches 200.
 
-Restore after every recorded ghost run ID is no longer queued; a repository-wide queue total of zero is not required. Close the Bead, remove the suspension record from both launchd templates, and reinstall both agents so the installed plists reflect the restored state.
+Restore after every recorded ghost run ID is no longer queued; a repository-wide queue total of zero is not required. Close the Bead and reinstall both agents with `EZGHA_SUSPENSION_RECORD=""` (keeping the template placeholders intact) so both installers explicitly clear the previously installed record in the generated plists.
 
 ### Service down
 ```bash

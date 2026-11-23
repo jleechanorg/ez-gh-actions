@@ -53,9 +53,26 @@ case "\$*" in
   *"pr list"*)
     printf '[]\n'; exit 0 ;;
   *"--jq .status"*|*".status"*)
+    if [ "\${VERIFY_STATUS_FAIL:-0}" = "1" ]; then
+      cnt_file="$WORK/status_cnt"
+      n=0
+      [ -f "\$cnt_file" ] && n="\$(cat "\$cnt_file")"
+      n=\$((n + 1))
+      printf '%s' "\$n" > "\$cnt_file"
+      if [ "\$n" -ge 2 ]; then
+        printf 'gh: Simulated status verify error (HTTP 503)\n' >&2
+        exit 1
+      fi
+    fi
     printf 'queued\n'; exit 0 ;;
   *"runs/9002/cancel"*)
     printf 'gh: Bad credentials (HTTP 401)\n' >&2; exit 1 ;;
+  *"/force-cancel"*)
+    if [ "\${FORCE_CANCEL_FAIL:-0}" = "1" ]; then
+      printf 'gh: Simulated force-cancel error (HTTP 500)\n' >&2
+      exit 1
+    fi
+    exit 0 ;;
   *"/cancel"*)
     case "\${CANCEL_MODE:-ghost}" in
       ghost)    printf 'gh: Cannot cancel a workflow run that has not been queued yet. (HTTP 409)\n' >&2; exit 1 ;;
@@ -151,6 +168,23 @@ export CANCEL_MODE=ghost GHOST_ESCALATE_COUNT=0
 run_case
 assert_rc 1 "case5 escalation bound => exit 1"
 assert_has "ESCALATION" "case5 prints the escalation notice"
+
+# ---- case 6: post-cancel verify status failure => exit 1 and failed=1 ------
+rm -f "$WORK/status_cnt"
+export CANCEL_MODE=ok CANCEL_VERIFY_WAIT_S=0 VERIFY_STATUS_FAIL=1 FORCE_CANCEL_FAIL=0 GHOST_ESCALATE_COUNT=200
+run_case
+assert_rc 1 "case6 verify status failure => exit 1"
+assert_has "FAIL verify/force-cancel 9001" "case6 records verify failure"
+assert_has "failed=1" "case6 increments failed count"
+unset VERIFY_STATUS_FAIL
+
+# ---- case 7: post-cancel force-cancel failure => exit 1 and failed=1 -------
+export CANCEL_MODE=ok CANCEL_VERIFY_WAIT_S=0 FORCE_CANCEL_FAIL=1
+run_case
+assert_rc 1 "case7 force-cancel failure => exit 1"
+assert_has "FAIL verify/force-cancel 9001" "case7 records force-cancel failure"
+assert_has "failed=1" "case7 increments failed count"
+unset FORCE_CANCEL_FAIL CANCEL_VERIFY_WAIT_S
 
 echo
 if [ "$FAILS" -ne 0 ]; then

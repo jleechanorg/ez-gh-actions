@@ -162,7 +162,10 @@ teardown_tree() {
     leader_state=$?
     if [ "$leader_state" -eq 0 ] && [ "$DESCENDANTS_RC" -eq 0 ]; then
       for k in $DESCENDANTS_OUT; do
-        child_identity="$(process_identity "$k")" || continue
+        child_identity="$(process_identity "$k")" || {
+          pid_is_running "$k" && discovery_ok=0
+          continue
+        }
         signal_owned_pid KILL "$k" "$child_identity" || true
       done
     elif [ "$leader_state" -eq 2 ]; then
@@ -172,7 +175,11 @@ teardown_tree() {
     discovery_ok=0
   fi
   signal_owned_pid KILL "$pid" "$leader_identity" || true
-  wait "$pid" 2>/dev/null || true
+  if pid_is_running "$pid"; then
+    discovery_ok=0
+  else
+    wait "$pid" 2>/dev/null || true
+  fi
 
   [ "$discovery_ok" -eq 1 ] || return 5
   return 0

@@ -142,10 +142,7 @@ def force_cancel_run(rid):
 def verify_and_force_cancel(rid):
     if verify_wait_s > 0:
         time.sleep(verify_wait_s)
-    try:
-        status = run_status(rid)
-    except subprocess.CalledProcessError:
-        return False
+    status = run_status(rid)
     if status == "queued":
         force_cancel_run(rid)
         return True
@@ -290,8 +287,12 @@ for r, reason in candidates:
         try:
             if verify_and_force_cancel(rid):
                 print(f"force-cancelled {rid}: survived plain cancel")
+        except subprocess.CalledProcessError as e:
+            failed += 1
+            print(f"FAIL verify/force-cancel {rid}: {(e.output or b'').decode()[:120]}")
         except Exception as e:
-            print(f"verify/force-cancel notice for {rid}: {e}")
+            failed += 1
+            print(f"FAIL verify/force-cancel {rid}: {e}")
     except subprocess.CalledProcessError as e:
         if is_ghost_rejection(e) and jobs_total(rid) == 0:
             ghost += 1

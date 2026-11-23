@@ -222,7 +222,6 @@ GHOST_STATUS_RE = re.compile(r"\(HTTP (\d{3})\)\s*$")
 
 _ghost_ids = set()      # DISTINCT run ids; per-lever counters overlap
 _ghost_ages = []        # for the age bound
-_jobs_cache = {}
 
 def ghost_http_status(err):
     """The ACTUAL status gh reported, or None if unknown. Anchored on gh's
@@ -244,8 +243,6 @@ def run_job_total(rid):
 
     Deliberately NOT job_labels(): that helper keeps only status=="queued"
     jobs, so an all-completed run looks identical to a zero-job run."""
-    if rid in _jobs_cache:
-        return _jobs_cache[rid]
     try:
         txt = subprocess.check_output(
             ["gh", "api", f"repos/{repo}/actions/runs/{rid}/jobs", "--jq", ".total_count"],
@@ -253,7 +250,6 @@ def run_job_total(rid):
         n = int(txt) if txt else -1
     except Exception:
         n = -1
-    _jobs_cache[rid] = n
     return n
 
 def ghost_hit(rid, age_m=None):

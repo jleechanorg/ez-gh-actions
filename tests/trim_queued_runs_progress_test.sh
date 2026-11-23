@@ -45,7 +45,7 @@ stop_fixture_pids() {
 cleanup() {
   if [ -n "$RUNPID" ] && [ -n "$RUNPID_ID" ]; then
     teardown_tree "$RUNPID" "$RUNPID_ID" || true
-    wait "$RUNPID" 2>/dev/null || true
+    pid_is_running "$RUNPID" || wait "$RUNPID" 2>/dev/null || true
     RUNPID=""; RUNPID_ID=""
   fi
   stop_fixture_pids
@@ -132,6 +132,8 @@ done
 [ -s "$WORK/progress-sleep-pid" ] \
   || fail "fixture: blocking sleep 20 did not start after scan output"
 descendants_checked "$RUNPID"
+[ "$DESCENDANTS_RC" -eq 0 ] \
+  || fail "fixture: descendants_checked failed (rc=$DESCENDANTS_RC)"
 progress_sleep_pid="$(cat "$WORK/progress-sleep-pid" 2>/dev/null || true)"
 progress_sleep_identity="$(process_identity "$progress_sleep_pid")" \
   || fail "fixture: blocking sleep 20 identity could not be captured"
@@ -151,7 +153,7 @@ fi
 # `wait` under `set -e` would abort BEFORE the assertions below.
 teardown_rc=0
 teardown_tree "$RUNPID" "$RUNPID_ID" || teardown_rc=$?
-wait "$RUNPID" 2>/dev/null || true
+pid_is_running "$RUNPID" || wait "$RUNPID" 2>/dev/null || true
 RUNPID=""; RUNPID_ID=""
 
 # Discovery MUST have worked, otherwise the survivor check below is vacuous.

@@ -52,6 +52,15 @@ case "$*" in
     exit 0 ;;
   *"/jobs"*)
     if [ "${JOBS_EMPTY:-0}" = "1" ]; then exit 0; fi
+    if [ -n "${JOBS_SEQUENCE_FILE:-}" ] && [[ "$*" == *"runs/9001/jobs"* ]]; then
+      cnt_file="${JOBS_SEQUENCE_FILE}.cnt"
+      n=0
+      [ -f "$cnt_file" ] && n="$(cat "$cnt_file")"
+      n=$((n + 1))
+      printf '%s' "$n" > "$cnt_file"
+      if [ "$n" -eq 1 ]; then printf '0'; else printf '2'; fi
+      exit 0
+    fi
     printf '%s' "${JOBS_BODY:-0}"; exit 0 ;;
   *"actions/runners"*)
     printf '{"runners":[]}'; exit 0 ;;
@@ -148,6 +157,16 @@ export CANCEL_MODE=ghost JOBS_BODY=0 GHOST_ESCALATE_COUNT=0
 run_case --zombies --apply
 assert_rc 1 "6 escalation bound => exit 1"
 assert_has "ESCALATION" "6 prints the escalation notice"
+
+# ---- 7: run_job_total re-queries /jobs instead of caching across levers ----
+export CANCEL_MODE=ghost JOBS_BODY=0 GHOST_ESCALATE_COUNT=200 TWO_RUNS=1
+export JOBS_SEQUENCE_FILE="$WORK/jobs_seq"
+rm -f "${JOBS_SEQUENCE_FILE}.cnt"
+run_case --zombies --superseded --apply
+assert_rc 1 "7 second /jobs query seeing jobs fails closed => exit 1"
+assert_has "'zombie_ghost': 2" "7 first pass saw 0 jobs (ghost)"
+assert_has "'superseded_failed': 1" "7 second pass re-queried /jobs and saw >0 jobs (failed)"
+unset TWO_RUNS JOBS_SEQUENCE_FILE
 
 echo
 if [ "$FAILS" -ne 0 ]; then
