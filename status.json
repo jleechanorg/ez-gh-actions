@@ -257,27 +257,27 @@
   },
   "latency": {
     "cancellation": {
-      "cancelled_rate_pct": 20.4,
-      "cancelled_runs": 11,
-      "total_non_skipped_runs": 54
+      "cancelled_rate_pct": 23.6,
+      "cancelled_runs": 13,
+      "total_non_skipped_runs": 55
     },
     "cohort": "success",
-    "generated_at": "2026-11-23T15:42:51Z",
+    "generated_at": "2026-11-23T15:54:14Z",
     "ok": true,
     "overall": {
       "e2e": {
-        "avg_s": 288.62,
+        "avg_s": 276.9,
         "max_s": 3156.0,
-        "n": 42,
+        "n": 41,
         "p50_s": 37.0,
-        "p90_s": 431.1,
-        "p99_s": 2998.97
+        "p90_s": 351.0,
+        "p99_s": 3002.8
       },
       "execution": {
-        "avg_s": 313.75,
+        "avg_s": 314.71,
         "max_s": 2764.0,
         "n": 72,
-        "p50_s": 50.5,
+        "p50_s": 55.5,
         "p90_s": 696.7,
         "p99_s": 2608.51
       },
@@ -350,12 +350,12 @@
       },
       {
         "e2e": {
-          "avg_s": 649.5,
-          "max_s": 769.0,
-          "n": 2,
-          "p50_s": 649.5,
-          "p90_s": 745.1,
-          "p99_s": 766.61
+          "avg_s": 530.0,
+          "max_s": 530.0,
+          "n": 1,
+          "p50_s": 530.0,
+          "p90_s": 530.0,
+          "p99_s": 530.0
         },
         "execution": {
           "avg_s": null,
@@ -574,6 +574,34 @@
       },
       {
         "e2e": {
+          "avg_s": null,
+          "max_s": null,
+          "n": 0,
+          "p50_s": null,
+          "p90_s": null,
+          "p99_s": null
+        },
+        "execution": {
+          "avg_s": 29.2,
+          "max_s": 58.0,
+          "n": 5,
+          "p50_s": 19.0,
+          "p90_s": 47.6,
+          "p99_s": 56.96
+        },
+        "queue_wait": {
+          "avg_s": 1.2,
+          "max_s": 2.0,
+          "n": 5,
+          "p50_s": 1.0,
+          "p90_s": 1.6,
+          "p99_s": 1.96
+        },
+        "repo": "repo-1",
+        "workflow": "workflow-11"
+      },
+      {
+        "e2e": {
           "avg_s": 42.0,
           "max_s": 52.0,
           "n": 3,
@@ -598,7 +626,7 @@
           "p99_s": 2.99
         },
         "repo": "repo-1",
-        "workflow": "workflow-11"
+        "workflow": "workflow-12"
       },
       {
         "e2e": {
@@ -626,7 +654,7 @@
           "p99_s": 1.0
         },
         "repo": "repo-1",
-        "workflow": "workflow-12"
+        "workflow": "workflow-13"
       },
       {
         "e2e": {
@@ -652,34 +680,6 @@
           "p50_s": 3.0,
           "p90_s": 3.8,
           "p99_s": 3.98
-        },
-        "repo": "repo-1",
-        "workflow": "workflow-13"
-      },
-      {
-        "e2e": {
-          "avg_s": null,
-          "max_s": null,
-          "n": 0,
-          "p50_s": null,
-          "p90_s": null,
-          "p99_s": null
-        },
-        "execution": {
-          "avg_s": 15.0,
-          "max_s": 19.0,
-          "n": 5,
-          "p50_s": 14.0,
-          "p90_s": 18.6,
-          "p99_s": 18.96
-        },
-        "queue_wait": {
-          "avg_s": 1.0,
-          "max_s": 1.0,
-          "n": 5,
-          "p50_s": 1.0,
-          "p90_s": 1.0,
-          "p99_s": 1.0
         },
         "repo": "repo-1",
         "workflow": "workflow-14"
@@ -714,12 +714,12 @@
       }
     ]
   },
-  "observed_at": "2026-11-23T15:42:03Z",
-  "published_at": "2026-11-23T15:42:04Z",
+  "observed_at": "2026-11-23T15:53:32Z",
+  "published_at": "2026-11-23T15:53:34Z",
   "queue": {
     "fresh": null,
     "ghosts": null,
-    "in_progress_runs": 3,
+    "in_progress_runs": 1,
     "ok": true,
     "oldest_fresh_wait_minutes": null,
     "partial": true,
@@ -739,12 +739,12 @@
   },
   "reconciliation": {
     "active_job_slots_occupied": 0,
-    "active_workflow_runs": 3,
+    "active_workflow_runs": 1,
     "available_pools": 1,
     "configured_slots": 20,
     "cycling_slots": 0,
     "down_slots": 0,
-    "explanation": "3 active GitHub workflow runs | 0 occupied local runner slots; queue partial: 89 unverified.",
+    "explanation": "1 active GitHub workflow runs | 0 occupied local runner slots; queue partial: 89 unverified.",
     "fresh_queued_runs": null,
     "idle_slots": 20,
     "inert_ghosts": null,
