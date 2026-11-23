@@ -68,6 +68,7 @@ jobs:
           bash tests/setup_native_macos_runner_test.sh
       - name: Cleanup-stuck-runs regression tests
         run: |
+          bash tests/cleanup_stuck_runs_app_token_test.sh
           bash tests/cleanup_stuck_runs_force_cancel_test.sh
           bash tests/cleanup_stuck_runs_multirepo_test.sh
           bash tests/cleanup_stuck_runs_race_skip_test.sh
