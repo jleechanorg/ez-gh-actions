@@ -22,6 +22,8 @@
 #
 # Usage: bash tests/cleanup_stuck_runs_race_skip_test.sh
 set -euo pipefail
+unset BASH_ENV || true   # this host exports BASH_ENV=~/.bashrc, which would
+                            # prepend ~/.local/bin ahead of the stub dir and run the REAL gh
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"

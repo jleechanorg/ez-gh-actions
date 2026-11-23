@@ -754,10 +754,53 @@ if [ -d "${UNIT_DIR}" ]; then
 
   if [ "$(uname -s)" = "Darwin" ]; then
     # macOS: wrap each systemd-style unit into a launchd plist
+    # XML-escape a value before interpolating it into a plist <string>.
+    # Without this a record containing & or < produces an INVALID plist, and the
+    # installer unloads the prior agent before writing, so a bad value can leave
+    # a cleaner UNLOADED (review P0).
+    #
+    # NOTE: bash's ${var//pat/rep} expands & in the REPLACEMENT to the matched
+    # text, so "${s//</&lt;}" yields "<lt;" (verified on bash 5.3). Use sed with
+    # escaped ampersands instead — the same construction the launchd template
+    # installer already relies on. Escape & FIRST.
+    xml_esc() {
+      printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'
+    }
+
+    # Read EZGHA_SUSPENSION_RECORD from an ALREADY INSTALLED plist so a
+    # reinstall without the env var preserves the declaration. Empty when the
+    # file or key is absent (=> fail-closed, which is the safe default).
+    plist_record_of() {
+      local f="$1"
+      [ -f "${f}" ] || { printf ''; return 0; }
+      # Prefer python3 plistlib (portable); PlistBuddy is the macOS fallback.
+      # NOTE: the python body must run BEFORE any `return`, otherwise the
+      # heredoc-produced value is discarded and preservation silently no-ops.
+      if command -v python3 >/dev/null 2>&1; then
+        python3 - "${f}" <<'PYPLIST' 2>/dev/null
+import plistlib, sys
+try:
+    d = plistlib.load(open(sys.argv[1], "rb"))
+except Exception:
+    raise SystemExit
+env = d.get("EnvironmentVariables") or {}
+sys.stdout.write(env.get("EZGHA_SUSPENSION_RECORD", ""))
+PYPLIST
+        return 0
+      fi
+      /usr/libexec/PlistBuddy -c "Print :EnvironmentVariables:EZGHA_SUSPENSION_RECORD" "${f}" 2>/dev/null || printf ''
+    }
+
     install_macos_plist() {
       local name="$1" interval_sec="$2" exec_path="$3" exec_args="$4"
       local plist="${HOME}/Library/LaunchAgents/org.jleechanorg.ezgha-${name}.plist"
+      # Capture the EXISTING declaration BEFORE we truncate the file below.
+      # install.sh overwrites ${plist} with `cat >`, so a read taken after that
+      # point cannot preserve anything (this was a P0: a reinstall without the
+      # env var silently cleared an acknowledged ghost set).
+      local prior_record=""
       if [ -f "${plist}" ]; then
+        prior_record="$(plist_record_of "${plist}")"
         launchctl unload "${plist}" 2>/dev/null || true
       fi
       mkdir -p "${HOME_DIR}/.local/state/ezgha"
@@ -776,12 +819,39 @@ PLIST
       cat >> "${plist}" <<PLIST
   </array>
 PLIST
-      # EnvironmentVariables: DOCKER_HOST when detected.
+      # EnvironmentVariables: DOCKER_HOST when detected, and the ghost-run
+      # suspension declaration for the queue agents. Both the template path
+      # (launchd/install-launchagents.sh) and this path MUST emit the declaration,
+      # or a routine reinstall silently reverts an acknowledged ghost set to
+      # fail-closed and the cleaners go red again (code-standards review P0).
+      local env_xml=""
       if [ -n "${DOCKER_HOST_OVERRIDE}" ]; then
+        env_xml="    <key>DOCKER_HOST</key><string>${DOCKER_HOST_OVERRIDE}</string>"
+      fi
+      case "${name}" in
+        queue-trimmer|queue-reaper)
+          # Preserve an EXISTING declaration across reinstalls. A routine
+          # ./install.sh (or a fresh-checkout reinstall) runs WITHOUT the
+          # variable exported; if we simply emitted empty we would silently
+          # revert an acknowledged ghost set to fail-closed and the cleaners
+          # would go permanently red again. Precedence:
+          #   1. EZGHA_SUSPENSION_RECORD explicitly set (incl. empty) -> declare it
+          #   2. otherwise, carry over the value already in the installed plist
+          #   3. otherwise, emit an explicit empty declaration
+          local rec="${EZGHA_SUSPENSION_RECORD-__UNSET__}"
+          if [ "${rec}" = "__UNSET__" ]; then
+            # prior_record was decoded by plistlib (entities resolved), so it is
+            # re-escaped on write below. That round-trip is intentional.
+            rec="${prior_record}"      # captured before truncation
+          fi
+          env_xml="${env_xml}    <key>EZGHA_SUSPENSION_RECORD</key><string>$(xml_esc "${rec}")</string>"
+          ;;
+      esac
+      if [ -n "${env_xml}" ]; then
         cat >> "${plist}" <<PLIST
   <key>EnvironmentVariables</key>
   <dict>
-    <key>DOCKER_HOST</key><string>${DOCKER_HOST_OVERRIDE}</string>
+${env_xml}
   </dict>
 PLIST
       fi
@@ -818,7 +888,9 @@ PLIST
     }
     install_macos_plist "token-refresh" "2700"  "${SCRIPTS_DIR}/refresh_gh_app_token.sh" ""
     install_macos_plist "queue-reaper"  "21600" "${SCRIPTS_DIR}/cleanup-stuck-runs.sh" "--apply"
-    install_macos_plist "queue-trimmer" "900"   "${SCRIPTS_DIR}/trim-queued-runs.sh" "--apply --min-pr-age-hours 2"
+    # 1.5h matches the launchd template and the deployed job. A reinstall must
+    # NOT silently change which runs are eligible for cancellation.
+    install_macos_plist "queue-trimmer" "900"   "${SCRIPTS_DIR}/trim-queued-runs.sh" "--apply --min-pr-age-hours 1.5"
     install_macos_plist "mission-output-cleanup" "3600" "${SCRIPTS_DIR}/cleanup-mission-output.sh" "--apply"
     info "runner dashboard activation deferred — install explicitly after enabling Pages (issue #82)"
     install_macos_plist "colima-trim"   "60"    "${SCRIPTS_DIR}/colima-trim-guard.sh" ""
