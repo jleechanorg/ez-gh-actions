@@ -262,32 +262,32 @@
       "total_non_skipped_runs": 55
     },
     "cohort": "success",
-    "generated_at": "2026-11-23T16:39:06Z",
+    "generated_at": "2026-11-23T16:50:20Z",
     "ok": true,
     "overall": {
       "e2e": {
-        "avg_s": 249.87,
+        "avg_s": 247.52,
         "max_s": 3156.0,
         "n": 46,
-        "p50_s": 31.5,
+        "p50_s": 25.0,
         "p90_s": 317.0,
         "p99_s": 2983.65
       },
       "execution": {
-        "avg_s": 303.14,
+        "avg_s": 321.51,
         "max_s": 2764.0,
-        "n": 81,
-        "p50_s": 46.0,
-        "p90_s": 694.0,
-        "p99_s": 2588.8
+        "n": 76,
+        "p50_s": 56.0,
+        "p90_s": 695.5,
+        "p99_s": 2599.75
       },
       "queue_wait": {
-        "avg_s": 1.64,
+        "avg_s": 1.71,
         "max_s": 12.0,
-        "n": 81,
+        "n": 76,
         "p50_s": 1.0,
         "p90_s": 2.0,
-        "p99_s": 6.4
+        "p99_s": 6.75
       }
     },
     "partial": false,
@@ -322,6 +322,34 @@
       },
       {
         "e2e": {
+          "avg_s": 1277.0,
+          "max_s": 1277.0,
+          "n": 1,
+          "p50_s": 1277.0,
+          "p90_s": 1277.0,
+          "p99_s": 1277.0
+        },
+        "execution": {
+          "avg_s": null,
+          "max_s": null,
+          "n": 0,
+          "p50_s": null,
+          "p90_s": null,
+          "p99_s": null
+        },
+        "queue_wait": {
+          "avg_s": null,
+          "max_s": null,
+          "n": 0,
+          "p50_s": null,
+          "p90_s": null,
+          "p99_s": null
+        },
+        "repo": "repo-1",
+        "workflow": "workflow-2"
+      },
+      {
+        "e2e": {
           "avg_s": 1213.0,
           "max_s": 1213.0,
           "n": 1,
@@ -346,7 +374,35 @@
           "p99_s": 2.0
         },
         "repo": "repo-1",
-        "workflow": "workflow-2"
+        "workflow": "workflow-3"
+      },
+      {
+        "e2e": {
+          "avg_s": 954.0,
+          "max_s": 954.0,
+          "n": 1,
+          "p50_s": 954.0,
+          "p90_s": 954.0,
+          "p99_s": 954.0
+        },
+        "execution": {
+          "avg_s": null,
+          "max_s": null,
+          "n": 0,
+          "p50_s": null,
+          "p90_s": null,
+          "p99_s": null
+        },
+        "queue_wait": {
+          "avg_s": null,
+          "max_s": null,
+          "n": 0,
+          "p50_s": null,
+          "p90_s": null,
+          "p99_s": null
+        },
+        "repo": "repo-1",
+        "workflow": "workflow-4"
       },
       {
         "e2e": {
@@ -374,7 +430,7 @@
           "p99_s": 2.89
         },
         "repo": "repo-1",
-        "workflow": "workflow-3"
+        "workflow": "workflow-5"
       },
       {
         "e2e": {
@@ -402,7 +458,7 @@
           "p99_s": 2.96
         },
         "repo": "repo-1",
-        "workflow": "workflow-4"
+        "workflow": "workflow-6"
       },
       {
         "e2e": {
@@ -430,7 +486,7 @@
           "p99_s": 11.9
         },
         "repo": "repo-2",
-        "workflow": "workflow-5"
+        "workflow": "workflow-7"
       },
       {
         "e2e": {
@@ -458,7 +514,7 @@
           "p99_s": 3.0
         },
         "repo": "repo-1",
-        "workflow": "workflow-6"
+        "workflow": "workflow-8"
       },
       {
         "e2e": {
@@ -486,7 +542,7 @@
           "p99_s": 1.95
         },
         "repo": "repo-2",
-        "workflow": "workflow-7"
+        "workflow": "workflow-9"
       },
       {
         "e2e": {
@@ -514,16 +570,16 @@
           "p99_s": 1.0
         },
         "repo": "repo-2",
-        "workflow": "workflow-8"
+        "workflow": "workflow-10"
       },
       {
         "e2e": {
-          "avg_s": 65.0,
-          "max_s": 74.0,
-          "n": 2,
-          "p50_s": 65.0,
-          "p90_s": 72.2,
-          "p99_s": 73.82
+          "avg_s": 56.0,
+          "max_s": 56.0,
+          "n": 1,
+          "p50_s": 56.0,
+          "p90_s": 56.0,
+          "p99_s": 56.0
         },
         "execution": {
           "avg_s": 53.0,
@@ -542,44 +598,16 @@
           "p99_s": 2.0
         },
         "repo": "repo-1",
-        "workflow": "workflow-9"
+        "workflow": "workflow-11"
       },
       {
         "e2e": {
-          "avg_s": null,
-          "max_s": null,
-          "n": 0,
-          "p50_s": null,
-          "p90_s": null,
-          "p99_s": null
-        },
-        "execution": {
-          "avg_s": 29.2,
-          "max_s": 58.0,
-          "n": 5,
-          "p50_s": 19.0,
-          "p90_s": 47.6,
-          "p99_s": 56.96
-        },
-        "queue_wait": {
-          "avg_s": 1.2,
-          "max_s": 2.0,
-          "n": 5,
-          "p50_s": 1.0,
-          "p90_s": 1.6,
-          "p99_s": 1.96
-        },
-        "repo": "repo-1",
-        "workflow": "workflow-10"
-      },
-      {
-        "e2e": {
-          "avg_s": 65.5,
-          "max_s": 90.0,
-          "n": 2,
-          "p50_s": 65.5,
-          "p90_s": 85.1,
-          "p99_s": 89.51
+          "avg_s": 41.0,
+          "max_s": 41.0,
+          "n": 1,
+          "p50_s": 41.0,
+          "p90_s": 41.0,
+          "p99_s": 41.0
         },
         "execution": {
           "avg_s": 38.0,
@@ -598,35 +626,35 @@
           "p99_s": 2.0
         },
         "repo": "repo-1",
-        "workflow": "workflow-11"
+        "workflow": "workflow-12"
       },
       {
         "e2e": {
-          "avg_s": 42.8,
+          "avg_s": 42.0,
           "max_s": 52.0,
-          "n": 5,
-          "p50_s": 42.0,
-          "p90_s": 48.0,
-          "p99_s": 51.6
+          "n": 6,
+          "p50_s": 41.5,
+          "p90_s": 47.0,
+          "p99_s": 51.5
         },
         "execution": {
-          "avg_s": 36.25,
+          "avg_s": 36.2,
           "max_s": 38.0,
-          "n": 4,
+          "n": 5,
           "p50_s": 37.0,
-          "p90_s": 37.7,
-          "p99_s": 37.97
+          "p90_s": 37.6,
+          "p99_s": 37.96
         },
         "queue_wait": {
-          "avg_s": 2.25,
+          "avg_s": 2.2,
           "max_s": 3.0,
-          "n": 4,
+          "n": 5,
           "p50_s": 2.0,
-          "p90_s": 2.7,
-          "p99_s": 2.97
+          "p90_s": 2.6,
+          "p99_s": 2.96
         },
         "repo": "repo-1",
-        "workflow": "workflow-12"
+        "workflow": "workflow-13"
       },
       {
         "e2e": {
@@ -654,7 +682,7 @@
           "p99_s": 1.0
         },
         "repo": "repo-1",
-        "workflow": "workflow-13"
+        "workflow": "workflow-14"
       },
       {
         "e2e": {
@@ -682,40 +710,12 @@
           "p99_s": 1.0
         },
         "repo": "repo-2",
-        "workflow": "workflow-14"
-      },
-      {
-        "e2e": {
-          "avg_s": 16.2,
-          "max_s": 26.0,
-          "n": 5,
-          "p50_s": 13.0,
-          "p90_s": 24.8,
-          "p99_s": 25.88
-        },
-        "execution": {
-          "avg_s": 10.25,
-          "max_s": 19.0,
-          "n": 4,
-          "p50_s": 8.0,
-          "p90_s": 16.0,
-          "p99_s": 18.7
-        },
-        "queue_wait": {
-          "avg_s": 1.75,
-          "max_s": 2.0,
-          "n": 4,
-          "p50_s": 2.0,
-          "p90_s": 2.0,
-          "p99_s": 2.0
-        },
-        "repo": "repo-1",
         "workflow": "workflow-15"
       }
     ]
   },
-  "observed_at": "2026-11-23T16:38:26Z",
-  "published_at": "2026-11-23T16:38:27Z",
+  "observed_at": "2026-11-23T16:49:39Z",
+  "published_at": "2026-11-23T16:49:40Z",
   "queue": {
     "fresh": null,
     "ghosts": null,
