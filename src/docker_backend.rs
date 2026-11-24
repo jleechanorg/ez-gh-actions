@@ -7,7 +7,7 @@ use std::io::Read;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::{Command, Output};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, Once};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -40,6 +40,8 @@ const DISK_MEASURE_STRIKES: u32 = 2;
 /// Incident-derived early warning for Mac host pressure. This is deliberately
 /// observability-only: `limits.min_free_disk_gb` remains the admission floor.
 const MACOS_HOST_DISK_PRESSURE_ALERT_GB: u64 = 40;
+const DISK_PROBE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
+static DISK_PROBE_COUNTER: AtomicU64 = AtomicU64::new(0);
 static CONSECUTIVE_DISK_NONE: AtomicU32 = AtomicU32::new(0);
 /// Once a failure-ladder transition cannot be persisted, the on-disk ledger
 /// is stale and the daemon must not admit another external start against it.
@@ -4764,6 +4766,41 @@ fn drain_inflight_registrations_inner(
     summary
 }
 
+fn next_disk_probe_name() -> String {
+    let seq = DISK_PROBE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("ezgha-disk-probe-{}-{seq}", std::process::id())
+}
+
+/// Best-effort cleanup guard for a uniquely named `docker run` probe container.
+/// `--rm` alone is not honored when `docker run` fails during create/start or
+/// is killed on CLI timeout, which otherwise leaks `Created` containers.
+struct ProbeContainerGuard {
+    name: String,
+}
+
+impl Drop for ProbeContainerGuard {
+    fn drop(&mut self) {
+        let mut rm_cmd = docker_cmd();
+        rm_cmd.args(["rm", "-f", &self.name]);
+        if let Ok(out) = run_docker_with_timeout(
+            rm_cmd,
+            "cleaning up df disk probe container",
+            DISK_PROBE_CLEANUP_TIMEOUT,
+        ) {
+            if !out.status.success() {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                if !stderr.to_ascii_lowercase().contains("no such container") {
+                    eprintln!(
+                        "warning: failed to clean up disk probe container {}: {}",
+                        self.name,
+                        stderr.trim()
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// Free disk in GB as seen by the docker DAEMON, measured from inside a
 /// container: the container's root overlay lives on the daemon's storage, so
 /// this is the disk runner jobs will actually fill. A host-side `df` would
@@ -4774,9 +4811,28 @@ pub fn free_disk_gb(image: &str) -> Option<u64> {
         return free;
     }
 
+    free_disk_gb_with_timeout(image, DOCKER_TIMEOUT)
+}
+
+fn free_disk_gb_with_timeout(image: &str, timeout: Duration) -> Option<u64> {
+    let probe_name = next_disk_probe_name();
+    let _guard = ProbeContainerGuard {
+        name: probe_name.clone(),
+    };
+
     let mut cmd = docker_cmd();
-    cmd.args(["run", "--rm", "--entrypoint", "df", image, "-Pk", "/"]);
-    let out = run_docker(cmd, "measuring docker daemon free disk")
+    cmd.args([
+        "run",
+        "--rm",
+        "--name",
+        &probe_name,
+        "--entrypoint",
+        "df",
+        image,
+        "-Pk",
+        "/",
+    ]);
+    let out = run_docker_with_timeout(cmd, "measuring docker daemon free disk", timeout)
         .ok()
         .filter(|o| o.status.success())?;
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -5867,6 +5923,143 @@ mod tests {
         *TEST_HOST_FREE_DISK_GB.lock().unwrap() = None;
 
         assert!(host_free_disk_gb().is_some());
+    }
+
+    fn with_fake_df_probe_docker<F>(label: &str, run_body: &str, rm_body: &str, f: F)
+    where
+        F: FnOnce(&Path),
+    {
+        let _env = TestEnv::new(label);
+        *TEST_FREE_DISK_GB.lock().unwrap() = None;
+        let temp_dir = env::temp_dir().join(format!(
+            "ezgha-df-probe-test-{}-{label}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let log_path = temp_dir.join("docker-calls.log");
+        let script = temp_dir.join("docker");
+        let script_src = format!(
+            "#!/bin/sh\n\
+            PATH=/usr/bin:/bin\n\
+            if [ \"${{1:-}}\" = \"--host\" ]; then\n\
+              shift 2\n\
+            fi\n\
+            printf '%s\\n' \"$*\" >> '{}'\n\
+            case \"${{1:-}}\" in\n\
+              run)\n\
+                {run_body}\n\
+                ;;\n\
+              rm)\n\
+                {rm_body}\n\
+                ;;\n\
+              *)\n\
+                echo \"unexpected docker subcommand: $*\" >&2\n\
+                exit 99\n\
+                ;;\n\
+            esac\n",
+            log_path.to_string_lossy()
+        );
+        std::fs::write(&script, script_src).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        *TEST_DOCKER_BIN.lock().unwrap() = Some(script.to_string_lossy().into_owned());
+
+        f(&log_path);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    fn assert_only_probe_container_cleaned_up(log_path: &Path) {
+        let log = std::fs::read_to_string(log_path).expect("docker calls log should exist");
+        let lines: Vec<&str> = log.lines().collect();
+        assert_eq!(
+            lines.len(),
+            2,
+            "expected exactly `run` and `rm -f` invocations, got:\n{log}"
+        );
+        let run_tokens: Vec<&str> = lines[0].split_whitespace().collect();
+        assert_eq!(run_tokens.get(0..3), Some(["run", "--rm", "--name"].as_slice()));
+        let probe_name = run_tokens[3];
+        assert!(
+            probe_name.starts_with("ezgha-disk-probe-"),
+            "probe container name must use ezgha-disk-probe- prefix, got {probe_name}"
+        );
+        assert_eq!(
+            run_tokens.get(4..),
+            Some(["--entrypoint", "df", "ezgha-runner:latest", "-Pk", "/"].as_slice())
+        );
+
+        let rm_tokens: Vec<&str> = lines[1].split_whitespace().collect();
+        assert_eq!(
+            rm_tokens,
+            vec!["rm", "-f", probe_name],
+            "cleanup must target ONLY the probe's unique container name"
+        );
+    }
+
+    #[test]
+    fn free_disk_gb_success_cleans_up_only_probe_container() {
+        with_fake_df_probe_docker(
+            "df_probe_success",
+            "printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\\noverlay 104857600 41943040 41943040 50%% /\\n'\nexit 0",
+            "echo \"Error response from daemon: No such container: $3\" >&2\nexit 1",
+            |log_path| {
+                let free = free_disk_gb("ezgha-runner:latest");
+                assert_eq!(free, Some(40));
+                assert_only_probe_container_cleaned_up(log_path);
+            },
+        );
+    }
+
+    #[test]
+    fn free_disk_gb_startup_failure_cleans_up_only_probe_container() {
+        with_fake_df_probe_docker(
+            "df_probe_startup_failure",
+            "echo 'docker: Error response from daemon: container create failed' >&2\nexit 125",
+            "exit 0",
+            |log_path| {
+                let free = free_disk_gb("ezgha-runner:latest");
+                assert_eq!(free, None);
+                assert_only_probe_container_cleaned_up(log_path);
+            },
+        );
+    }
+
+    #[test]
+    fn free_disk_gb_timeout_cleans_up_only_probe_container() {
+        with_fake_df_probe_docker(
+            "df_probe_timeout",
+            "exec sleep 30",
+            "exit 0",
+            |log_path| {
+                let start = Instant::now();
+                let free = free_disk_gb_with_timeout(
+                    "ezgha-runner:latest",
+                    Duration::from_secs(1),
+                );
+                assert_eq!(free, None);
+                assert!(
+                    start.elapsed() < Duration::from_secs(5),
+                    "probe timeout took too long: {:?}",
+                    start.elapsed()
+                );
+                assert_only_probe_container_cleaned_up(log_path);
+            },
+        );
+    }
+
+    #[test]
+    fn free_disk_gb_parse_failure_cleans_up_only_probe_container() {
+        with_fake_df_probe_docker(
+            "df_probe_parse_failure",
+            "printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\\noverlay 100 50 not-a-number 50%% /\\n'\nexit 0",
+            "exit 0",
+            |log_path| {
+                let free = free_disk_gb("ezgha-runner:latest");
+                assert_eq!(free, None);
+                assert_only_probe_container_cleaned_up(log_path);
+            },
+        );
     }
 
     #[test]

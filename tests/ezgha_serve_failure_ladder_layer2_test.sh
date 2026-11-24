@@ -100,9 +100,9 @@ case "${1:-}" in
   pull) [[ "$#" -eq 2 && "${2:-}" == 'alpine:3.19' ]] || exit 91 ;;
   ps)
     [[ "$#" -eq 5 && "$2" == '--filter' && "$3" == 'label=ezgha=managed' && "$4" == '--format' && "$5" == 'json' ]] || exit 91 ;;
-  rm) [[ "${2:-}" == '-f' && "$#" -eq 3 && "${3:-}" =~ ^layer2-serve-runner-[1-3]$ ]] || exit 91 ;;
+  rm) [[ "${2:-}" == '-f' && "$#" -eq 3 ]] && [[ "${3:-}" =~ ^layer2-serve-runner-[1-3]$ || "${3:-}" =~ ^ezgha-disk-probe-[0-9]+-[0-9]+$ ]] || exit 91 ;;
   run)
-    if [[ "$#" -eq 7 && "$2" == '--rm' && "$3" == '--entrypoint' && "$4" == 'df' && "$5" == 'layer2-runner:never-pulled' && "$6" == '-Pk' && "$7" == '/' ]]; then
+    if [[ "$#" -eq 9 && "$2" == '--rm' && "$3" == '--name' && "$4" =~ ^ezgha-disk-probe-[0-9]+-[0-9]+$ && "$5" == '--entrypoint' && "$6" == 'df' && "$7" == 'layer2-runner:never-pulled' && "$8" == '-Pk' && "$9" == '/' ]]; then
       printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\n'
       printf 'overlay 4194304 1 4194303 1%% /\n'
     elif [[ "$#" -eq 8 && "$2" == '--rm' && "$3" == '--cgroupns=host' && "$4" == '--network=none' && "$5" == 'alpine:3.19' && "$6" == 'sh' && "$7" == '-c' && "$8" == 'cat /sys/fs/cgroup/cgroup.controllers 2>/dev/null || cat /proc/cgroups 2>/dev/null' ]]; then
