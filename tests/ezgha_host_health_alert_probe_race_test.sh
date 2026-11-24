@@ -72,14 +72,26 @@ if [ "$1" = top ]; then
       printf 'PID COMMAND\n1 bash\n'
       ;;
     wrapper-not-running)
-      # Non-docker wrapper text on one of two containers. With the anchored
-      # regex this blinds (rc=1); an unanchored match would count the healthy
-      # container and report 1, so this fixture discriminates the anchoring.
+      # Non-docker wrapper text on one of two containers. This discriminates a
+      # loose bare-substring match ('is not running', the pre-fix regression)
+      # from a match on the daemon's own error shape: bare matching would call
+      # this container absent, count the healthy one, and report 1.
       if [ "$2" = "$GONE_ID" ]; then
         printf 'colima is not running\n' >&2
         exit 1
       fi
       printf 'PID COMMAND\n1 Runner.Listener\n'
+      ;;
+    generic-first-success-second)
+      # Failure-path re-read only: the classification run may succeed where the
+      # capacity read failed. A successful re-read must not become a count.
+      if [ -f "${PROBE_MARKER:-/nonexistent}" ]; then
+        printf 'PID COMMAND\n1 Runner.Listener\n'
+      else
+        : > "${PROBE_MARKER:-/dev/null}" 2>/dev/null || true
+        printf 'Error response from daemon: something transient\n' >&2
+        exit 1
+      fi
       ;;
     success-with-warning)
       # The docker CLI can print a warning and still exit 0 (unparsable
@@ -182,6 +194,30 @@ if [ "$rc" = 1 ] && [ -z "$out" ]; then
   echo "PASS: an unreachable docker daemon still blinds the probe"
 else
   echo "FAIL: an unreachable docker daemon still blinds the probe (rc=$rc out='$out')"
+  FAILED=1
+fi
+
+# A failed capacity read whose classification re-read succeeds must stay unknown:
+# the re-read only supplies error text, never a count.
+marker="$W/skew-marker"
+rm -f "$marker"
+rc=0
+out=$(PROBE_MARKER="$marker" PROBE_FIXTURE=generic-first-success-second bash -c "$(cat "$W/probe_fn.sh"); probe_runner_count \"\$1\"" bash "$W/docker" 2>/dev/null) || rc=$?
+if [ "$rc" = 1 ] && [ -z "$out" ]; then
+  echo "PASS: a successful failure-path re-read never becomes a count"
+else
+  echo "FAIL: a successful failure-path re-read never becomes a count (rc=$rc out='$out')"
+  FAILED=1
+fi
+
+# The function is documented as loadable into other shells; it must not abort a
+# caller that runs with errexit (the failure-path capture is a failing command).
+rc=0
+out=$(PROBE_FIXTURE=one-gone bash -c "set -euo pipefail; $(cat "$W/probe_fn.sh"); probe_runner_count \"\$1\"" bash "$W/docker" 2>/dev/null) || rc=$?
+if [ "$rc" = 0 ] && [ "$out" = 1 ]; then
+  echo "PASS: the probe survives an errexit caller"
+else
+  echo "FAIL: the probe survives an errexit caller (rc=$rc out='$out')"
   FAILED=1
 fi
 

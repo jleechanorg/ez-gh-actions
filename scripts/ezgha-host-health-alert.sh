@@ -286,7 +286,10 @@ probe_runner_count() {
       # merging that into the table would blind a healthy probe.
       :
     else
-      err=$("$docker_bin" top "$id" -eo pid,comm 2>&1 >/dev/null)
+      # `|| true` keeps errexit callers safe; the captured text is preserved
+      # because the command always fails on this path (clearing it would make
+      # every failure look unrecognized).
+      err=$("$docker_bin" top "$id" -eo pid,comm 2>&1 >/dev/null) || true
       # Anchor on the daemon's own error shape: wrapper text such as
       # "colima is not running" must not be read as container absence.
       if grep -qiE '^error response from daemon: (no such container:|container [0-9a-f]{12,64} (is not running|is restarting, wait until the container is running))' <<< "$err"; then
