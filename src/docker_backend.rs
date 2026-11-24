@@ -5978,7 +5978,10 @@ mod tests {
             "expected exactly `run` and `rm -f` invocations, got:\n{log}"
         );
         let run_tokens: Vec<&str> = lines[0].split_whitespace().collect();
-        assert_eq!(run_tokens.get(0..3), Some(["run", "--rm", "--name"].as_slice()));
+        assert_eq!(
+            run_tokens.get(0..3),
+            Some(["run", "--rm", "--name"].as_slice())
+        );
         let probe_name = run_tokens[3];
         assert!(
             probe_name.starts_with("ezgha-disk-probe-"),
@@ -6027,25 +6030,17 @@ mod tests {
 
     #[test]
     fn free_disk_gb_timeout_cleans_up_only_probe_container() {
-        with_fake_df_probe_docker(
-            "df_probe_timeout",
-            "exec sleep 30",
-            "exit 0",
-            |log_path| {
-                let start = Instant::now();
-                let free = free_disk_gb_with_timeout(
-                    "ezgha-runner:latest",
-                    Duration::from_secs(1),
-                );
-                assert_eq!(free, None);
-                assert!(
-                    start.elapsed() < Duration::from_secs(5),
-                    "probe timeout took too long: {:?}",
-                    start.elapsed()
-                );
-                assert_only_probe_container_cleaned_up(log_path);
-            },
-        );
+        with_fake_df_probe_docker("df_probe_timeout", "exec sleep 30", "exit 0", |log_path| {
+            let start = Instant::now();
+            let free = free_disk_gb_with_timeout("ezgha-runner:latest", Duration::from_secs(1));
+            assert_eq!(free, None);
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "probe timeout took too long: {:?}",
+                start.elapsed()
+            );
+            assert_only_probe_container_cleaned_up(log_path);
+        });
     }
 
     #[test]
