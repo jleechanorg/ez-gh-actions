@@ -247,9 +247,32 @@ fi
 # Inventory is only a candidate set. A complete inventory and all process
 # reads must succeed before zero/positive evidence is usable. Keep the whole
 # local pass within the existing 10s budget, not 10s per container.
+#
+# Ephemeral-runner race (2026-11-24, Jeff-Ubuntu): these runners are recreated
+# after every job, so a container listed by `docker ps` can be gone by the time
+# `docker top` reads it. Treating that as an unreadable inventory blinded the
+# whole probe (status=BLIND, cause=blind) at 03:25:45Z and 03:26:03Z while 18/18
+# org runners were online+busy, 19-20 managed containers were running, and 5
+# consecutive manual probes in the same window returned top_fail=0 whenever no
+# recreation happened. A `docker top` that reports the container no longer exists
+# or is not running is a DEFINITIVE "no processes in that container" answer, so it
+# contributes 0 ready and the rest of the inventory stays usable. Every other
+# docker failure, and a malformed table, still blinds the probe (fail closed).
+# If every container vanishes this way the count is NOT reported as a live zero —
+# "0 ready" is the outage claim, so it stays unknown and the fail-closed path owns
+# it. The same fail-closed direction applies when a container vanished while the
+# surviving containers show no runner process: the probe cannot distinguish a
+# fleet outage from discarded observations, so it stays unknown (the second blind
+# poll escalates to ERROR and the outage still pages).
+#
+# Failure classification reads the error text only on the failure path, so this
+# probe never needs a writable TMPDIR, never creates a fixed /tmp path (a health
+# probe must not be able to cause its own blindness, and a predictable scratch
+# name is a symlink-truncation primitive), and a docker CLI warning on an
+# otherwise successful read cannot corrupt the process table.
 # shellcheck disable=SC2329 # Loaded into bounded local and remote shells.
 probe_runner_count() {
-  local docker_bin="$1" ids id table ready count=0
+  local docker_bin="$1" ids id table err ready count=0 vanished=0
   ids=$("$docker_bin" ps --no-trunc --filter label=ezgha=managed --filter status=running -q && printf .) || return 1
   ids=${ids%.}
   [ -n "$ids" ] || { echo 0; return 0; }
@@ -257,7 +280,25 @@ probe_runner_count() {
     length($0) != 64 || /[^0-9a-f]/ || seen[$0]++ { exit 1 }
   ' || return 1
   while IFS= read -r id; do
-    table=$("$docker_bin" top "$id" -eo pid,comm) || return 1
+    if table=$("$docker_bin" top "$id" -eo pid,comm 2>/dev/null); then
+      # Success: stderr is discarded on purpose. The docker CLI can print a
+      # warning and still exit 0 (e.g. an unparsable ~/.docker/config.json);
+      # merging that into the table would blind a healthy probe.
+      :
+    else
+      # `|| true` keeps errexit callers safe; the captured text is preserved
+      # because the command always fails on this path (clearing it would make
+      # every failure look unrecognized).
+      err=$("$docker_bin" top "$id" -eo pid,comm 2>&1 >/dev/null) || true
+      # Anchor on the daemon's own error shape: wrapper text such as
+      # "colima is not running" must not be read as container absence.
+      if grep -qiE '^error response from daemon: (no such container:|container [0-9a-f]{12,64} (is not running|is restarting, wait until the container is running))' <<< "$err"; then
+        # Container recreated or stopped between inventory and process read.
+        vanished=$((vanished + 1))
+        continue
+      fi
+      return 1
+    fi
     ready=$(printf '%s\n' "$table" | awk '
       NR == 1 { if (NF != 2 || $1 != "PID" || ($2 != "COMMAND" && $2 != "COMM")) bad=1; next }
       NF != 2 || $1 !~ /^[0-9]+$/ { bad=1; next }
@@ -266,6 +307,9 @@ probe_runner_count() {
     ') || return 1
     count=$((count + ready))
   done <<< "${ids%$'\n'}"
+  if [ "$count" -eq 0 ] && [ "$vanished" -gt 0 ]; then
+    return 1
+  fi
   echo "$count"
 }
 CONTAINER_COUNT="${HEALTH_ALERT_CONTAINER_COUNT:-}"
