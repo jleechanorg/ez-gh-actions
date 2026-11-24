@@ -64,6 +64,17 @@ if [ "$1" = top ]; then
       printf 'Error response from daemon: No such container: %s\n' "$2" >&2
       exit 1
       ;;
+    one-gone-one-idle)
+      if [ "$2" = "$GONE_ID" ]; then
+        printf 'Error response from daemon: No such container: %s\n' "$2" >&2
+        exit 1
+      fi
+      printf 'PID COMMAND\n1 bash\n'
+      ;;
+    wrapper-not-running)
+      printf 'colima is not running\n' >&2
+      exit 1
+      ;;
     malformed)
       printf 'PID COMMAND\nnot-a-pid Runner.Worker\n'
       ;;
@@ -78,7 +89,7 @@ if [ "$1" = top ]; then
   exit 0
 fi
 case "$PROBE_FIXTURE" in
-  one-gone|one-not-running|all-gone) printf '%s\n%s\n' "$GOOD_ID" "$GONE_ID" ;;
+  one-gone|one-not-running|all-gone|one-gone-one-idle) printf '%s\n%s\n' "$GOOD_ID" "$GONE_ID" ;;
   *) printf '%s\n' "$GOOD_ID" ;;
 esac
 STUB
@@ -114,9 +125,35 @@ check() { # fixture expected_rc expected_out description
 check one-gone 0 1 "a container recreated between ps and top does not blind the probe"
 check one-not-running 0 1 "'is not running' is definitive absence, not a measurement gap"
 check all-gone 1 "" "every container gone is unknown capacity, never a live zero"
+check one-gone-one-idle 1 "" "a vanish plus an inspected idle container stays unknown, never a live zero"
+check wrapper-not-running 1 "" "wrapper text ('colima is not running') is not container absence"
 check malformed 1 "" "a malformed successful table still blinds the probe"
 check top-generic-failure 1 "" "a generic top failure still blinds the probe (fail closed)"
 check healthy 0 1 "an unraced healthy inventory is unchanged"
+
+# The probe must not depend on a writable scratch directory: an unusable TMPDIR
+# previously blinded a healthy read because stderr was written to a fixed /tmp
+# path. Classification now travels in-shell.
+rc=0
+out=$(TMPDIR="$W/definitely-not-a-directory" PROBE_FIXTURE=one-gone bash -c "$(cat "$W/probe_fn.sh"); probe_runner_count \"\$1\"" bash "$W/docker" 2>/dev/null) || rc=$?
+if [ "$rc" = 0 ] && [ "$out" = 1 ]; then
+  echo "PASS: an unusable TMPDIR no longer blinds a healthy inventory"
+else
+  echo "FAIL: an unusable TMPDIR no longer blinds a healthy inventory (rc=$rc out='$out')"
+  FAILED=1
+fi
+
+# No scratch artifacts: the probe must not create predictable /tmp paths (a
+# symlink-truncation primitive) nor leak files on the timeout path.
+before=$(find "${TMPDIR:-/tmp}" -maxdepth 1 -name 'ezgha-probe*' 2>/dev/null | wc -l | tr -d ' ')
+probe one-gone >/dev/null
+after=$(find "${TMPDIR:-/tmp}" -maxdepth 1 -name 'ezgha-probe*' 2>/dev/null | wc -l | tr -d ' ')
+if [ "$before" = "$after" ]; then
+  echo "PASS: the probe writes no scratch files"
+else
+  echo "FAIL: the probe writes no scratch files (before=$before after=$after)"
+  FAILED=1
+fi
 
 rc=0
 out=$(PROBE_FIXTURE=healthy bash -c "$(cat "$W/probe_fn.sh"); probe_runner_count \"\$1\"" bash "$W/docker-down" 2>/dev/null) || rc=$?
