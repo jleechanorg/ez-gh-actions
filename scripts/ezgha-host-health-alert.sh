@@ -247,25 +247,53 @@ fi
 # Inventory is only a candidate set. A complete inventory and all process
 # reads must succeed before zero/positive evidence is usable. Keep the whole
 # local pass within the existing 10s budget, not 10s per container.
+#
+# Ephemeral-runner race (2026-11-24, Jeff-Ubuntu): these runners are recreated
+# after every job, so a container listed by `docker ps` can be gone by the time
+# `docker top` reads it. Treating that as an unreadable inventory blinded the
+# whole probe (status=BLIND, cause=blind) at 03:25:45Z and 03:26:03Z while 18/18
+# org runners were online+busy, 19-20 managed containers were running, and 5
+# consecutive manual probes in the same window returned top_fail=0 whenever no
+# recreation happened. A `docker top` that reports the container no longer exists
+# or is not running is a DEFINITIVE "no processes in that container" answer, so it
+# contributes 0 ready and the rest of the inventory stays usable. Every other
+# docker failure, and a malformed table, still blinds the probe (fail closed).
+# If every container vanishes this way the count is NOT reported as a live zero —
+# "0 ready" is the outage claim, so it stays unknown and the fail-closed path owns
+# it.
 # shellcheck disable=SC2329 # Loaded into bounded local and remote shells.
 probe_runner_count() {
-  local docker_bin="$1" ids id table ready count=0
+  local docker_bin="$1" ids id table ready count=0 vanished=0 err_file err
   ids=$("$docker_bin" ps --no-trunc --filter label=ezgha=managed --filter status=running -q && printf .) || return 1
   ids=${ids%.}
   [ -n "$ids" ] || { echo 0; return 0; }
   printf '%s' "$ids" | awk '
     length($0) != 64 || /[^0-9a-f]/ || seen[$0]++ { exit 1 }
   ' || return 1
+  err_file="${TMPDIR:-/tmp}/ezgha-probe-$$.err"
   while IFS= read -r id; do
-    table=$("$docker_bin" top "$id" -eo pid,comm) || return 1
+    if ! table=$("$docker_bin" top "$id" -eo pid,comm 2>"$err_file"); then
+      err=$(cat "$err_file" 2>/dev/null || true)
+      if printf '%s' "$err" | grep -qiE 'no such container|is not running'; then
+        # Container recreated or stopped between inventory and process read.
+        vanished=$((vanished + 1))
+        continue
+      fi
+      rm -f "$err_file"
+      return 1
+    fi
     ready=$(printf '%s\n' "$table" | awk '
       NR == 1 { if (NF != 2 || $1 != "PID" || ($2 != "COMMAND" && $2 != "COMM")) bad=1; next }
       NF != 2 || $1 !~ /^[0-9]+$/ { bad=1; next }
       $2 == "Runner.Listener" || $2 == "Runner.Worker" { ready=1 }
       END { if (bad || NR < 2) exit 1; print ready + 0 }
-    ') || return 1
+    ') || { rm -f "$err_file"; return 1; }
     count=$((count + ready))
   done <<< "${ids%$'\n'}"
+  rm -f "$err_file"
+  if [ "$count" -eq 0 ] && [ "$vanished" -gt 0 ]; then
+    return 1
+  fi
   echo "$count"
 }
 CONTAINER_COUNT="${HEALTH_ALERT_CONTAINER_COUNT:-}"
