@@ -4,6 +4,13 @@ set -euo pipefail
 
 umask 0022
 
+if [ -z "${GH_TOKEN:-}" ] && [ -z "${GITHUB_TOKEN:-}" ] && [ -n "${HOME:-}" ] && [ -r "${HOME}/.config/ezgha/gh_token" ]; then
+  _ezgha_tok="$(tr -d '[:space:]' < "${HOME}/.config/ezgha/gh_token" 2>/dev/null || true)"
+  if [ -n "${_ezgha_tok}" ]; then
+    export GH_TOKEN="${_ezgha_tok}"
+  fi
+fi
+
 if [ "${EZGHA_STRICT_PATH:-0}" != "1" ]; then
   for _dir in /opt/homebrew/bin /usr/local/bin "${HOME}/.local/bin" "${HOME}/.cargo/bin"; do
     if [ -d "${_dir}" ] && [[ ":${PATH:-}:" != *":${_dir}:"* ]]; then

@@ -52,6 +52,7 @@ jobs:
           bash tests/install_uninstall_aux_units_test.sh
           bash tests/systemd_units_install_guard_test.sh
           bash tests/refresh_runner_caches_test.sh
+          bash tests/bootstrap_cloud_vm_git_mirror_test.sh
       - name: Mac trim guard shell regressions
         run: |
           bash tests/colima_trim_guard_test.sh
