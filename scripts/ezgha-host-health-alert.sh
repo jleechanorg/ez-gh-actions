@@ -281,37 +281,42 @@ fi
 # The runner is matched on the command column's FIRST field only, so a table that
 # renders a full command line cannot be counted by an argument that merely
 # mentions `Runner.Worker` (e.g. `sh -c echo Runner.Worker`).
-# ── Bounded, sanitized diagnostic capture for the Docker probe ───────────────
+# ── Bounded, allowlisted diagnostic capture for the Docker probe ─────────────
 # A blind row that says only "inventory or process evidence incomplete" costs a
-# manual classification pass. The probe therefore names its failing leg (and
-# container id) on stderr, and this block carries a bounded excerpt into the row.
+# manual classification pass. The probe therefore reports a failing leg, the
+# container id and an ALLOWLISTED error classification — never raw docker text.
 #
-# It must never become a new failure source:
-#   * private `mktemp` file, so no predictable path exists to pre-truncate;
-#   * capacity reserved (8 KiB written, then truncated) and one fd opened and
-#     proven BEFORE the probe runs, so the probe redirects to an already-open
-#     descriptor instead of opening a file at command start — a full or vanished
-#     scratch path is detected here, not while docker is being read;
-#   * any failure in that setup disables capture, and the probe then runs exactly
-#     as before (`2>/dev/null`) with classification untouched;
-#   * read-back is bounded (`head -c`) from a closed file, so truncation can never
-#     SIGPIPE or deadlock a live producer;
-#   * control characters, multi-line output and credential-shaped fragments are
-#     stripped before the text can reach the log row.
+# Properties this block is built around:
+#   * the diagnostic channel is fd 8 and carries only the probe's own fixed
+#     `probe_fail leg=… container=… detail=…` line (one per failed probe), so
+#     retained storage cannot scale with producer output: a 2 MB docker error
+#     burst still retains a single short line;
+#   * raw docker stderr is classified in memory (`_classify`) and never written,
+#     so untrusted provider text cannot carry credentials or control characters
+#     into the log row;
+#   * fd 8 is redirected on the probe command itself — never with `exec`, which
+#     would leave a redirection attached to the monitor's own shell;
+#   * a private `mktemp` file (no predictable path to pre-truncate); when it
+#     cannot be created, the probe still runs with fd 8 to /dev/null and the
+#     classification is identical;
+#   * read-back is bounded and sanitized as defence in depth, then only the owned
+#     file is removed (`-f`, no globs, no directories).
 PROBE_DIAG_MAX_CHARS="${HEALTH_ALERT_PROBE_DIAG_MAX_CHARS:-512}"
 PROBE_DIAG_READ_MAX_BYTES="${HEALTH_ALERT_PROBE_DIAG_READ_MAX_BYTES:-8192}"
 PROBE_ERR_FILE=""
 PROBE_DIAG=""
 PROBE_DIAG_JSON=""
+PROBE_DIAG_BYTES=0
 sanitize_probe_diag() { # stdin -> bounded printable single-line excerpt
   local raw clean
   raw=$(head -c "$PROBE_DIAG_READ_MAX_BYTES" 2>/dev/null) || raw=""
   [ -n "$raw" ] || return 0
   clean=$(printf '%s' "$raw" | LC_ALL=C tr -c '[:print:]' ' ' | LC_ALL=C sed -E '
     s/[[:space:]]+/ /g
-    s/([Aa]uthorization:[[:space:]]*[Bb]earer)[[:space:]]+[^ ]+/\1 <redacted>/g
-    s/([Pp]assword|[Pp]asswd|[Ss]ecret|[Tt]oken|[Aa]pi[-_]?[Kk]ey)([[:space:]]*[=:][[:space:]]*)[^[:space:]]+/\1\2<redacted>/g
-    s#(https?://)[^/@[:space:]]+@#\1<redacted>@#g
+    s/([Aa][Uu][Tt][Hh][Oo][Rr][Ii][Zz][Aa][Tt][Ii][Oo][Nn]:[[:space:]]*[Bb][Ee][Aa][Rr][Ee][Rr])([[:space:]]+)[^[:space:]]+/\1\2<redacted>/g
+    s/([Bb][Ee][Aa][Rr][Ee][Rr])([[:space:]]+)[^[:space:]]+/\1\2<redacted>/g
+    s/([A-Za-z0-9_.-]*([Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd]|[Pp][Aa][Ss][Ss][Ww][Dd]|[Tt][Oo][Kk][Ee][Nn]|[Ss][Ee][Cc][Rr][Ee][Tt]|[Cc][Rr][Ee][Dd][Ee][Nn][Tt][Ii][Aa][Ll][Ss]?|[Aa][Pp][Ii][_-]?[Kk][Ee][Yy]))([[:space:]]*[=:][[:space:]]*)[^[:space:]]+/\1\3<redacted>/g
+    s#([Hh][Tt][Tt][Pp][Ss]?://)[^/@[:space:]]+@#\1<redacted>@#g
     s/^ //
     s/ $//
   ' 2>/dev/null) || clean=""
@@ -323,17 +328,36 @@ sanitize_probe_diag() { # stdin -> bounded printable single-line excerpt
   fi
 }
 # shellcheck disable=SC2329 # Loaded into bounded local and remote shells.
-probe_runner_count() {
-  local docker_bin="$1" ids id table err ready count=0 vanished=0
-  # Failure legs are named on stderr for the diagnostic row. Stdout and exit
-  # status stay exactly as before: the classification contract is unchanged.
-  ids=$("$docker_bin" ps --no-trunc --filter label=ezgha=managed --filter status=running -q && printf .) ||
-    { printf 'probe_fail leg=docker-ps\n' >&2; return 1; }
+probe_runner_count() { # docker-bin: count on stdout, allowlisted diagnostic on fd 8
+  local docker_bin="$1" ids id id_disp table err ready count=0 vanished=0
+  # Only allowlisted tokens ever reach the diagnostic channel (fd 8). Raw docker
+  # stderr is reduced in memory to a fixed classification here, so untrusted
+  # provider text cannot carry credentials, control characters or arbitrary
+  # payload into the log row. Stdout and exit status are unchanged.
+  _classify() { # stdin: docker error text -> allowlisted token
+    local t
+    t=$(head -c 4096 2>/dev/null) || t=""
+    if grep -qi 'no such container' <<< "$t"; then echo no-such-container
+    elif grep -qi 'is not running' <<< "$t"; then echo container-not-running
+    elif grep -qi 'is restarting' <<< "$t"; then echo container-restarting
+    elif grep -qi 'cannot connect to the docker daemon' <<< "$t"; then echo daemon-unreachable
+    elif grep -qi 'permission denied' <<< "$t"; then echo permission-denied
+    elif grep -qiE 'context deadline exceeded|i/o timeout|timed out' <<< "$t"; then echo timeout
+    else echo unclassified
+    fi
+  }
+  # The trailing '.' stops command substitution from stripping a blank Docker
+  # listing into "" — a blank row must stay incomplete evidence, never a live 0.
+  if ! ids=$("$docker_bin" ps --no-trunc --filter label=ezgha=managed --filter status=running -q 2>/dev/null && printf .); then
+    err=$("$docker_bin" ps --no-trunc --filter label=ezgha=managed --filter status=running -q 2>&1 >/dev/null) || true
+    printf 'probe_fail leg=docker-ps detail=%s\n' "$(printf '%s' "$err" | _classify)" >&8
+    return 1
+  fi
   ids=${ids%.}
   [ -n "$ids" ] || { echo 0; return 0; }
   printf '%s' "$ids" | awk '
     length($0) != 64 || /[^0-9a-f]/ || seen[$0]++ { exit 1 }
-  ' || { printf 'probe_fail leg=inventory-shape\n' >&2; return 1; }
+  ' || { printf 'probe_fail leg=inventory-shape detail=id-shape\n' >&8; return 1; }
   while IFS= read -r id; do
     # Identity is claimed only for a field that actually looks like a container
     # id, so a mangled or partial value is reported as unknown rather than as a
@@ -356,9 +380,7 @@ probe_runner_count() {
         vanished=$((vanished + 1))
         continue
       fi
-      # Name the container and keep the daemon text (bounded + sanitized by the
-      # caller) so the row distinguishes a daemon error from a parse problem.
-      printf 'probe_fail leg=docker-top container=%s detail=%s\n' "$id_disp" "$(printf '%s' "$err" | tr '\n' ' ')" >&2
+      printf 'probe_fail leg=docker-top container=%s detail=%s\n' "$id_disp" "$(printf '%s' "$err" | _classify)" >&8
       return 1
     fi
     ready=$(printf '%s\n' "$table" | awk '
@@ -366,11 +388,11 @@ probe_runner_count() {
       NF < 2 || $1 !~ /^[0-9]+$/ { bad=1; next }
       $2 == "Runner.Listener" || $2 == "Runner.Worker" { ready=1 }
       END { if (bad || NR < 2) exit 1; print ready + 0 }
-    ') || { printf 'probe_fail leg=process-table container=%s\n' "$id_disp" >&2; return 1; }
+    ') || { printf 'probe_fail leg=process-table container=%s detail=table-shape\n' "$id_disp" >&8; return 1; }
     count=$((count + ready))
   done <<< "${ids%$'\n'}"
   if [ "$count" -eq 0 ] && [ "$vanished" -gt 0 ]; then
-    printf 'probe_fail leg=all-vanished vanished=%s\n' "$vanished" >&2
+    printf 'probe_fail leg=all-vanished vanished=%s detail=all-containers-gone\n' "$vanished" >&8
     return 1
   fi
   echo "$count"
@@ -380,30 +402,34 @@ if [ -z "$CONTAINER_COUNT" ]; then
   if [ "$PLATFORM" = "Darwin" ] && [ -S "$HOME/.colima/default/docker.sock" ] && [ -z "${DOCKER_HOST:-}" ]; then
     export DOCKER_HOST="unix://$HOME/.colima/default/docker.sock"
   fi
-  # Capture the probe's stderr only when the scratch path is proven usable. Any
-  # setup failure falls back to the previous `2>/dev/null` behaviour, so a
-  # scratch-directory problem can never blind a healthy probe.
+  # Diagnostic capture. The probe writes ONLY its own allowlisted line to fd 8;
+  # docker's stderr is classified in memory and never written, so retained
+  # storage cannot grow with producer output (a 2MB docker error burst still
+  # retains one short line). Redirecting fd 8 on the command itself — never with
+  # `exec` — keeps the monitor's own fd 2 untouched.
   PROBE_CMD="$(declare -f probe_runner_count); probe_runner_count \"\$1\""
-  PROBE_CAPTURE_READY=0
   PROBE_ERR_FILE=$(mktemp "${TMPDIR:-/tmp}/ezgha-probe-diag.XXXXXXXX" 2>/dev/null) || PROBE_ERR_FILE=""
-  if [ -n "$PROBE_ERR_FILE" ] &&
-     head -c "$PROBE_DIAG_READ_MAX_BYTES" /dev/zero > "$PROBE_ERR_FILE" 2>/dev/null &&
-     : > "$PROBE_ERR_FILE" &&
-     exec 9>>"$PROBE_ERR_FILE" 2>/dev/null; then
-    PROBE_CAPTURE_READY=1
-  fi
-  if [ "$PROBE_CAPTURE_READY" = 1 ]; then
-    # fd 9, not `{var}`: this script also runs under macOS /bin/bash 3.2, which
-    # has no automatic fd allocation (it aborts the whole monitor with 127).
-    CONTAINER_COUNT=$(timeout 10 /bin/bash -c "$PROBE_CMD" bash "$DOCKER_BIN" 2>&9) || CONTAINER_COUNT=""
-    exec 9>&- 2>/dev/null || true
+  if [ -n "$PROBE_ERR_FILE" ] && [ -w "$PROBE_ERR_FILE" ]; then
+    CONTAINER_COUNT=$(timeout 10 /bin/bash -c "$PROBE_CMD" bash "$DOCKER_BIN" 8>"$PROBE_ERR_FILE") || CONTAINER_COUNT=""
     PROBE_DIAG=$(sanitize_probe_diag < "$PROBE_ERR_FILE" 2>/dev/null) || PROBE_DIAG=""
   else
-    CONTAINER_COUNT=$(timeout 10 /bin/bash -c "$PROBE_CMD" bash "$DOCKER_BIN" 2>/dev/null) || CONTAINER_COUNT=""
+    # No usable scratch path: the probe still runs with the diagnostic channel
+    # discarded. Classification is identical to the capture path.
+    CONTAINER_COUNT=$(timeout 10 /bin/bash -c "$PROBE_CMD" bash "$DOCKER_BIN" 8>/dev/null) || CONTAINER_COUNT=""
   fi
-  # Owned artifact only: no fixed path, no wildcard, no directory removal.
+  PROBE_DIAG_BYTES=0
   if [ -n "$PROBE_ERR_FILE" ]; then
-    rm -f -- "$PROBE_ERR_FILE" 2>/dev/null || true
+    if [ -s "$PROBE_ERR_FILE" ]; then
+      PROBE_DIAG_BYTES=$(wc -c < "$PROBE_ERR_FILE" 2>/dev/null | tr -d ' ') || PROBE_DIAG_BYTES=0
+    fi
+    if [ "${HEALTH_ALERT_PROBE_DIAG_KEEP:-0}" = 1 ]; then
+      # Test-only seam: keep the owned file so a suite can measure exactly how
+      # much storage the capture retained.
+      echo "[$NOW_ISO] probe diag retained: ${PROBE_DIAG_BYTES} bytes ($PROBE_ERR_FILE)" >&2
+    else
+      # Owned artifact only: no fixed path, no wildcard, no directory removal.
+      rm -f -- "$PROBE_ERR_FILE" 2>/dev/null || true
+    fi
   fi
   PROBE_ERR_FILE=""
   if [ -n "$PROBE_DIAG" ]; then
