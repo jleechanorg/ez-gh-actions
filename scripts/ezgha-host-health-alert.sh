@@ -336,7 +336,10 @@ probe_runner_count() { # docker-bin: count on stdout, allowlisted diagnostic on 
   # payload into the log row. Stdout and exit status are unchanged.
   _classify() { # stdin: docker error text -> allowlisted token
     local t
-    t=$(head -c 4096 2>/dev/null) || t=""
+    # Tail, not head: docker prints warnings first and the decisive daemon error
+    # last. `tail -c` drains the whole stream (no SIGPIPE for the writer) while
+    # keeping only the final 4 KiB in memory.
+    t=$(tail -c 4096 2>/dev/null) || t=""
     if grep -qi 'no such container' <<< "$t"; then echo no-such-container
     elif grep -qi 'is not running' <<< "$t"; then echo container-not-running
     elif grep -qi 'is restarting' <<< "$t"; then echo container-restarting
@@ -349,7 +352,7 @@ probe_runner_count() { # docker-bin: count on stdout, allowlisted diagnostic on 
   # The trailing '.' stops command substitution from stripping a blank Docker
   # listing into "" — a blank row must stay incomplete evidence, never a live 0.
   if ! ids=$("$docker_bin" ps --no-trunc --filter label=ezgha=managed --filter status=running -q 2>/dev/null && printf .); then
-    err=$("$docker_bin" ps --no-trunc --filter label=ezgha=managed --filter status=running -q 2>&1 >/dev/null) || true
+    err=$("$docker_bin" ps --no-trunc --filter label=ezgha=managed --filter status=running -q 2>&1 >/dev/null | tail -c 8192) || true
     printf 'probe_fail leg=docker-ps detail=%s\n' "$(printf '%s' "$err" | _classify)" >&8
     return 1
   fi
@@ -372,7 +375,9 @@ probe_runner_count() { # docker-bin: count on stdout, allowlisted diagnostic on 
       # `|| true` keeps errexit callers safe; the captured text is preserved
       # because the command always fails on this path (clearing it would make
       # every failure look unrecognized).
-      err=$("$docker_bin" top "$id" -eo pid,comm 2>&1 >/dev/null) || true
+      # `tail -c` keeps the capture bounded without closing the pipe early: a
+      # 2 MB error burst is drained, and only its last 8 KiB is retained.
+      err=$("$docker_bin" top "$id" -eo pid,comm 2>&1 >/dev/null | tail -c 8192) || true
       # Anchor on the daemon's own error shape: wrapper text such as
       # "colima is not running" must not be read as container absence.
       if grep -qiE '^error response from daemon: (no such container:|container [0-9a-f]{12,64} (is not running|is restarting, wait until the container is running))' <<< "$err"; then

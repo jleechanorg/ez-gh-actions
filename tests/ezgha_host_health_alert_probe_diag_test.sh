@@ -78,7 +78,11 @@ if [ "${1:-}" = ps ]; then
     flood)
       # 2 MB of producer noise. None of it may be retained, and the producer must
       # not be killed by a truncated read (it finishes and exits on its own).
-      head -c 2000000 /dev/zero 2>/dev/null | tr '\0' 'x' >&2 || :
+      # Real 2 MB of producer noise (portable awk: no NUL/tr escape assumptions).
+      # None of it may be retained, and the producer must not be killed by a
+      # truncated read: it finishes and exits on its own.
+      awk 'BEGIN{s="";for(i=0;i<100;i++)s=s"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";for(i=0;i<200;i++)printf "%s",s}' >&2
+      awk 'BEGIN{s="";for(i=0;i<100;i++)s=s"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";print length(s)*200}' > "${FLOOD_BYTES_FILE:-/dev/null}" 2>/dev/null || :
       printf '
 Error response from daemon: Cannot connect to the Docker daemon
 ' >&2
@@ -259,13 +263,19 @@ expect blank 'length == 1 and .[0].cause == "blind" and .[0].container_count == 
 
 # ── 4. 2 MB producer burst: bounded payload, no deadlock, nothing retained ─
 SECONDS=0
-rc=$(run flood DOCKER_FIXTURE=flood)
+rc=$(run flood DOCKER_FIXTURE=flood FLOOD_BYTES_FILE="$W/flood_bytes")
 elapsed=$SECONDS
 [ "$rc" = 0 ] || { echo "FAIL: flood run exited $rc"; FAILED=1; }
 if [ "$elapsed" -le 20 ]; then
   echo "PASS: a 2MB docker error burst does not deadlock or slow the probe (${elapsed}s)"
 else
   echo "FAIL: a 2MB docker error burst does not deadlock or slow the probe (${elapsed}s)"; FAILED=1
+fi
+flood_bytes=$(cat "$W/flood_bytes" 2>/dev/null || echo "")
+if [ "$flood_bytes" = "2000000" ]; then
+  echo "PASS: the flood fixture really emitted 2000000 bytes of producer stderr"
+else
+  echo "FAIL: the flood fixture really emitted 2000000 bytes of producer stderr (got '${flood_bytes:-missing}')"; FAILED=1
 fi
 expect flood 'length == 1 and .[0].cause == "blind" and .[0].container_count == null
   and (.[0].probe_diag == "probe_fail leg=docker-ps detail=daemon-unreachable")
@@ -276,7 +286,7 @@ expect flood 'length == 1 and .[0].cause == "blind" and .[0].container_count == 
 # Measure the actual retained file (real storage, not a claim).
 mkdir -p "$W/tmp-retained"
 printf 'keep\n' > "$W/tmp-retained/keepme.txt"
-rc=$(run retained DOCKER_FIXTURE=flood HEALTH_ALERT_PROBE_DIAG_KEEP=1)
+rc=$(run retained DOCKER_FIXTURE=flood FLOOD_BYTES_FILE="$W/retained_flood_bytes" HEALTH_ALERT_PROBE_DIAG_KEEP=1)
 [ "$rc" = 0 ] || { echo "FAIL: retained run exited $rc"; FAILED=1; }
 retained_bytes=$(sed -n 's/.*probe diag retained: \([0-9][0-9]*\) bytes.*/\1/p' "$W/out-retained" | head -1)
 retained_path=$(sed -n 's/.*probe diag retained: [0-9][0-9]* bytes (\(.*\))$/\1/p' "$W/out-retained" | head -1)
