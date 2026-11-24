@@ -19,8 +19,8 @@
 #   HOST_TAG=a RUNNER_COUNT=4 NAME_PREFIX=ez-cloud-runner-a \
 #     ./scripts/cloud/bootstrap-cloud-vm-host.sh
 #
-# Idempotent: re-running skips the clone/image when present, rebuilds the binary,
-# and restarts the service.
+# Idempotent: re-running skips the clone/image when present (set REBUILD_IMAGE=1
+# to force image rebuild), rebuilds the binary, and restarts the service.
 set -euo pipefail
 
 HOST_TAG="${HOST_TAG:?set HOST_TAG (a short label used for logs)}"
@@ -31,6 +31,8 @@ REPO_URL="${REPO_URL:-https://github.com/jleechanorg/ez-gh-actions}"
 REF="${REF:-main}"
 KEY_PATH="${KEY_PATH:-$HOME/.config/ezgha/app_private_key.pem}"
 GH_TOKEN="${GH_TOKEN:-$(cat "$HOME/.config/ezgha/gh_token" 2>/dev/null || true)}"
+REBUILD_IMAGE="${REBUILD_IMAGE:-0}"
+ENABLE_GIT_MIRROR="${ENABLE_GIT_MIRROR:-1}"
 LOG="${LOG:-$HOME/ezgha-bootstrap-$HOST_TAG.log}"
 
 exec > >(tee -a "$LOG") 2>&1
@@ -212,7 +214,7 @@ cargo install --path . --locked --force
 ezgha --version 2>&1 | head -2 || true
 
 step "5. runner image (ezgha-runner:latest from Dockerfile.runner)"
-if ! docker image inspect ezgha-runner:latest >/dev/null 2>&1; then
+if [ "$REBUILD_IMAGE" = "1" ] || ! docker image inspect ezgha-runner:latest >/dev/null 2>&1; then
   # Legacy builder: BuildKit's context network path fails apt in nested virt
   # (bead jleechan-bl0n).
   DOCKER_BUILDKIT=0 docker build -f "$REPO_DIR/Dockerfile.runner" -t ezgha-runner:latest "$REPO_DIR"
@@ -225,17 +227,23 @@ chmod 700 "$HOME/.config/ezgha"
 [ -f "$KEY_PATH" ] || { echo "MISSING GitHub App private key at $KEY_PATH"; exit 1; }
 chmod 600 "$KEY_PATH"
 cp "$REPO_DIR/config/config.toml.cloud-vm.example" "$HOME/.config/ezgha/config.toml"
-python3 - "$HOME/.config/ezgha/config.toml" "$RUNNER_COUNT" "$NAME_PREFIX" <<'PY'
-import re, sys
+GIT_MIRROR_PATH="${HOME%/}/.cache/ezgha-git-mirrors"
+python3 - "$HOME/.config/ezgha/config.toml" "$RUNNER_COUNT" "$NAME_PREFIX" "$ENABLE_GIT_MIRROR" "$GIT_MIRROR_PATH" <<'PY'
+import json, os, re, sys
 path, count, prefix = sys.argv[1], sys.argv[2], sys.argv[3]
+enable_git_mirror = (sys.argv[4] if len(sys.argv) > 4 else os.environ.get("ENABLE_GIT_MIRROR", "1")) == "1"
+git_mirror_path = sys.argv[5] if len(sys.argv) > 5 else os.path.join(os.path.expanduser("~"), ".cache", "ezgha-git-mirrors")
 
 # Issue 229: pin the container's resolver list to the host's real forwarder plus
 # two public fallbacks. Detected at write time so a host whose forwarder is not
 # 10.32.0.28 still gets the entry that can answer VM-local names first. If the
 # host exposes no private resolver, stop here instead of writing a guessed
 # address: `--dns` would then send every container lookup to the wrong server.
+resolv_paths = tuple(
+    p for p in os.environ.get("EZGHA_BOOTSTRAP_RESOLV_PATHS", "").split(":") if p
+) or ("/etc/resolv.conf", "/run/systemd/resolve/resolv.conf")
 forwarder = None
-for resolv_path in ("/etc/resolv.conf", "/run/systemd/resolve/resolv.conf"):
+for resolv_path in resolv_paths:
     try:
         for line in open(resolv_path):
             m = re.match(r"^nameserver\s+(\S+)", line)
@@ -251,10 +259,12 @@ if not forwarder:
     sys.exit("FATAL: no private resolver found; refusing to write a guessed dns "
              "entry into [runner] (issue 229)")
 
-dns_lines = [
+runner_extra_lines = [
     f'dns = ["{forwarder}", "1.1.1.1", "8.8.8.8"]\n',
     'dns_opts = ["timeout:2", "attempts:3"]\n',
 ]
+if enable_git_mirror:
+    runner_extra_lines.append(f"git_mirror_host_path = {json.dumps(git_mirror_path)}\n")
 
 out = []
 for line in open(path):
@@ -262,22 +272,31 @@ for line in open(path):
         out.append(f"count = {count}\n")
     elif line.startswith("name_prefix = "):
         out.append(f'name_prefix = "{prefix}"\n')
-    elif line.startswith("dns =") or line.startswith("dns_opts ="):
+    elif line.startswith("dns =") or line.startswith("dns_opts =") or line.startswith("git_mirror_host_path ="):
         continue  # re-inserted right after `image =` below
     else:
         out.append(line)
         if line.startswith("image = "):
-            out.extend(dns_lines)
+            out.extend(runner_extra_lines)
 
-# If the example ever drops its `image =` line the dns entries must still land in
-# [runner], so append them rather than silently omitting them.
+# If the example ever drops its `image =` line the entries must still land in
+# [runner], so insert after [runner] (or append) rather than silently omitting them.
 if not any(l.startswith("dns = ") for l in out):
-    out.extend(dns_lines)
+    inserted = False
+    new_out = []
+    for line in out:
+        new_out.append(line)
+        if not inserted and line.strip() == "[runner]":
+            new_out.extend(runner_extra_lines)
+            inserted = True
+    if not inserted:
+        new_out.extend(runner_extra_lines)
+    out = new_out
 
 open(path, "w").writelines(out)
-print(f"runner dns forwarder={forwarder}")
+print(f"runner dns forwarder={forwarder} git_mirror={git_mirror_path if enable_git_mirror else 'disabled'}")
 PY
-grep -E '^(count|name_prefix|dns|dns_opts) =|host_containment' "$HOME/.config/ezgha/config.toml"
+grep -E '^(count|name_prefix|dns|dns_opts|git_mirror_host_path) =|host_containment' "$HOME/.config/ezgha/config.toml"
 
 step "6b. refuse a count the memory budget cannot hold"
 # `serve` would refuse to start anyway; fail here with the arithmetic instead of a
@@ -351,6 +370,46 @@ systemctl --user is-active ezgha-token-refresh.timer
 ls -l "$HOME/.config/ezgha/gh_token"
 GH_TOKEN="$(cat "$HOME/.config/ezgha/gh_token")" gh api /orgs/jleechanorg/actions/runners?per_page=1 \
   --jq '"gh app token ok, org runners: \(.total_count)"'
+
+step "7b. host-side bare git mirror cache warmer (ENABLE_GIT_MIRROR=${ENABLE_GIT_MIRROR})"
+if [ "$ENABLE_GIT_MIRROR" = "1" ]; then
+  mkdir -p "$HOME/.local/state/ezgha"
+  chmod 0700 "$HOME/.local/state/ezgha"
+  install -m 0755 \
+    "$REPO_DIR/scripts/refresh_runner_caches.sh" \
+    "$REPO_DIR/scripts/refresh_runner_caches.py" \
+    "$REPO_DIR/scripts/ezgha_cache_common.py" \
+    "$REPO_DIR/scripts/ezgha_git_mirrors.py" \
+    "$REPO_DIR/scripts/ezgha_wheelhouse.py" \
+    "$REPO_DIR/scripts/ezgha_npm_cache.py" \
+    "$SCRIPTS_DIR/"
+  sed -e "s|@SCRIPTS_DIR@|${SCRIPTS_DIR}|g" \
+      -e "s|@HOME@|${HOME}|g" \
+      "$REPO_DIR/systemd/ezgha-cache-warm.service" \
+    > "$HOME/.config/systemd/user/ezgha-cache-warm.service"
+  sed -e "s|@SCRIPTS_DIR@|${SCRIPTS_DIR}|g" \
+      -e "s|@HOME@|${HOME}|g" \
+      "$REPO_DIR/systemd/ezgha-cache-warm.timer" \
+    > "$HOME/.config/systemd/user/ezgha-cache-warm.timer"
+  if grep -q '@[A-Z_]*@' "$HOME/.config/systemd/user/ezgha-cache-warm.service" \
+     || grep -q '@[A-Z_]*@' "$HOME/.config/systemd/user/ezgha-cache-warm.timer"; then
+    echo "unrendered @...@ placeholder in the cache-warm unit"; exit 1
+  fi
+  systemctl --user daemon-reload
+  systemctl --user enable --now ezgha-cache-warm.timer
+  systemctl --user is-active ezgha-cache-warm.timer
+  # Initial best-effort mirror warm pass (bounded timeout; fail-open on low disk
+  # just like refresh_runner_caches.py so bootstrap never hangs or aborts).
+  GH_TOKEN="$(cat "$HOME/.config/ezgha/gh_token" 2>/dev/null || printf '%s' "$GH_TOKEN")" \
+    timeout "${CACHE_WARM_TIMEOUT_SEC:-300}s" \
+    "$SCRIPTS_DIR/refresh_runner_caches.sh" --skip-wheels --skip-npm \
+    || echo "WARNING: initial git mirror warm pass did not complete cleanly (continuing; runners fail open and timer will retry)"
+else
+  if systemctl --user is-enabled ezgha-cache-warm.timer >/dev/null 2>&1; then
+    systemctl --user disable --now ezgha-cache-warm.timer 2>/dev/null || true
+  fi
+  echo "git mirror cache warmer disabled (ENABLE_GIT_MIRROR=${ENABLE_GIT_MIRROR})"
+fi
 
 step "8. install + start the user service"
 ezgha install-service

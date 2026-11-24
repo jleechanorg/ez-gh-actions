@@ -29,6 +29,11 @@ image = "ezgha-runner:latest"
 # time; the values here are the safe defaults for a hand-copied config.
 dns = ["10.32.0.28", "1.1.1.1", "8.8.8.8"]
 dns_opts = ["timeout:2", "attempts:3"]
+# Opt-in host-side bare git mirrors: mounted read-only into every runner container at
+# /opt/ezgha-git-mirrors with EZGHA_GIT_MIRRORS pointed at it (fail-open if absent).
+# Warmed on a schedule by scripts/refresh_runner_caches.sh (ezgha-cache-warm.timer).
+# bootstrap-cloud-vm-host.sh sets this automatically when ENABLE_GIT_MIRROR=1 (default).
+# git_mirror_host_path = "/home/cmux/.cache/ezgha-git-mirrors"
 # The 4 GiB Lima guest reserve is too big here (the daemon's Docker *is* this VM's
 # Docker), but zero is wrong too: dockerd, the guest OS and the daemon itself still
 # need memory. 512 MiB keeps `count x runner_floor_mb` inside the budget:
