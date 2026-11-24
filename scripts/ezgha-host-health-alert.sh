@@ -281,16 +281,64 @@ fi
 # The runner is matched on the command column's FIRST field only, so a table that
 # renders a full command line cannot be counted by an argument that merely
 # mentions `Runner.Worker` (e.g. `sh -c echo Runner.Worker`).
+# ── Bounded, sanitized diagnostic capture for the Docker probe ───────────────
+# A blind row that says only "inventory or process evidence incomplete" costs a
+# manual classification pass. The probe therefore names its failing leg (and
+# container id) on stderr, and this block carries a bounded excerpt into the row.
+#
+# It must never become a new failure source:
+#   * private `mktemp` file, so no predictable path exists to pre-truncate;
+#   * capacity reserved (8 KiB written, then truncated) and one fd opened and
+#     proven BEFORE the probe runs, so the probe redirects to an already-open
+#     descriptor instead of opening a file at command start — a full or vanished
+#     scratch path is detected here, not while docker is being read;
+#   * any failure in that setup disables capture, and the probe then runs exactly
+#     as before (`2>/dev/null`) with classification untouched;
+#   * read-back is bounded (`head -c`) from a closed file, so truncation can never
+#     SIGPIPE or deadlock a live producer;
+#   * control characters, multi-line output and credential-shaped fragments are
+#     stripped before the text can reach the log row.
+PROBE_DIAG_MAX_CHARS="${HEALTH_ALERT_PROBE_DIAG_MAX_CHARS:-512}"
+PROBE_DIAG_READ_MAX_BYTES="${HEALTH_ALERT_PROBE_DIAG_READ_MAX_BYTES:-8192}"
+PROBE_ERR_FILE=""
+PROBE_DIAG=""
+PROBE_DIAG_JSON=""
+sanitize_probe_diag() { # stdin -> bounded printable single-line excerpt
+  local raw clean
+  raw=$(head -c "$PROBE_DIAG_READ_MAX_BYTES" 2>/dev/null) || raw=""
+  [ -n "$raw" ] || return 0
+  clean=$(printf '%s' "$raw" | LC_ALL=C tr -c '[:print:]' ' ' | LC_ALL=C sed -E '
+    s/[[:space:]]+/ /g
+    s/([Aa]uthorization:[[:space:]]*[Bb]earer)[[:space:]]+[^ ]+/\1 <redacted>/g
+    s/([Pp]assword|[Pp]asswd|[Ss]ecret|[Tt]oken|[Aa]pi[-_]?[Kk]ey)([[:space:]]*[=:][[:space:]]*)[^[:space:]]+/\1\2<redacted>/g
+    s#(https?://)[^/@[:space:]]+@#\1<redacted>@#g
+    s/^ //
+    s/ $//
+  ' 2>/dev/null) || clean=""
+  [ -n "$clean" ] || return 0
+  if [ "${#clean}" -gt "$PROBE_DIAG_MAX_CHARS" ]; then
+    printf '%s...[truncated]' "${clean:0:$PROBE_DIAG_MAX_CHARS}"
+  else
+    printf '%s' "$clean"
+  fi
+}
 # shellcheck disable=SC2329 # Loaded into bounded local and remote shells.
 probe_runner_count() {
   local docker_bin="$1" ids id table err ready count=0 vanished=0
-  ids=$("$docker_bin" ps --no-trunc --filter label=ezgha=managed --filter status=running -q && printf .) || return 1
+  # Failure legs are named on stderr for the diagnostic row. Stdout and exit
+  # status stay exactly as before: the classification contract is unchanged.
+  ids=$("$docker_bin" ps --no-trunc --filter label=ezgha=managed --filter status=running -q && printf .) ||
+    { printf 'probe_fail leg=docker-ps\n' >&2; return 1; }
   ids=${ids%.}
   [ -n "$ids" ] || { echo 0; return 0; }
   printf '%s' "$ids" | awk '
     length($0) != 64 || /[^0-9a-f]/ || seen[$0]++ { exit 1 }
-  ' || return 1
+  ' || { printf 'probe_fail leg=inventory-shape\n' >&2; return 1; }
   while IFS= read -r id; do
+    # Identity is claimed only for a field that actually looks like a container
+    # id, so a mangled or partial value is reported as unknown rather than as a
+    # container name.
+    if [[ "$id" =~ ^[0-9a-f]{12,64}$ ]]; then id_disp="$id"; else id_disp="unknown"; fi
     if table=$("$docker_bin" top "$id" -eo pid,comm 2>/dev/null); then
       # Success: stderr is discarded on purpose. The docker CLI can print a
       # warning and still exit 0 (e.g. an unparsable ~/.docker/config.json);
@@ -308,6 +356,9 @@ probe_runner_count() {
         vanished=$((vanished + 1))
         continue
       fi
+      # Name the container and keep the daemon text (bounded + sanitized by the
+      # caller) so the row distinguishes a daemon error from a parse problem.
+      printf 'probe_fail leg=docker-top container=%s detail=%s\n' "$id_disp" "$(printf '%s' "$err" | tr '\n' ' ')" >&2
       return 1
     fi
     ready=$(printf '%s\n' "$table" | awk '
@@ -315,10 +366,11 @@ probe_runner_count() {
       NF < 2 || $1 !~ /^[0-9]+$/ { bad=1; next }
       $2 == "Runner.Listener" || $2 == "Runner.Worker" { ready=1 }
       END { if (bad || NR < 2) exit 1; print ready + 0 }
-    ') || return 1
+    ') || { printf 'probe_fail leg=process-table container=%s\n' "$id_disp" >&2; return 1; }
     count=$((count + ready))
   done <<< "${ids%$'\n'}"
   if [ "$count" -eq 0 ] && [ "$vanished" -gt 0 ]; then
+    printf 'probe_fail leg=all-vanished vanished=%s\n' "$vanished" >&2
     return 1
   fi
   echo "$count"
@@ -328,7 +380,37 @@ if [ -z "$CONTAINER_COUNT" ]; then
   if [ "$PLATFORM" = "Darwin" ] && [ -S "$HOME/.colima/default/docker.sock" ] && [ -z "${DOCKER_HOST:-}" ]; then
     export DOCKER_HOST="unix://$HOME/.colima/default/docker.sock"
   fi
-  CONTAINER_COUNT=$(timeout 10 /bin/bash -c "$(declare -f probe_runner_count); probe_runner_count \"\$1\"" bash "$DOCKER_BIN" 2>/dev/null) || CONTAINER_COUNT=""
+  # Capture the probe's stderr only when the scratch path is proven usable. Any
+  # setup failure falls back to the previous `2>/dev/null` behaviour, so a
+  # scratch-directory problem can never blind a healthy probe.
+  PROBE_CMD="$(declare -f probe_runner_count); probe_runner_count \"\$1\""
+  PROBE_CAPTURE_READY=0
+  PROBE_ERR_FILE=$(mktemp "${TMPDIR:-/tmp}/ezgha-probe-diag.XXXXXXXX" 2>/dev/null) || PROBE_ERR_FILE=""
+  if [ -n "$PROBE_ERR_FILE" ] &&
+     head -c "$PROBE_DIAG_READ_MAX_BYTES" /dev/zero > "$PROBE_ERR_FILE" 2>/dev/null &&
+     : > "$PROBE_ERR_FILE" &&
+     exec 9>>"$PROBE_ERR_FILE" 2>/dev/null; then
+    PROBE_CAPTURE_READY=1
+  fi
+  if [ "$PROBE_CAPTURE_READY" = 1 ]; then
+    # fd 9, not `{var}`: this script also runs under macOS /bin/bash 3.2, which
+    # has no automatic fd allocation (it aborts the whole monitor with 127).
+    CONTAINER_COUNT=$(timeout 10 /bin/bash -c "$PROBE_CMD" bash "$DOCKER_BIN" 2>&9) || CONTAINER_COUNT=""
+    exec 9>&- 2>/dev/null || true
+    PROBE_DIAG=$(sanitize_probe_diag < "$PROBE_ERR_FILE" 2>/dev/null) || PROBE_DIAG=""
+  else
+    CONTAINER_COUNT=$(timeout 10 /bin/bash -c "$PROBE_CMD" bash "$DOCKER_BIN" 2>/dev/null) || CONTAINER_COUNT=""
+  fi
+  # Owned artifact only: no fixed path, no wildcard, no directory removal.
+  if [ -n "$PROBE_ERR_FILE" ]; then
+    rm -f -- "$PROBE_ERR_FILE" 2>/dev/null || true
+  fi
+  PROBE_ERR_FILE=""
+  if [ -n "$PROBE_DIAG" ]; then
+    # The excerpt goes into JSON: quote it with jq rather than interpolating raw
+    # probe text into the payload row.
+    PROBE_DIAG_JSON=$(jq -Rn --arg d "$PROBE_DIAG" '$d' 2>/dev/null) || PROBE_DIAG_JSON=""
+  fi
 fi
 if ! [[ "$CONTAINER_COUNT" =~ ^(0|[1-9][0-9]*)$ ]]; then
   CONTAINER_COUNT=null
@@ -693,7 +775,7 @@ fi
 # Persistence and throttling belong to the failed measurement, not to the
 # generic blind route. Each notification carries only its source's checks.
 report_blind() {
-  local source="$1" persistent="$2" last="$3" severity=WARNING payload
+  local source="$1" persistent="$2" last="$3" severity=WARNING payload diag_fragment=""
   shift 3
   BLIND_LAST_RESULT=0
   [ "$#" -gt 0 ] || return 0
@@ -702,8 +784,14 @@ report_blind() {
     severity=ERROR
     if [ "$((NOW_EPOCH - last))" -lt "$COOLDOWN_SEC" ]; then return 0; fi
   fi
-  payload=$(printf '{"host":"%s", "platform":"%s", "status":"BLIND", "cause":"blind", "blind_source":"%s", "severity":"%s", "failed_checks":%s, "container_count":%s, "free_gb":%s, "ts":"%s"}' \
-    "$HOST" "$PLATFORM" "$source" "$severity" "$(json_checks "$@")" "$CONTAINER_COUNT" "$FREE_GB" "$NOW_ISO")
+  # Only the Docker source has a probe to quote. The field is additive: status,
+  # cause, blind_source, severity, failed_checks, container_count and the paging
+  # filters are byte-identical to the previous row shape.
+  if [ "$source" = docker ] && [ -n "${PROBE_DIAG_JSON:-}" ]; then
+    diag_fragment=", \"probe_diag\":${PROBE_DIAG_JSON}"
+  fi
+  payload=$(printf '{"host":"%s", "platform":"%s", "status":"BLIND", "cause":"blind", "blind_source":"%s", "severity":"%s", "failed_checks":%s, "container_count":%s, "free_gb":%s, "ts":"%s"%s}' \
+    "$HOST" "$PLATFORM" "$source" "$severity" "$(json_checks "$@")" "$CONTAINER_COUNT" "$FREE_GB" "$NOW_ISO" "$diag_fragment")
   emit "$severity" "$payload"
   if [ "$severity" = ERROR ] && [ "$EMIT_OK" = 1 ]; then BLIND_LAST_RESULT=$NOW_EPOCH; fi
 }
