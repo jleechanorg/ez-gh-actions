@@ -17,8 +17,8 @@
         "configured": 20,
         "cycling": 0,
         "down": 0,
-        "executing": 0,
-        "idle": 20,
+        "executing": 1,
+        "idle": 19,
         "reserved": 20
       },
       "parked": false,
@@ -147,11 +147,11 @@
           "workflow_category": null
         },
         {
-          "elapsed_minutes": null,
+          "elapsed_minutes": 0.2,
           "phase_badge": null,
           "slot": 16,
           "slot_id": "linux-16",
-          "state": "IDLE",
+          "state": "EXECUTING",
           "workflow_category": null
         },
         {
@@ -262,7 +262,7 @@
       "total_non_skipped_runs": 52
     },
     "cohort": "success",
-    "generated_at": "2026-11-24T16:44:06Z",
+    "generated_at": "2026-11-24T16:55:22Z",
     "ok": true,
     "overall": {
       "e2e": {
@@ -714,12 +714,12 @@
       }
     ]
   },
-  "observed_at": "2026-11-24T16:43:17Z",
-  "published_at": "2026-11-24T16:43:19Z",
+  "observed_at": "2026-11-24T16:54:40Z",
+  "published_at": "2026-11-24T16:54:42Z",
   "queue": {
     "fresh": null,
     "ghosts": null,
-    "in_progress_runs": 0,
+    "in_progress_runs": 1,
     "ok": true,
     "oldest_fresh_wait_minutes": null,
     "partial": true,
@@ -738,15 +738,15 @@
     "unverified_runs": 89
   },
   "reconciliation": {
-    "active_job_slots_occupied": 0,
-    "active_workflow_runs": 0,
+    "active_job_slots_occupied": 1,
+    "active_workflow_runs": 1,
     "available_pools": 1,
     "configured_slots": 20,
     "cycling_slots": 0,
     "down_slots": 0,
-    "explanation": "0 active GitHub workflow runs | 0 occupied local runner slots; queue partial: 89 unverified.",
+    "explanation": "1 active GitHub workflow runs | 1 occupied local runner slots; queue partial: 89 unverified.",
     "fresh_queued_runs": null,
-    "idle_slots": 20,
+    "idle_slots": 19,
     "inert_ghosts": null,
     "parked_slots": 0
   },
