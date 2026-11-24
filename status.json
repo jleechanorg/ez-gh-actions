@@ -17,8 +17,8 @@
         "configured": 20,
         "cycling": 0,
         "down": 0,
-        "executing": 2,
-        "idle": 18,
+        "executing": 1,
+        "idle": 19,
         "reserved": 20
       },
       "parked": false,
@@ -91,11 +91,11 @@
           "workflow_category": null
         },
         {
-          "elapsed_minutes": 12.9,
-          "phase_badge": "git index-pack",
+          "elapsed_minutes": null,
+          "phase_badge": null,
           "slot": 9,
           "slot_id": "linux-9",
-          "state": "EXECUTING",
+          "state": "IDLE",
           "workflow_category": null
         },
         {
@@ -123,8 +123,8 @@
           "workflow_category": null
         },
         {
-          "elapsed_minutes": 1.4,
-          "phase_badge": null,
+          "elapsed_minutes": 12.6,
+          "phase_badge": "gcloud",
           "slot": 13,
           "slot_id": "linux-13",
           "state": "EXECUTING",
@@ -262,7 +262,7 @@
       "total_non_skipped_runs": 54
     },
     "cohort": "success",
-    "generated_at": "2026-11-24T14:27:48Z",
+    "generated_at": "2026-11-24T14:38:59Z",
     "ok": true,
     "overall": {
       "e2e": {
@@ -714,12 +714,12 @@
       }
     ]
   },
-  "observed_at": "2026-11-24T14:27:08Z",
-  "published_at": "2026-11-24T14:27:10Z",
+  "observed_at": "2026-11-24T14:38:21Z",
+  "published_at": "2026-11-24T14:38:22Z",
   "queue": {
     "fresh": null,
     "ghosts": null,
-    "in_progress_runs": 2,
+    "in_progress_runs": 1,
     "ok": true,
     "oldest_fresh_wait_minutes": null,
     "partial": true,
@@ -738,15 +738,15 @@
     "unverified_runs": 89
   },
   "reconciliation": {
-    "active_job_slots_occupied": 2,
-    "active_workflow_runs": 2,
+    "active_job_slots_occupied": 1,
+    "active_workflow_runs": 1,
     "available_pools": 1,
     "configured_slots": 20,
     "cycling_slots": 0,
     "down_slots": 0,
-    "explanation": "2 active GitHub workflow runs | 2 occupied local runner slots; queue partial: 89 unverified.",
+    "explanation": "1 active GitHub workflow runs | 1 occupied local runner slots; queue partial: 89 unverified.",
     "fresh_queued_runs": null,
-    "idle_slots": 18,
+    "idle_slots": 19,
     "inert_ghosts": null,
     "parked_slots": 0
   },
