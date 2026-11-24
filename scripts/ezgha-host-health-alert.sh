@@ -265,13 +265,14 @@ fi
 # fleet outage from discarded observations, so it stays unknown (the second blind
 # poll escalates to ERROR and the outage still pages).
 #
-# Failure classification reads the error text through a combined pipe-free
-# capture, so this probe never needs a writable TMPDIR and never creates a fixed
-# /tmp path (a health probe must not be able to cause its own blindness, and a
-# predictable scratch name is a symlink-truncation primitive).
+# Failure classification reads the error text only on the failure path, so this
+# probe never needs a writable TMPDIR, never creates a fixed /tmp path (a health
+# probe must not be able to cause its own blindness, and a predictable scratch
+# name is a symlink-truncation primitive), and a docker CLI warning on an
+# otherwise successful read cannot corrupt the process table.
 # shellcheck disable=SC2329 # Loaded into bounded local and remote shells.
 probe_runner_count() {
-  local docker_bin="$1" ids id out table ready count=0 vanished=0
+  local docker_bin="$1" ids id table err ready count=0 vanished=0
   ids=$("$docker_bin" ps --no-trunc --filter label=ezgha=managed --filter status=running -q && printf .) || return 1
   ids=${ids%.}
   [ -n "$ids" ] || { echo 0; return 0; }
@@ -279,17 +280,22 @@ probe_runner_count() {
     length($0) != 64 || /[^0-9a-f]/ || seen[$0]++ { exit 1 }
   ' || return 1
   while IFS= read -r id; do
-    if ! out=$("$docker_bin" top "$id" -eo pid,comm 2>&1); then
+    if table=$("$docker_bin" top "$id" -eo pid,comm 2>/dev/null); then
+      # Success: stderr is discarded on purpose. The docker CLI can print a
+      # warning and still exit 0 (e.g. an unparsable ~/.docker/config.json);
+      # merging that into the table would blind a healthy probe.
+      :
+    else
+      err=$("$docker_bin" top "$id" -eo pid,comm 2>&1 >/dev/null)
       # Anchor on the daemon's own error shape: wrapper text such as
       # "colima is not running" must not be read as container absence.
-      if grep -qiE '^error response from daemon: (no such container:|container [0-9a-f]{12,64} is not running)' <<< "$out"; then
+      if grep -qiE '^error response from daemon: (no such container:|container [0-9a-f]{12,64} (is not running|is restarting, wait until the container is running))' <<< "$err"; then
         # Container recreated or stopped between inventory and process read.
         vanished=$((vanished + 1))
         continue
       fi
       return 1
     fi
-    table="$out"
     ready=$(printf '%s\n' "$table" | awk '
       NR == 1 { if (NF != 2 || $1 != "PID" || ($2 != "COMMAND" && $2 != "COMM")) bad=1; next }
       NF != 2 || $1 !~ /^[0-9]+$/ { bad=1; next }

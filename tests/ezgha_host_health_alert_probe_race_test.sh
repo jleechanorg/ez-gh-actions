@@ -72,8 +72,27 @@ if [ "$1" = top ]; then
       printf 'PID COMMAND\n1 bash\n'
       ;;
     wrapper-not-running)
-      printf 'colima is not running\n' >&2
-      exit 1
+      # Non-docker wrapper text on one of two containers. With the anchored
+      # regex this blinds (rc=1); an unanchored match would count the healthy
+      # container and report 1, so this fixture discriminates the anchoring.
+      if [ "$2" = "$GONE_ID" ]; then
+        printf 'colima is not running\n' >&2
+        exit 1
+      fi
+      printf 'PID COMMAND\n1 Runner.Listener\n'
+      ;;
+    success-with-warning)
+      # The docker CLI can print a warning and still exit 0 (unparsable
+      # ~/.docker/config.json). That must not corrupt the table.
+      printf 'WARNING: Error parsing config file: invalid character\n' >&2
+      printf 'PID COMMAND\n1 Runner.Listener\n'
+      ;;
+    restarting)
+      if [ "$2" = "$GONE_ID" ]; then
+        printf 'Error response from daemon: Container %s is restarting, wait until the container is running\n' "$2" >&2
+        exit 1
+      fi
+      printf 'PID COMMAND\n1 Runner.Worker\n'
       ;;
     malformed)
       printf 'PID COMMAND\nnot-a-pid Runner.Worker\n'
@@ -89,7 +108,7 @@ if [ "$1" = top ]; then
   exit 0
 fi
 case "$PROBE_FIXTURE" in
-  one-gone|one-not-running|all-gone|one-gone-one-idle) printf '%s\n%s\n' "$GOOD_ID" "$GONE_ID" ;;
+  one-gone|one-not-running|all-gone|one-gone-one-idle|wrapper-not-running|restarting) printf '%s\n%s\n' "$GOOD_ID" "$GONE_ID" ;;
   *) printf '%s\n' "$GOOD_ID" ;;
 esac
 STUB
@@ -127,6 +146,8 @@ check one-not-running 0 1 "'is not running' is definitive absence, not a measure
 check all-gone 1 "" "every container gone is unknown capacity, never a live zero"
 check one-gone-one-idle 1 "" "a vanish plus an inspected idle container stays unknown, never a live zero"
 check wrapper-not-running 1 "" "wrapper text ('colima is not running') is not container absence"
+check success-with-warning 0 1 "a docker CLI warning on a successful read does not blind the probe"
+check restarting 0 1 "'is restarting, wait until the container is running' is definitive absence"
 check malformed 1 "" "a malformed successful table still blinds the probe"
 check top-generic-failure 1 "" "a generic top failure still blinds the probe (fail closed)"
 check healthy 0 1 "an unraced healthy inventory is unchanged"
