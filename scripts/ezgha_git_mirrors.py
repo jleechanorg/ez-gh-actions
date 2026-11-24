@@ -66,6 +66,16 @@ def find_local_donor(repo):
         common_dir, is_shallow = lines[0], lines[1]
         seen_common.add(common_dir)
         if is_shallow == "false" and os.path.isdir(os.path.join(common_dir, "objects")):
+            partial = subprocess.run(
+                [
+                    "git", "--git-dir", common_dir, "config", "--get-regexp",
+                    r"^(remote\..*\.promisor|extensions\.partialclone)$",
+                ],
+                env=sanitary_env, text=True, capture_output=True,
+            )
+            if partial.returncode == 0 and partial.stdout.strip():
+                log(f"skipping partial-clone/promisor local donor {common_dir}")
+                continue
             return common_dir
         log(f"skipping shallow or unreadable local donor {common_dir}")
     return None
