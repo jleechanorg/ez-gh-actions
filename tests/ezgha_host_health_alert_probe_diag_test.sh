@@ -69,6 +69,7 @@ cat > "$W/docker" <<'STUB'
 #!/usr/bin/env bash
 ID1=$(printf '%064d' 1)
 ID2=$(printf '%064d' 2)
+if [ -n "${CALL_DIR:-}" ]; then printf '.' >> "$CALL_DIR/${1:-unknown}" 2>/dev/null || :; fi
 fixture="${DOCKER_FIXTURE:-healthy}"
 if [ "${1:-}" = ps ]; then
   case "$fixture" in
@@ -101,7 +102,7 @@ https://user:pw@example.invalid/x
       sleep 30
       exit 0 ;;
     blank) echo; exit 0 ;;
-    all-vanished) printf '%s\n%s\n' "$ID1" "$ID2"; exit 0 ;;
+    all-vanished|vanished-long) printf '%s\n%s\n' "$ID1" "$ID2"; exit 0 ;;
     *) printf '%s\n' "$ID1"; exit 0 ;;
   esac
 fi
@@ -116,6 +117,17 @@ if [ "${1:-}" = top ]; then
     all-vanished)
       printf 'Error response from daemon: No such container: %s\n' "$2" >&2
       exit 1 ;;
+    vanished-long)
+      # One container is gone with the daemon's absence line followed by 200 KB of
+      # trailing junk; the other is healthy. The authoritative classifier must
+      # still call the first ABSENT even though no diagnostic excerpt can hold
+      # the whole text, and the surviving container must still be counted.
+      if [ "$2" = "$ID2" ]; then
+        printf 'Error response from daemon: No such container: %s\n' "$2" >&2
+        awk 'BEGIN{s="";for(i=0;i<100;i++)s=s"jjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjj";for(i=0;i<2000;i++)printf "%s",s}' >&2
+        exit 1
+      fi
+      printf 'PID COMMAND\n1 Runner.Listener\n' ;;
     *)
       printf 'PID COMMAND\n1 Runner.Listener\n' ;;
   esac
@@ -138,10 +150,10 @@ chmod +x "$W/gcloud" "$W/docker" "$W/systemctl"
 run() { # case [VAR=value ...]
   local name="$1"; shift
   local tmp="$W/tmp-$name"
-  mkdir -p "$tmp"
+  mkdir -p "$tmp" "$W/calls-$name"
   : > "$W/log-$name"
   env GCLOUD_BIN="$W/gcloud" STUB_LOG="$W/log-$name" DOCKER_BIN="$W/docker" \
-    TMPDIR="$tmp" \
+    TMPDIR="$tmp" CALL_DIR="$W/calls-$name" \
     HEALTH_ALERT_HOST="$HOSTNAME_FIXTURE" HEALTH_ALERT_PLATFORM=Linux \
     HEALTH_ALERT_STATE_DIR="$W/state-$name" HEALTH_ALERT_SERVICE_OK=1 \
     HEALTH_ALERT_PEER_OK=1 HEALTH_ALERT_FREE_GB=100 HEALTH_ALERT_CONTAINER_COUNT= \
@@ -186,6 +198,21 @@ expect_out_absent() { # case needle description
   fi
 }
 
+calls() { # case verb -> count of docker invocations of that verb
+  local f="$W/calls-$1/$2"
+  if [ -f "$f" ]; then wc -c < "$f" | tr -d ' '; else echo 0; fi
+}
+
+expect_calls() { # case verb want description
+  local got
+  got=$(calls "$1" "$2")
+  if [ "$got" = "$3" ]; then
+    echo "PASS: $4"
+  else
+    echo "FAIL: $4 (docker $2 calls: got $got, want $3)"; FAILED=1
+  fi
+}
+
 expect_no_scratch() { # case description
   local left
   left=$(find "$W/tmp-$1" -maxdepth 1 -name 'ezgha-probe-diag.*' 2>/dev/null | wc -l | tr -d ' ')
@@ -209,6 +236,8 @@ else
 fi
 expect healthy 'all(.probe_diag == null)' "no diagnostic field is emitted on a successful probe"
 expect_no_scratch healthy "a successful probe leaves no scratch artifact"
+expect_calls healthy ps 1 "a healthy poll issues exactly one docker ps (no added invocation)"
+expect_calls healthy top 1 "a healthy poll issues exactly one docker top per container"
 
 # ── 2/3. docker-top failure: classification preserved, leg + container named ─
 rc=$(run top-fail DOCKER_FIXTURE=top-fail)
@@ -227,6 +256,8 @@ fi
 jq -e '.docker_blind == 1' "$W/state-top-fail/host-health-alert-$HOSTNAME_FIXTURE.json" >/dev/null 2>&1 \
   && echo "PASS: top failure: persisted docker_blind=1 is unchanged" \
   || { echo "FAIL: top failure: persisted docker_blind=1 is unchanged"; FAILED=1; }
+expect_calls top-fail ps 1 "a failing inventory is read once, never retried"
+expect_calls top-fail top 2 "a top failure uses only the pre-existing single error re-read (2 calls, unchanged)"
 # Second consecutive blind poll escalates exactly as before.
 rc=$(run top-fail DOCKER_FIXTURE=top-fail)
 [ "$rc" = 0 ] || { echo "FAIL: top-fail second poll exited $rc"; FAILED=1; }
@@ -245,14 +276,26 @@ expect malformed 'length == 1 and .[0].cause == "blind" and .[0].container_count
 # ── 3. docker ps failure names the inventory leg and the daemon text ───────
 run ps-fail DOCKER_FIXTURE=ps-fail >/dev/null
 expect ps-fail 'length == 1 and .[0].cause == "blind" and .[0].container_count == null
-  and (.[0].probe_diag == "probe_fail leg=docker-ps detail=daemon-unreachable")' \
-  "docker ps failure: classification unchanged, leg=docker-ps and detail=daemon-unreachable are recorded"
+  and (.[0].probe_diag == "probe_fail leg=docker-ps detail=inventory-unavailable")' \
+  "docker ps failure: classification unchanged, and the row names leg=docker-ps with a fixed code"
+expect_calls ps-fail ps 1 "a docker ps failure spends exactly one inventory call (no diagnostic retry)"
+expect_calls ps-fail top 0 "a docker ps failure issues no docker top call"
 
 # ── 3. every container vanished keeps unknown capacity and says so ─────────
 run all-vanished DOCKER_FIXTURE=all-vanished >/dev/null
 expect all-vanished 'length == 1 and .[0].cause == "blind" and .[0].container_count == null
   and (.[0].probe_diag == "probe_fail leg=all-vanished vanished=2 detail=all-containers-gone")' \
   "all-vanished inventory: never a live zero, and the vanish count is recorded"
+
+# Absence classification must not depend on the diagnostic excerpt: a daemon
+# "No such container" line followed by 200 KB of junk is still ABSENT.
+run vanished-long DOCKER_FIXTURE=vanished-long >/dev/null
+expect vanished-long 'length == 0' \
+  "a long error keeps its authoritative absence verdict: no blind row, no fleet page"
+expect_out vanished-long "MUTUAL HEALTH CHECK OK" "a long error still resolves to a healthy mutual check"
+expect_out vanished-long "Local: 1 containers" "the surviving container is still counted (absence stayed absent)"
+expect_calls vanished-long ps 1 "the absence case reads the inventory once"
+expect_calls vanished-long top 3 "the absence case performs one top read per container plus the pre-existing single error re-read (3 calls)"
 
 # A blank listing must stay incomplete evidence, never a live zero. This cell is
 # the regression guard for this patch: dropping the '.' sentinel in the ps capture
@@ -278,7 +321,7 @@ else
   echo "FAIL: the flood fixture really emitted 2000000 bytes of producer stderr (got '${flood_bytes:-missing}')"; FAILED=1
 fi
 expect flood 'length == 1 and .[0].cause == "blind" and .[0].container_count == null
-  and (.[0].probe_diag == "probe_fail leg=docker-ps detail=daemon-unreachable")
+  and (.[0].probe_diag == "probe_fail leg=docker-ps detail=inventory-unavailable")
   and ((.[0].probe_diag | length) <= 160)
   and ((.[0].probe_diag | test("x{64}")) | not)' \
   "2MB of producer noise retains only the probe line: bounded, no raw text, no xx-run"
@@ -315,7 +358,7 @@ fi
 # ── 3/10. raw provider text never reaches the row ──────────────────────────
 run secrets DOCKER_FIXTURE=secrets >/dev/null
 expect secrets 'length == 1 and .[0].cause == "blind"
-  and (.[0].probe_diag | test("^probe_fail leg=docker-ps detail=[a-z-]+$"))
+  and (.[0].probe_diag == "probe_fail leg=docker-ps detail=inventory-unavailable")
   and ((.[0].probe_diag | contains("credential-sentinel")) | not)
   and ((.[0].probe_diag | contains("hunter2")) | not)
   and ((.[0].probe_diag | contains("SECRETBEARER")) | not)
@@ -358,6 +401,17 @@ chmod 700 "$W/ro-tmp"
 [ "$rc" = 0 ] || { echo "FAIL: tmpdir-readonly run exited $rc"; FAILED=1; }
 expect tmpdir-readonly 'length == 0' "read-only TMPDIR: no blind row is produced"
 expect_out_re tmpdir-readonly 'Local: [1-9][0-9]* containers' "read-only TMPDIR: a healthy probe still counts the runner"
+
+# Descriptor-open failure (or a path that disappeared) must not blind a healthy
+# probe: fd 8 falls back to /dev/null and the probe still runs exactly once.
+rc=$(run open-fail HEALTH_ALERT_PROBE_DIAG_FORCE_OPEN_FAIL=1)
+[ "$rc" = 0 ] || { echo "FAIL: open-fail run exited $rc"; FAILED=1; }
+expect open-fail 'length == 0' "capture-open failure: no blind row is produced"
+expect open-fail 'all(.probe_diag == null)' "capture-open failure: no diagnostic field is emitted"
+expect_out_re open-fail 'Local: [1-9][0-9]* containers' "capture-open failure: a healthy probe still counts the runner"
+expect_out open-fail "MUTUAL HEALTH CHECK OK" "capture-open failure: healthy verdict is unchanged"
+expect_calls open-fail ps 1 "capture-open failure: the inventory is still read exactly once"
+expect_calls open-fail top 1 "capture-open failure: the container is still inspected exactly once"
 
 # ── 8. only owned artifacts are touched ────────────────────────────────────
 mkdir -p "$W/tmp-keep"

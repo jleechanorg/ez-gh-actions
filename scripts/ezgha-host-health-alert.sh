@@ -336,10 +336,9 @@ probe_runner_count() { # docker-bin: count on stdout, allowlisted diagnostic on 
   # payload into the log row. Stdout and exit status are unchanged.
   _classify() { # stdin: docker error text -> allowlisted token
     local t
-    # Tail, not head: docker prints warnings first and the decisive daemon error
-    # last. `tail -c` drains the whole stream (no SIGPIPE for the writer) while
-    # keeping only the final 4 KiB in memory.
-    t=$(tail -c 4096 2>/dev/null) || t=""
+    # The caller passes the same single capture the absence check reads, so this
+    # classification sees exactly what the authoritative path sees.
+    t=$(cat 2>/dev/null) || t=""
     if grep -qi 'no such container' <<< "$t"; then echo no-such-container
     elif grep -qi 'is not running' <<< "$t"; then echo container-not-running
     elif grep -qi 'is restarting' <<< "$t"; then echo container-restarting
@@ -351,9 +350,10 @@ probe_runner_count() { # docker-bin: count on stdout, allowlisted diagnostic on 
   }
   # The trailing '.' stops command substitution from stripping a blank Docker
   # listing into "" — a blank row must stay incomplete evidence, never a live 0.
+  # The failure verdict comes straight from this one inventory read: diagnostics
+  # never spend a second Docker call (that would be an unapproved retry).
   if ! ids=$("$docker_bin" ps --no-trunc --filter label=ezgha=managed --filter status=running -q 2>/dev/null && printf .); then
-    err=$("$docker_bin" ps --no-trunc --filter label=ezgha=managed --filter status=running -q 2>&1 >/dev/null | tail -c 8192) || true
-    printf 'probe_fail leg=docker-ps detail=%s\n' "$(printf '%s' "$err" | _classify)" >&8
+    printf 'probe_fail leg=docker-ps detail=inventory-unavailable\n' >&8
     return 1
   fi
   ids=${ids%.}
@@ -375,9 +375,10 @@ probe_runner_count() { # docker-bin: count on stdout, allowlisted diagnostic on 
       # `|| true` keeps errexit callers safe; the captured text is preserved
       # because the command always fails on this path (clearing it would make
       # every failure look unrecognized).
-      # `tail -c` keeps the capture bounded without closing the pipe early: a
-      # 2 MB error burst is drained, and only its last 8 KiB is retained.
-      err=$("$docker_bin" top "$id" -eo pid,comm 2>&1 >/dev/null | tail -c 8192) || true
+      # Full capture, exactly as before this patch: the absence classifier below
+      # is authoritative and must not depend on any diagnostic truncation. This is
+      # the pre-existing failure-path re-read, not an added probe invocation.
+      err=$("$docker_bin" top "$id" -eo pid,comm 2>&1 >/dev/null) || true
       # Anchor on the daemon's own error shape: wrapper text such as
       # "colima is not running" must not be read as container absence.
       if grep -qiE '^error response from daemon: (no such container:|container [0-9a-f]{12,64} (is not running|is restarting, wait until the container is running))' <<< "$err"; then
@@ -408,19 +409,32 @@ if [ -z "$CONTAINER_COUNT" ]; then
     export DOCKER_HOST="unix://$HOME/.colima/default/docker.sock"
   fi
   # Diagnostic capture. The probe writes ONLY its own allowlisted line to fd 8;
-  # docker's stderr is classified in memory and never written, so retained
-  # storage cannot grow with producer output (a 2MB docker error burst still
-  # retains one short line). Redirecting fd 8 on the command itself — never with
-  # `exec` — keeps the monitor's own fd 2 untouched.
+  # docker's stderr is classified in memory and never written, so retained storage
+  # cannot grow with producer output (a 2MB error burst still retains one short
+  # line).
+  #
+  # fd 8 is opened ONCE by this shell and inherited by the probe, so the probe's
+  # own execution never depends on a file open: if the open fails, fd 8 points at
+  # /dev/null and the probe runs exactly as it would with capture on. The open is
+  # a file redirection on fd 8 only — `exec` here never touches fd 2, so the
+  # monitor's stderr (and every later log line) is unaffected.
   PROBE_CMD="$(declare -f probe_runner_count); probe_runner_count \"\$1\""
   PROBE_ERR_FILE=$(mktemp "${TMPDIR:-/tmp}/ezgha-probe-diag.XXXXXXXX" 2>/dev/null) || PROBE_ERR_FILE=""
-  if [ -n "$PROBE_ERR_FILE" ] && [ -w "$PROBE_ERR_FILE" ]; then
-    CONTAINER_COUNT=$(timeout 10 /bin/bash -c "$PROBE_CMD" bash "$DOCKER_BIN" 8>"$PROBE_ERR_FILE") || CONTAINER_COUNT=""
-    PROBE_DIAG=$(sanitize_probe_diag < "$PROBE_ERR_FILE" 2>/dev/null) || PROBE_DIAG=""
+  PROBE_CAPTURE_OPEN=0
+  if [ -n "$PROBE_ERR_FILE" ] && [ -w "$PROBE_ERR_FILE" ] &&
+     [ "${HEALTH_ALERT_PROBE_DIAG_FORCE_OPEN_FAIL:-0}" != 1 ] &&
+     exec 8>>"$PROBE_ERR_FILE"; then
+    PROBE_CAPTURE_OPEN=1
   else
-    # No usable scratch path: the probe still runs with the diagnostic channel
-    # discarded. Classification is identical to the capture path.
-    CONTAINER_COUNT=$(timeout 10 /bin/bash -c "$PROBE_CMD" bash "$DOCKER_BIN" 8>/dev/null) || CONTAINER_COUNT=""
+    # Capture unavailable (no scratch path, unwritable file, removed path or the
+    # test seam). The diagnostic channel is discarded; the probe still runs and
+    # its verdict is unchanged.
+    exec 8>/dev/null
+  fi
+  CONTAINER_COUNT=$(timeout 10 /bin/bash -c "$PROBE_CMD" bash "$DOCKER_BIN" 2>/dev/null) || CONTAINER_COUNT=""
+  exec 8>&-
+  if [ "$PROBE_CAPTURE_OPEN" = 1 ]; then
+    PROBE_DIAG=$(sanitize_probe_diag < "$PROBE_ERR_FILE" 2>/dev/null) || PROBE_DIAG=""
   fi
   PROBE_DIAG_BYTES=0
   if [ -n "$PROBE_ERR_FILE" ]; then
