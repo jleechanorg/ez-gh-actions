@@ -270,6 +270,17 @@ fi
 # probe must not be able to cause its own blindness, and a predictable scratch
 # name is a symlink-truncation primitive), and a docker CLI warning on an
 # otherwise successful read cannot corrupt the process table.
+#
+# Process-table shape (2026-11-24, Jeff-Ubuntu): `docker top <id> -eo pid,comm`
+# does not always honor `-eo`. Inside some managed containers the `ps` that runs
+# renders the command column with embedded spaces (a renamed process reports
+# `npm exec expo e`), so the rows are no longer two fields wide. Parsing on an
+# exact 2-column shape therefore failed on a healthy fleet and blinded the probe.
+# "Malformed" now means what actually distinguishes garbage from a process table:
+# a `PID` header with a `COMMAND` column, and a numeric first field on every row.
+# The runner is matched on the command column's FIRST field only, so a table that
+# renders a full command line cannot be counted by an argument that merely
+# mentions `Runner.Worker` (e.g. `sh -c echo Runner.Worker`).
 # shellcheck disable=SC2329 # Loaded into bounded local and remote shells.
 probe_runner_count() {
   local docker_bin="$1" ids id table err ready count=0 vanished=0
@@ -300,8 +311,8 @@ probe_runner_count() {
       return 1
     fi
     ready=$(printf '%s\n' "$table" | awk '
-      NR == 1 { if (NF != 2 || $1 != "PID" || ($2 != "COMMAND" && $2 != "COMM")) bad=1; next }
-      NF != 2 || $1 !~ /^[0-9]+$/ { bad=1; next }
+      NR == 1 { if (NF < 2 || $1 != "PID" || ($2 != "COMMAND" && $2 != "COMM")) bad=1; next }
+      NF < 2 || $1 !~ /^[0-9]+$/ { bad=1; next }
       $2 == "Runner.Listener" || $2 == "Runner.Worker" { ready=1 }
       END { if (bad || NR < 2) exit 1; print ready + 0 }
     ') || return 1

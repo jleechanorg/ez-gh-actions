@@ -109,6 +109,48 @@ if [ "$1" = top ]; then
     malformed)
       printf 'PID COMMAND\nnot-a-pid Runner.Worker\n'
       ;;
+    ragged-runner)
+      # Captured verbatim from Jeff-Ubuntu (2026-11-24): inside some managed
+      # containers `ps` ignores -eo and pads columns, and a job process reports a
+      # multi-word COMMAND ("npm exec expo e"). A strict 2-column parse blinded
+      # the probe on a healthy fleet.
+      printf 'PID                 COMMAND\n'
+      printf '3661776             run.sh\n3662965             run-helper.sh\n'
+      printf '3662975             Runner.Listener\n3665548             Runner.Worker\n'
+      printf '3641780             npm exec expo e\n3642145             sh\n'
+      ;;
+    ragged-idle)
+      # Same shape, no runner process: a real zero, not a blind.
+      printf 'PID                 COMMAND\n'
+      printf '3661776             run.sh\n3641780             npm exec expo e\n'
+      ;;
+    ragged-malformed)
+      # Padded but still malformed: the PID column must stay numeric.
+      printf 'PID                 COMMAND\nnot-a-pid           Runner.Worker\n'
+      ;;
+    decoy-argv)
+      # A command line that merely mentions the runner must not read as a runner.
+      printf 'PID                 COMMAND\n'
+      printf '100                 sh -c echo Runner.Worker\n'
+      printf '101                 pgrep -f Runner.Listener\n'
+      ;;
+    ragged-multi-row)
+      # One bad row blinds the whole table (the observation-to-page boundary).
+      printf 'PID                 COMMAND\n'
+      printf '3662975             Runner.Listener\n'
+      printf 'garbage             Runner.Worker\n'
+      ;;
+    header-other-column)
+      # A PID table whose second column is not the command column must blind:
+      # the header clause is what stops "count anything that looks tabular".
+      printf 'PID                 ELAPSED\n'
+      printf '3662975             Runner.Worker\n'
+      ;;
+    ragged-truncated-row)
+      # A row with no command field at all must blind, never silently count 0.
+      printf 'PID                 COMMAND\n'
+      printf '3662975\n'
+      ;;
     top-generic-failure)
       printf 'PID COMMAND\n1 Runner.Worker\n'
       exit 1
@@ -161,6 +203,13 @@ check wrapper-not-running 1 "" "wrapper text ('colima is not running') is not co
 check success-with-warning 0 1 "a docker CLI warning on a successful read does not blind the probe"
 check restarting 0 1 "'is restarting, wait until the container is running' is definitive absence"
 check malformed 1 "" "a malformed successful table still blinds the probe"
+check ragged-runner 0 1 "a padded table with a multi-word command still counts a live runner"
+check ragged-idle 0 0 "a padded table without a runner is a real zero, not a blind"
+check ragged-malformed 1 "" "a padded table with a non-numeric PID still blinds the probe"
+check decoy-argv 0 0 "a command line that only mentions the runner is not a runner"
+check ragged-multi-row 1 "" "one malformed row still blinds the whole table"
+check header-other-column 1 "" "a PID table without a command column still blinds"
+check ragged-truncated-row 1 "" "a row with no command field still blinds"
 check top-generic-failure 1 "" "a generic top failure still blinds the probe (fail closed)"
 check healthy 0 1 "an unraced healthy inventory is unchanged"
 
