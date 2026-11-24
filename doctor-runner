@@ -221,8 +221,20 @@ fetch_respawn_log_window() {
     return 0
   fi
   if [ "$remote_platform" = "linux" ]; then
-    timeout 10 ssh -o ConnectTimeout=4 -o BatchMode=yes "$host" \
-      "journalctl --user -u ezgha.service --since '${mins} minutes ago' --no-pager 2>/dev/null" 2>/dev/null
+    # `journalctl --user` needs the same systemd user bus `systemctl --user`
+    # does (bead jleechan-edzc). A non-interactive ssh command inherits no
+    # login session, so neither XDG_RUNTIME_DIR nor DBUS_SESSION_BUS_ADDRESS
+    # is set and the query fails with "Failed to connect to bus: No medium
+    # found" — respawn evidence was unavailable for EVERY remote slot, so a
+    # genuinely churning slot could not be told apart from an abandoned one
+    # and was finalized DOWN with an honest-but-useless "(respawn-log fetch
+    # failed)" note. Same resolution remote_docker_env uses (PR #241): export
+    # both for the verified uid INSIDE the remote command, letting any
+    # inherited value win over the default.
+    timeout 10 ssh -o ConnectTimeout=4 -o BatchMode=yes "$host" "
+      export XDG_RUNTIME_DIR=\"\${XDG_RUNTIME_DIR:-/run/user/\$(id -u)}\"
+      export DBUS_SESSION_BUS_ADDRESS=\"\${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/\$(id -u)/bus}\"
+      journalctl --user -u ezgha.service --since '${mins} minutes ago' --no-pager 2>/dev/null" 2>/dev/null
   else
     timeout 10 ssh -o ConnectTimeout=4 -o BatchMode=yes "$host" \
       "tail -n 400 /tmp/ezgha-launchd-stdout.log 2>/dev/null" 2>/dev/null
