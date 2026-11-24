@@ -892,7 +892,7 @@ build_runner_job_index() {
         jobs_json=$(gh api "repos/$repo/actions/runs/$rid/jobs" 2>/dev/null) || { echo "jobs $repo $rid" >> "$JOBMAP_ERRORS_FILE"; continue; }
         printf '%s' "$jobs_json" | jq -c --arg repo "$repo" --arg run_url "$run_url" \
           '.jobs[]? | select(.status=="in_progress" or .status=="queued")
-           | {runner_name, job_name: .name, status, repo: $repo, run_url: $run_url, html_url, started_at, created_at}' 2>/dev/null
+           | {runner_name, job_name: .name, status, repo: $repo, run_url: $run_url, html_url, started_at, created_at, labels: (.labels // [])}' 2>/dev/null
       done < <(printf '%s' "$runs_json" | jq -r --arg cutoff "${fresh_cutoff:-}" \
         '.workflow_runs[]? | select($cutoff == "" or .created_at > $cutoff) | [.id, .html_url] | @tsv' 2>/dev/null)
     done
@@ -908,12 +908,37 @@ set -e
 # run-level and single-repo; these are job-level across every repo the
 # fleet serves, and are what the section-8 tail gate and section-9
 # starvation gate trigger on.
+# Queued jobs targeting an intentionally parked leg (MAC_RUNNER_DISABLED=1
+# or REMOTE_LINUX_DISABLED=1) are excluded from JOBLEVEL_QUEUED_COUNT and
+# JOBLEVEL_OLDEST_QUEUED_AT so they do not trigger false QUEUE_TAIL_BAD=1
+# or IDLE-STARVED [BAD] verdicts on the active leg. Generic or empty labels
+# are never excluded. Both opt-out env vars apply regardless of $PLATFORM,
+# consistent with LOCAL_OPTED_OUT / REMOTE_DISABLED.
+_PARKED_LEG_JQ='
+  def is_parked_leg($mac_off; $linux_off):
+    ((.labels // []) | map(tostring | ascii_downcase)) as $lbls
+    | (
+        ($mac_off == "1" and ($lbls | any(. == "self-hosted-macos" or . == "macos" or . == "ez-mac-runner" or startswith("ez-mac-runner-"))))
+        or
+        ($linux_off == "1" and ($lbls | any(. == "self-hosted-linux" or . == "linux" or . == "ez-runner-c" or startswith("ez-runner-c-"))))
+      );
+'
+_MAC_OPT_OFF="${MAC_RUNNER_DISABLED:-0}"
+_LINUX_OPT_OFF="${REMOTE_LINUX_DISABLED:-0}"
 set +e
-JOBLEVEL_QUEUED_COUNT=$(jq '[.[] | select(.status=="queued")] | length' "$RUNNER_JOB_INDEX_FILE" 2>/dev/null)
+JOBLEVEL_QUEUED_COUNT=$(jq --arg mac_off "$_MAC_OPT_OFF" --arg linux_off "$_LINUX_OPT_OFF" \
+  "$_PARKED_LEG_JQ"'[.[] | select(.status=="queued") | select(is_parked_leg($mac_off; $linux_off) | not)] | length' \
+  "$RUNNER_JOB_INDEX_FILE" 2>/dev/null)
+JOBLEVEL_PARKED_QUEUED_COUNT=$(jq --arg mac_off "$_MAC_OPT_OFF" --arg linux_off "$_LINUX_OPT_OFF" \
+  "$_PARKED_LEG_JQ"'[.[] | select(.status=="queued") | select(is_parked_leg($mac_off; $linux_off))] | length' \
+  "$RUNNER_JOB_INDEX_FILE" 2>/dev/null)
 JOBLEVEL_INPROG_COUNT=$(jq '[.[] | select(.status=="in_progress")] | length' "$RUNNER_JOB_INDEX_FILE" 2>/dev/null)
-JOBLEVEL_OLDEST_QUEUED_AT=$(jq -r '[.[] | select(.status=="queued")] | sort_by(.created_at) | first | .created_at // empty' "$RUNNER_JOB_INDEX_FILE" 2>/dev/null)
+JOBLEVEL_OLDEST_QUEUED_AT=$(jq -r --arg mac_off "$_MAC_OPT_OFF" --arg linux_off "$_LINUX_OPT_OFF" \
+  "$_PARKED_LEG_JQ"'[.[] | select(.status=="queued") | select(is_parked_leg($mac_off; $linux_off) | not)] | sort_by(.created_at) | first | .created_at // empty' \
+  "$RUNNER_JOB_INDEX_FILE" 2>/dev/null)
 set -e
 JOBLEVEL_QUEUED_COUNT="${JOBLEVEL_QUEUED_COUNT:-0}"
+JOBLEVEL_PARKED_QUEUED_COUNT="${JOBLEVEL_PARKED_QUEUED_COUNT:-0}"
 JOBLEVEL_INPROG_COUNT="${JOBLEVEL_INPROG_COUNT:-0}"
 JOBLEVEL_OLDEST_QUEUED_MIN="0"
 if [ -n "${JOBLEVEL_OLDEST_QUEUED_AT:-}" ]; then
@@ -1227,6 +1252,9 @@ if [ "${JOBLEVEL_FETCH_ERRORS:-0}" -gt 0 ]; then
   warn "job map DEGRADED (${JOBLEVEL_FETCH_ERRORS} fetch errors) — per-slot job evidence below may be incomplete; Runner.Worker pids remain ground truth"
 fi
 info "job map: ${JOBLEVEL_INPROG_COUNT} in-progress + ${JOBLEVEL_QUEUED_COUNT} queued fresh job(s) across: $EXPLICIT_WORK_REPOS"
+if [ "${JOBLEVEL_PARKED_QUEUED_COUNT:-0}" -gt 0 ]; then
+  info "job map: excluded ${JOBLEVEL_PARKED_QUEUED_COUNT} queued job(s) targeting an intentionally parked leg"
+fi
 
 job_evidence_for_runner() {
   # Prints "<job name> | started <ISO time> (<elapsed>m ago) | <run html_url>"
@@ -1804,6 +1832,9 @@ elif [ "${JOBLEVEL_QUEUED_COUNT:-0}" -gt 0 ]; then
   echo "  queue: ${JOBLEVEL_QUEUED_COUNT} queued job(s) (oldest ${JOBLEVEL_OLDEST_QUEUED_MIN:-?}m) | ${JOBLEVEL_INPROG_COUNT:-0} in-progress job(s)"
 else
   echo "  queue: 0 queued job(s) | ${JOBLEVEL_INPROG_COUNT:-0} in-progress job(s)"
+fi
+if [ "${JOBLEVEL_PARKED_QUEUED_COUNT:-0}" -gt 0 ]; then
+  echo "  queue (parked-leg excluded): ${JOBLEVEL_PARKED_QUEUED_COUNT} queued job(s) targeting intentionally parked leg(s)"
 fi
 CRITICAL=0
 # Every increment below prints a named [BAD] line at the point of increment —
