@@ -262,11 +262,11 @@
       "total_non_skipped_runs": 59
     },
     "cohort": "success",
-    "generated_at": "2026-11-25T15:17:40Z",
+    "generated_at": "2026-11-25T15:29:00Z",
     "ok": true,
     "overall": {
       "e2e": {
-        "avg_s": 125.35,
+        "avg_s": 125.21,
         "max_s": 2754.0,
         "n": 52,
         "p50_s": 25.0,
@@ -274,7 +274,7 @@
         "p99_s": 2037.96
       },
       "execution": {
-        "avg_s": 275.88,
+        "avg_s": 275.95,
         "max_s": 1407.0,
         "n": 66,
         "p50_s": 40.0,
@@ -406,12 +406,12 @@
       },
       {
         "e2e": {
-          "avg_s": 37.5,
+          "avg_s": 44.33,
           "max_s": 68.0,
-          "n": 4,
-          "p50_s": 32.5,
-          "p90_s": 61.4,
-          "p99_s": 67.34
+          "n": 3,
+          "p50_s": 46.0,
+          "p90_s": 63.6,
+          "p99_s": 67.56
         },
         "execution": {
           "avg_s": 40.0,
@@ -442,7 +442,7 @@
           "p99_s": 47.0
         },
         "execution": {
-          "avg_s": 38.33,
+          "avg_s": 38.78,
           "max_s": 41.0,
           "n": 9,
           "p50_s": 39.0,
@@ -546,18 +546,18 @@
       },
       {
         "e2e": {
-          "avg_s": 10.92,
+          "avg_s": 10.86,
           "max_s": 19.0,
-          "n": 13,
-          "p50_s": 11.0,
-          "p90_s": 13.8,
-          "p99_s": 18.4
+          "n": 14,
+          "p50_s": 10.5,
+          "p90_s": 13.7,
+          "p99_s": 18.35
         },
         "execution": {
-          "avg_s": 6.89,
+          "avg_s": 7.0,
           "max_s": 9.0,
           "n": 9,
-          "p50_s": 6.0,
+          "p50_s": 7.0,
           "p90_s": 9.0,
           "p99_s": 9.0
         },
@@ -602,14 +602,14 @@
       }
     ]
   },
-  "observed_at": "2026-11-25T15:16:54Z",
-  "published_at": "2026-11-25T15:16:55Z",
+  "observed_at": "2026-11-25T15:28:13Z",
+  "published_at": "2026-11-25T15:28:14Z",
   "queue": {
     "fresh": null,
     "ghosts": null,
     "in_progress_runs": 0,
     "ok": true,
-    "oldest_fresh_wait_minutes": 268,
+    "oldest_fresh_wait_minutes": 279,
     "partial": true,
     "repos": [
       {
