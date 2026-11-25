@@ -110,5 +110,25 @@ check "policy includes SMS channel" "$(jq -r '.notificationChannels[]' "$POLICY"
 check "policy metric is queue_wait_alert_count" "$(jq -r '.conditions[0].conditionThreshold.filter' "$POLICY" | grep -c queue_wait_alert_count)" 1
 check "script metric filter covers QUEUE_BACKED_UP and TEST" "$(grep -c 'status="QUEUE_BACKED_UP" OR jsonPayload.status="TEST"' "$SCRIPT")" 1
 
+# lock: a fresh lock makes the run skip without touching state; a stale lock (>10 min) is reclaimed
+rm -f "$STATE_FILE" "$GLOG"; export QUEUE_WAIT_SIMULATE_MIN=40 SUSTAIN_CYCLES=2; mkdir "$STATE_FILE.lockdir"
+run
+check "held lock skips the run" "$(grep -c 'holds the lock; skipping' "$T/out")" 1
+check "held lock writes no state" "$([ -f "$STATE_FILE" ] && echo yes || echo no)" no
+touch -t 202001010000 "$STATE_FILE.lockdir"; run
+check "stale lock is reclaimed" "$(grep -c 'queue breach 1/2' "$T/out")" 1
+check "lock is released after a run" "$([ -d "$STATE_FILE.lockdir" ] && echo held || echo free)" free
+
+# gh hang is bounded by GH_CALL_TIMEOUT_SEC even without coreutils timeout
+cat > "$T/ghhang" <<'EOF'
+#!/usr/bin/env bash
+sleep 30
+EOF
+chmod +x "$T/ghhang"; rm -f "$STATE_FILE" "$GLOG"; unset QUEUE_WAIT_SIMULATE_MIN
+start=$(date +%s); GH_BIN="$T/ghhang" GH_CALL_TIMEOUT_SEC=2 PATH="$T/nobin:$PATH" run
+el=$(( $(date +%s) - start ))
+check "hung gh is cut off by the timeout (<15s)" "$([ "$el" -lt 15 ] && echo yes || echo no)" yes
+check "hung gh counts as an API failure" "$(jq -r .api_failures "$STATE_FILE")" 1
+
 echo "queue_wait_alert_test: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

@@ -115,9 +115,18 @@ if [ "$TEST_ALERT" -eq 1 ]; then
 fi
 
 # One run at a time: an overlapping cron run would race on the state file and double-alert.
-if [ "$DRY_RUN" -eq 0 ] && command -v flock >/dev/null 2>&1; then
-  exec 9>"$STATE_FILE.lock"
-  flock -n 9 || { echo "[$NOW_ISO] another queue-wait-alert run holds the lock; skipping"; exit 0; }
+# Portable mkdir lock (atomic everywhere, no flock needed); a lock older than 10 min is a crashed run's.
+LOCKDIR="$STATE_FILE.lockdir"
+if [ "$DRY_RUN" -eq 0 ]; then
+  if ! mkdir "$LOCKDIR" 2>/dev/null; then
+    if [ -n "$(find "$LOCKDIR" -maxdepth 0 -mmin +10 2>/dev/null)" ]; then
+      rmdir "$LOCKDIR" 2>/dev/null || true
+      mkdir "$LOCKDIR" 2>/dev/null || { echo "[$NOW_ISO] lost the stale-lock race; skipping"; exit 0; }
+    else
+      echo "[$NOW_ISO] another queue-wait-alert run holds the lock; skipping"; exit 0
+    fi
+  fi
+  trap 'rmdir "$LOCKDIR" 2>/dev/null || true' EXIT
 fi
 BREACHES=0; LAST_SENT=0; API_FAILS=0; LAST_BLIND=0
 num() { case "$1" in ''|*[!0-9]*) echo 0 ;; *) echo "$1" ;; esac; } # corrupt state must not abort the run
@@ -132,8 +141,14 @@ save() { # breaches last_sent api_failures last_blind
   jq -nc --argjson b "$1" --argjson t "$2" --argjson f "$3" --argjson l "$4" \
     '{breaches:$b,last_sent:$t,api_failures:$f,last_blind:$l}' > "$STATE_FILE.tmp.$$" && mv "$STATE_FILE.tmp.$$" "$STATE_FILE"
 }
-gh_call() { # bounded: a hung gh must not stack cron runs on the fleet host
-  if command -v timeout >/dev/null 2>&1; then timeout "$GH_CALL_TIMEOUT_SEC" "$GH_BIN" "$@"; else "$GH_BIN" "$@"; fi
+gh_call() { # always bounded: a hung gh must not stack cron runs on the fleet host
+  if command -v timeout >/dev/null 2>&1; then timeout "$GH_CALL_TIMEOUT_SEC" "$GH_BIN" "$@"; return; fi
+  local p w rc # no coreutils timeout (macOS): kill the call from a watchdog
+  "$GH_BIN" "$@" & p=$!
+  ( sleep "$GH_CALL_TIMEOUT_SEC"; kill "$p" 2>/dev/null ) >/dev/null 2>&1 & w=$!
+  wait "$p"; rc=$?
+  kill "$w" 2>/dev/null || true; wait "$w" 2>/dev/null || true
+  return "$rc"
 }
 # Same parked-leg rule as doctor-runner (_PARKED_LEG_JQ): generic/empty labels are never excluded.
 PARKED_JQ='def is_parked_leg($mac_off; $linux_off):
