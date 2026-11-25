@@ -92,6 +92,8 @@ def discover(env=os.environ, call=None, clock=time.monotonic):
                     # started_at is often pre-populated by GitHub for queued jobs. Preserve it;
                     # status, not that timestamp alone, determines whether the job is waiting.
                     created = dt.datetime.fromisoformat(job['created_at'].replace('Z', '+00:00'))
+                    if created.tzinfo is None:
+                        raise ValueError('queued-job timestamp has no timezone')
                     age = now - created.timestamp()
                     url = job.get('html_url')
                     if age < 0 or not isinstance(url, str) or not url.startswith(f'https://github.com/{repo}/actions/runs/'):

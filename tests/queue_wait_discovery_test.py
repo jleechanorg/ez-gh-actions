@@ -68,6 +68,15 @@ class Discovery(unittest.TestCase):
             return call(path)
         r=m.discover(dict(ALERT_REPOS='o/r',QUEUE_NOW_EPOCH=str(NOW),MAX_RUN_CHECKS='200',MAX_API_CALLS='300'),call=once)
         self.assertEqual(len(r['jobs']),101); self.assertEqual(r['runs_checked'],101)
+    def test_count_change_rejected(self):
+        def call(path):
+            page=int(path.rsplit('=',1)[1])
+            return dict(total_count=101 if page==1 else 102, workflow_runs=[dict(id=i) for i in (range(100) if page==1 else [100])])
+        with self.assertRaises(ValueError): m.discover(dict(ALERT_REPOS='o/r',MAX_RUN_CHECKS='200'), call=call)
+    def test_missing_count_rejected(self):
+        with self.assertRaises(ValueError): m.discover(dict(ALERT_REPOS='o/r'), call=lambda _: dict(workflow_runs=[]))
+    def test_api_budget_rejected(self):
+        with self.assertRaises(OverflowError): self.scan([job()],MAX_API_CALLS='0')
     def test_short_page_with_more_count_rejected(self):
         with self.assertRaises(ValueError):
             m.discover(dict(ALERT_REPOS='o/r'),call=lambda _:dict(total_count=101,workflow_runs=[dict(id=1)]))
