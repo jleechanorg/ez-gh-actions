@@ -257,21 +257,21 @@
   },
   "latency": {
     "cancellation": {
-      "cancelled_rate_pct": 10.3,
+      "cancelled_rate_pct": 10.2,
       "cancelled_runs": 6,
-      "total_non_skipped_runs": 58
+      "total_non_skipped_runs": 59
     },
     "cohort": "success",
-    "generated_at": "2026-11-25T13:46:50Z",
+    "generated_at": "2026-11-25T13:58:11Z",
     "ok": true,
     "overall": {
       "e2e": {
-        "avg_s": 132.53,
+        "avg_s": 130.88,
         "max_s": 2754.0,
-        "n": 51,
+        "n": 52,
         "p50_s": 29.0,
-        "p90_s": 263.0,
-        "p99_s": 2052.0
+        "p90_s": 253.3,
+        "p99_s": 2037.96
       },
       "execution": {
         "avg_s": 275.36,
@@ -282,7 +282,7 @@
         "p99_s": 1403.1
       },
       "queue_wait": {
-        "avg_s": 1.8,
+        "avg_s": 1.79,
         "max_s": 3.0,
         "n": 66,
         "p50_s": 2.0,
@@ -406,12 +406,12 @@
       },
       {
         "e2e": {
-          "avg_s": 43.42,
+          "avg_s": 43.46,
           "max_s": 56.0,
-          "n": 12,
-          "p50_s": 42.5,
-          "p90_s": 46.9,
-          "p99_s": 55.01
+          "n": 13,
+          "p50_s": 43.0,
+          "p90_s": 46.8,
+          "p99_s": 54.92
         },
         "execution": {
           "avg_s": 38.25,
@@ -546,7 +546,7 @@
       },
       {
         "e2e": {
-          "avg_s": 30.92,
+          "avg_s": 31.15,
           "max_s": 272.0,
           "n": 13,
           "p50_s": 11.0,
@@ -562,10 +562,10 @@
           "p99_s": 16.52
         },
         "queue_wait": {
-          "avg_s": 1.56,
+          "avg_s": 1.44,
           "max_s": 2.0,
           "n": 9,
-          "p50_s": 2.0,
+          "p50_s": 1.0,
           "p90_s": 2.0,
           "p99_s": 2.0
         },
@@ -630,14 +630,14 @@
       }
     ]
   },
-  "observed_at": "2026-11-25T13:46:04Z",
-  "published_at": "2026-11-25T13:46:05Z",
+  "observed_at": "2026-11-25T13:57:22Z",
+  "published_at": "2026-11-25T13:57:23Z",
   "queue": {
     "fresh": null,
     "ghosts": null,
     "in_progress_runs": 0,
     "ok": true,
-    "oldest_fresh_wait_minutes": 177,
+    "oldest_fresh_wait_minutes": 189,
     "partial": true,
     "repos": [
       {
