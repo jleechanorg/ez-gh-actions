@@ -257,37 +257,37 @@
   },
   "latency": {
     "cancellation": {
-      "cancelled_rate_pct": 12.1,
-      "cancelled_runs": 7,
+      "cancelled_rate_pct": 10.3,
+      "cancelled_runs": 6,
       "total_non_skipped_runs": 58
     },
     "cohort": "success",
-    "generated_at": "2026-11-25T13:35:33Z",
+    "generated_at": "2026-11-25T13:46:50Z",
     "ok": true,
     "overall": {
       "e2e": {
-        "avg_s": 144.58,
+        "avg_s": 132.53,
         "max_s": 2754.0,
-        "n": 50,
+        "n": 51,
         "p50_s": 29.0,
-        "p90_s": 276.7,
-        "p99_s": 2066.04
+        "p90_s": 263.0,
+        "p99_s": 2052.0
       },
       "execution": {
-        "avg_s": 279.29,
+        "avg_s": 275.36,
         "max_s": 1407.0,
         "n": 66,
-        "p50_s": 39.0,
+        "p50_s": 38.5,
         "p90_s": 1235.0,
         "p99_s": 1403.1
       },
       "queue_wait": {
-        "avg_s": 1.91,
-        "max_s": 8.0,
+        "avg_s": 1.8,
+        "max_s": 3.0,
         "n": 66,
         "p50_s": 2.0,
         "p90_s": 2.0,
-        "p99_s": 4.75
+        "p99_s": 3.0
       }
     },
     "partial": false,
@@ -406,43 +406,15 @@
       },
       {
         "e2e": {
-          "avg_s": 32.83,
-          "max_s": 272.0,
+          "avg_s": 43.42,
+          "max_s": 56.0,
           "n": 12,
-          "p50_s": 11.0,
-          "p90_s": 18.5,
-          "p99_s": 244.17
+          "p50_s": 42.5,
+          "p90_s": 46.9,
+          "p99_s": 55.01
         },
         "execution": {
-          "avg_s": 37.33,
-          "max_s": 262.0,
-          "n": 9,
-          "p50_s": 9.0,
-          "p90_s": 66.0,
-          "p99_s": 242.4
-        },
-        "queue_wait": {
-          "avg_s": 2.22,
-          "max_s": 8.0,
-          "n": 9,
-          "p50_s": 2.0,
-          "p90_s": 3.2,
-          "p99_s": 7.52
-        },
-        "repo": "repo-1",
-        "workflow": "workflow-5"
-      },
-      {
-        "e2e": {
-          "avg_s": 83.25,
-          "max_s": 518.0,
-          "n": 12,
-          "p50_s": 43.0,
-          "p90_s": 55.1,
-          "p99_s": 467.18
-        },
-        "execution": {
-          "avg_s": 38.5,
+          "avg_s": 38.25,
           "max_s": 43.0,
           "n": 8,
           "p50_s": 38.5,
@@ -450,15 +422,15 @@
           "p99_s": 42.86
         },
         "queue_wait": {
-          "avg_s": 2.12,
-          "max_s": 3.0,
+          "avg_s": 2.0,
+          "max_s": 2.0,
           "n": 8,
           "p50_s": 2.0,
-          "p90_s": 2.3,
-          "p99_s": 2.93
+          "p90_s": 2.0,
+          "p99_s": 2.0
         },
         "repo": "repo-1",
-        "workflow": "workflow-6"
+        "workflow": "workflow-5"
       },
       {
         "e2e": {
@@ -486,7 +458,7 @@
           "p99_s": 1.0
         },
         "repo": "repo-1",
-        "workflow": "workflow-7"
+        "workflow": "workflow-6"
       },
       {
         "e2e": {
@@ -514,7 +486,7 @@
           "p99_s": 2.0
         },
         "repo": "repo-2",
-        "workflow": "workflow-8"
+        "workflow": "workflow-7"
       },
       {
         "e2e": {
@@ -542,7 +514,7 @@
           "p99_s": 1.97
         },
         "repo": "repo-2",
-        "workflow": "workflow-9"
+        "workflow": "workflow-8"
       },
       {
         "e2e": {
@@ -568,6 +540,34 @@
           "p50_s": 1.0,
           "p90_s": 1.0,
           "p99_s": 1.0
+        },
+        "repo": "repo-1",
+        "workflow": "workflow-9"
+      },
+      {
+        "e2e": {
+          "avg_s": 30.92,
+          "max_s": 272.0,
+          "n": 13,
+          "p50_s": 11.0,
+          "p90_s": 18.0,
+          "p99_s": 241.64
+        },
+        "execution": {
+          "avg_s": 8.78,
+          "max_s": 17.0,
+          "n": 9,
+          "p50_s": 8.0,
+          "p90_s": 12.2,
+          "p99_s": 16.52
+        },
+        "queue_wait": {
+          "avg_s": 1.56,
+          "max_s": 2.0,
+          "n": 9,
+          "p50_s": 2.0,
+          "p90_s": 2.0,
+          "p99_s": 2.0
         },
         "repo": "repo-1",
         "workflow": "workflow-10"
@@ -630,14 +630,14 @@
       }
     ]
   },
-  "observed_at": "2026-11-25T13:34:49Z",
-  "published_at": "2026-11-25T13:34:50Z",
+  "observed_at": "2026-11-25T13:46:04Z",
+  "published_at": "2026-11-25T13:46:05Z",
   "queue": {
     "fresh": null,
     "ghosts": null,
     "in_progress_runs": 0,
     "ok": true,
-    "oldest_fresh_wait_minutes": 166,
+    "oldest_fresh_wait_minutes": 177,
     "partial": true,
     "repos": [
       {
