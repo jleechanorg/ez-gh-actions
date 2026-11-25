@@ -163,9 +163,11 @@ if ! printf '%s' "$SCAN" | jq -e '.complete == true and (.jobs|type)=="array"' >
       STATE=$(printf '%s' "$STATE" | jq -c --argjson t "$NOW_EPOCH" '.last_blind=$t'); save
     else heartbeat "$STATUS" failed "$REASON; logging write failed"; exit 1; fi
   fi
-  exit 0
+else
+  COMPLETE=true
 fi
-COMPLETE=true
+# Positive observed jobs survive partial scans; unknown coverage can never recover a queue.
+SCAN=$(printf '%s' "$SCAN" | jq -c 'if (.jobs|type)=="array" then . else .jobs=[] end')
 QUEUED_JOBS=$(printf '%s' "$SCAN" | jq '.jobs|length')
 OLDEST_MIN=$(printf '%s' "$SCAN" | jq '.jobs[0].wait_min // 0')
 WORST_REPO=$(printf '%s' "$SCAN" | jq -r '.jobs[0].repo // ""')
@@ -175,7 +177,7 @@ EXCLUDED=$(printf '%s' "$SCAN" | jq '.excluded // 0')
 # a backlog nor invent a second sample. A complete absent/below-threshold job resets.
 NEXT=$(jq -nc --argjson old "$STATE" --argjson scan "$SCAN" --argjson threshold "$QUEUE_WAIT_MIN" '
   reduce ($scan.jobs[] | select(.wait_min > $threshold)) as $j
-    ({}; .[$j.key] = {cycles:((($old.jobs[$j.key].cycles // 0)|if type=="number" then . else 0 end)+1),
+    (if $scan.complete then {} else ($old.jobs // {}) end; .[$j.key] = {cycles:((($old.jobs[$j.key].cycles // 0)|if type=="number" then . else 0 end)+1),
       last_sent:($old.jobs[$j.key].last_sent // 0),created_at:$j.created_at})')
 ALERT_EVIDENCE=$(jq -nc --argjson jobs "$(printf '%s' "$SCAN" | jq '.jobs')" --argjson state "$NEXT" \
   --argjson sustain "$SUSTAIN_CYCLES" --argjson now "$NOW_EPOCH" --argjson cooldown "$COOLDOWN_SEC" '
@@ -183,14 +185,14 @@ ALERT_EVIDENCE=$(jq -nc --argjson jobs "$(printf '%s' "$SCAN" | jq '.jobs')" --a
 BREACHES=$(printf '%s' "$NEXT" | jq '[.[].cycles]|max // 0')
 if [ "$OLDEST_MIN" -gt "$QUEUE_WAIT_MIN" ]; then
   echo "[$NOW_ISO] queue breach $BREACHES/$SUSTAIN_CYCLES: oldest job wait ${OLDEST_MIN}m > ${QUEUE_WAIT_MIN}m ($QUEUED_JOBS queued job(s), $WORST_REPO)"
-else
+elif [ "$COMPLETE" = true ]; then
   echo "[$NOW_ISO] queue ok: oldest job wait ${OLDEST_MIN}m <= ${QUEUE_WAIT_MIN}m ($QUEUED_JOBS queued job(s))"
 fi
 # Save observations before delivery so a failed write retries without losing sustain.
-STATE=$(printf '%s' "$STATE" | jq -c --argjson jobs "$NEXT" --argjson b "$BREACHES" '.last_sent=(.last_sent // 0)|.jobs=$jobs|.breaches=$b|.api_failures=0')
+STATE=$(printf '%s' "$STATE" | jq -c --argjson jobs "$NEXT" --argjson b "$BREACHES" '.last_sent=(.last_sent // 0)|.jobs=$jobs|.breaches=$b|.api_failures=(if $complete then 0 else .api_failures end)' --argjson complete "$COMPLETE")
 save
-heartbeat COMPLETE pending ''
-if [ "$(printf '%s' "$ALERT_EVIDENCE" | jq length)" -gt 0 ]; then
+heartbeat "$([ "$COMPLETE" = true ] && echo COMPLETE || echo PARTIAL)" pending ''
+if [ "$(printf '%s' "$ALERT_EVIDENCE" | jq length)" -gt 0 ] && [ $((NOW_EPOCH - LAST_SENT)) -ge "$COOLDOWN_SEC" ]; then
   if ! emit ERROR QUEUE_BACKED_UP "CI queue backed up: verified queued self-hosted jobs exceed ${QUEUE_WAIT_MIN}m; see job evidence" "$OLDEST_MIN" "$QUEUED_JOBS" "$WORST_REPO"; then
     heartbeat BLIND failed 'alert not recorded, will retry next run'; exit 1
   fi
@@ -199,6 +201,6 @@ if [ "$(printf '%s' "$ALERT_EVIDENCE" | jq length)" -gt 0 ]; then
   save
 fi
 ALERT_EVIDENCE='[]'
-if emit INFO HEARTBEAT "complete queue observation; $QUEUED_JOBS queued self-hosted jobs, $EXCLUDED excluded" "$OLDEST_MIN" "$QUEUED_JOBS" "$WORST_REPO"; then
-  heartbeat COMPLETE ok ''
+if emit INFO HEARTBEAT "queue observation complete=$COMPLETE; $QUEUED_JOBS observed queued self-hosted jobs, $EXCLUDED excluded" "$OLDEST_MIN" "$QUEUED_JOBS" "$WORST_REPO"; then
+  heartbeat "$([ "$COMPLETE" = true ] && echo COMPLETE || echo PARTIAL)" ok ''
 else heartbeat BLIND failed 'heartbeat logging write failed'; exit 1; fi

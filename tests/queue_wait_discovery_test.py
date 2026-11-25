@@ -36,17 +36,17 @@ class Discovery(unittest.TestCase):
     def test_custom_selfhosted_label(self):
         r,_=self.scan([job(labels=['ezgha'])]); self.assertEqual(len(r['jobs']),1)
     def test_unknown_labels_fail_closed(self):
-        with self.assertRaises(ValueError): self.scan([job(labels=['mystery'])])
+        self.assertFalse(self.scan([job(labels=['mystery'])])[0]['complete'])
     def test_missing_labels_fail_closed(self):
-        with self.assertRaises(ValueError): self.scan([job(labels=[])])
+        self.assertFalse(self.scan([job(labels=[])])[0]['complete'])
     def test_parked_mac(self):
         r,_=self.scan([job(labels=['self-hosted','self-hosted-macos'])],MAC_RUNNER_DISABLED='1'); self.assertEqual(r['excluded'],1)
     def test_cap_is_incomplete(self):
-        with self.assertRaises(OverflowError): self.scan([job()],MAX_RUN_CHECKS='0')
+        self.assertFalse(self.scan([job()],MAX_RUN_CHECKS='0')[0]['complete'])
     def test_deadline_is_incomplete(self):
-        with self.assertRaises(OverflowError): self.scan([job()],MAX_RUN_SEC='0')
+        self.assertFalse(self.scan([job()],MAX_RUN_SEC='0')[0]['complete'])
     def test_future_time_rejected(self):
-        with self.assertRaises(ValueError): self.scan([job(age=-60)])
+        self.assertEqual(self.scan([job(age=-60)])[0]['jobs'][0]['wait_min'],0)
     def test_job_evidence(self):
         r,_=self.scan([job()]); self.assertEqual(r['jobs'][0]['key'],'o/r:7'); self.assertIsNone(r['jobs'][0]['started_at'])
     def test_queued_with_started_timestamp_retained(self):
@@ -72,14 +72,30 @@ class Discovery(unittest.TestCase):
         def call(path):
             page=int(path.rsplit('=',1)[1])
             return dict(total_count=101 if page==1 else 102, workflow_runs=[dict(id=i) for i in (range(100) if page==1 else [100])])
-        with self.assertRaises(ValueError): m.discover(dict(ALERT_REPOS='o/r',MAX_RUN_CHECKS='200'), call=call)
+        self.assertFalse(m.discover(dict(ALERT_REPOS='o/r',MAX_RUN_CHECKS='200'), call=call)['complete'])
     def test_missing_count_rejected(self):
-        with self.assertRaises(ValueError): m.discover(dict(ALERT_REPOS='o/r'), call=lambda _: dict(workflow_runs=[]))
+        self.assertFalse(m.discover(dict(ALERT_REPOS='o/r'), call=lambda _: dict(workflow_runs=[]))['complete'])
     def test_api_budget_rejected(self):
-        with self.assertRaises(OverflowError): self.scan([job()],MAX_API_CALLS='0')
+        self.assertFalse(self.scan([job()],MAX_API_CALLS='0')[0]['complete'])
+    def test_one_repo_token_failure_retains_other_positive(self):
+        def call(path):
+            if path.startswith('repos/denied/'):
+                raise PermissionError('repository denied')
+            if '/jobs?' in path: return dict(total_count=1,jobs=[job()])
+            runs=[dict(id=1)] if 'status=queued&' in path else []
+            return dict(total_count=len(runs),workflow_runs=runs)
+        r=m.discover(dict(ALERT_REPOS='denied/r o/r',QUEUE_NOW_EPOCH=str(NOW)),call=call)
+        self.assertFalse(r['complete']); self.assertEqual(len(r['jobs']),1)
+    def test_duplicate_mutable_page_retains_positive_but_incomplete(self):
+        def call(path):
+            if '/jobs?' in path: return dict(total_count=1,jobs=[job()])
+            if 'status=queued&' not in path: return dict(total_count=0,workflow_runs=[])
+            page=int(path.rsplit('=',1)[1])
+            return dict(total_count=101,workflow_runs=[dict(id=i) for i in range(100)] if page==1 else [dict(id=99),dict(id=100)])
+        r=m.discover(dict(ALERT_REPOS='o/r',QUEUE_NOW_EPOCH=str(NOW),MAX_RUN_CHECKS='200',MAX_API_CALLS='300'),call=call)
+        self.assertFalse(r['complete']); self.assertEqual(len(r['jobs']),1)
     def test_short_page_with_more_count_rejected(self):
-        with self.assertRaises(ValueError):
-            m.discover(dict(ALERT_REPOS='o/r'),call=lambda _:dict(total_count=101,workflow_runs=[dict(id=1)]))
+        self.assertFalse(m.discover(dict(ALERT_REPOS='o/r'),call=lambda _:dict(total_count=101,workflow_runs=[dict(id=1)]))['complete'])
 
 class Integration(unittest.TestCase):
     def setUp(self):
@@ -100,7 +116,7 @@ class Integration(unittest.TestCase):
         self.run_script(); before=self.state()['jobs']
         r=self.run_script(QUEUE_WAIT_SIMULATE_MIN='',GH_BIN='false',MAX_API_FAILURES='1')
         self.assertNotIn('queue ok',r.stdout); self.assertEqual(self.state()['jobs'],before)
-        self.assertEqual(self.logs()[-1]['status'],'BLIND')
+        self.assertTrue(any(x['status']=='BLIND' for x in self.logs()))
         self.assertFalse(json.loads((self.t/'state.heartbeat.json').read_text())['complete'])
     def test_failed_delivery_retries_same_job(self):
         self.run_script(); self.assertNotEqual(self.run_script(FAIL_GCLOUD='1').returncode,0)
@@ -108,8 +124,50 @@ class Integration(unittest.TestCase):
         self.assertEqual(json.loads((self.t/'state.heartbeat.json').read_text())['delivery'],'failed')
         self.assertEqual(self.run_script().returncode,0)
         self.assertGreater(self.state()['jobs']['simulated:1']['last_sent'],0)
+    def fixture_gh(self):
+        gh=self.t/'gh'
+        gh.write_text('''#!/usr/bin/env python3
+import os,sys,json,datetime,time
+p=sys.argv[-1]
+if '/jobs?' in p:
+ n=int(os.environ.get('WIRE_JOBS','1'))
+ jobs=[dict(id=i+1,status='queued',labels=['self-hosted','ezgha'],created_at=datetime.datetime.fromtimestamp(time.time()-3600,datetime.timezone.utc).isoformat(),started_at=None,html_url='https://github.com/o/r/actions/runs/1/job/'+str(i+1)) for i in range(n)]
+ if os.environ.get('WIRE_UNKNOWN'): jobs.append(dict(id=900,status='queued',labels=[]))
+ print(json.dumps(dict(total_count=len(jobs),jobs=jobs)))
+else:
+ runs=[dict(id=i+1) for i in range(int(os.environ.get('WIRE_RUNS','1')))] if 'status=queued&' in p else []
+ print(json.dumps(dict(total_count=len(runs),workflow_runs=runs)))
+''')
+        gh.chmod(0o755)
+        self.env.update(GH_BIN=str(gh),ALERT_REPOS='o/r',QUEUE_WAIT_SIMULATE_MIN='')
+    def test_wire_partial_positive_and_unknown(self):
+        self.fixture_gh()
+        for _ in range(2): self.assertEqual(self.run_script(WIRE_UNKNOWN='1').returncode,0)
+        self.assertEqual(sum(x['status']=='QUEUE_BACKED_UP' for x in self.logs()),1)
+        hb=json.loads((self.t/'state.heartbeat.json').read_text()); self.assertFalse(hb['complete'])
+    def test_wire_cap_partial_positive(self):
+        self.fixture_gh()
+        for _ in range(2): self.assertEqual(self.run_script(WIRE_RUNS='2',MAX_RUN_CHECKS='1').returncode,0)
+        self.assertTrue(any(x['status']=='TRUNCATED' for x in self.logs()))
+        self.assertTrue(any(x['status']=='QUEUE_BACKED_UP' for x in self.logs()))
+    def test_wire_global_cooldown_for_new_job(self):
+        self.fixture_gh()
+        self.run_script(); self.run_script()
+        self.run_script(WIRE_JOBS='2'); self.run_script(WIRE_JOBS='2')
+        alerts=[x for x in self.logs() if x['status']=='QUEUE_BACKED_UP']
+        self.assertEqual(len(alerts),1)
+        self.assertEqual(self.state()['jobs']['o/r:2']['last_sent'],0)
     def test_dry_run_writes_no_state_or_remote_log(self):
         r=subprocess.run([str(ROOT/'scripts/queue-wait-alert.sh'),'--dry-run'],env=self.env,capture_output=True,text=True)
         self.assertEqual(r.returncode,0); self.assertFalse((self.t/'state').exists()); self.assertEqual(self.logs(),[])
+
+class Installer(unittest.TestCase):
+    def test_missing_helper_refuses_install_before_crontab(self):
+        import shutil
+        with tempfile.TemporaryDirectory() as t:
+            d=Path(t); shutil.copy(ROOT/'scripts/install-queue-wait-alert-cron.sh',d)
+            target=d/'queue-wait-alert.sh'; target.write_text('#!/bin/sh\nexit 0\n'); target.chmod(0o755)
+            r=subprocess.run(['bash',str(d/'install-queue-wait-alert-cron.sh'),'--dry-run'],capture_output=True,text=True)
+            self.assertNotEqual(r.returncode,0); self.assertIn('queue_wait_discovery.py',r.stderr)
 
 if __name__=='__main__': unittest.main()

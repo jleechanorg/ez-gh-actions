@@ -14,6 +14,11 @@ DRY_RUN=0 REMOVE=0
 for arg in "$@"; do
   case "$arg" in --dry-run) DRY_RUN=1 ;; --remove) REMOVE=1 ;; *) echo "unknown arg: $arg" >&2; exit 64 ;; esac
 done
+if [ "$REMOVE" -eq 0 ]; then
+  [ -r "$SCRIPT_DIR/queue_wait_discovery.py" ] || { echo "FATAL: queue_wait_discovery.py must be installed beside $TARGET" >&2; exit 3; }
+  command -v python3 >/dev/null || { echo "FATAL: python3 is required for queued-job discovery" >&2; exit 3; }
+  command -v jq >/dev/null || { echo "FATAL: jq is required for queued-job evidence" >&2; exit 3; }
+fi
 [ -x "$TARGET" ] || { echo "FATAL: $TARGET missing or not executable" >&2; exit 3; }
 # A transient crontab failure must not make us rewrite the crontab from nothing (that would drop the host-health cron).
 CURRENT="$(crontab -l 2>&1)" || case "$CURRENT" in *"no crontab"*) CURRENT="" ;; *) echo "FATAL: crontab -l failed: $CURRENT" >&2; exit 5 ;; esac
