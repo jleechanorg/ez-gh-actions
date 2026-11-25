@@ -130,5 +130,16 @@ el=$(( $(date +%s) - start ))
 check "hung gh is cut off by the timeout (<15s)" "$([ "$el" -lt 15 ] && echo yes || echo no)" yes
 check "hung gh counts as an API failure" "$(jq -r .api_failures "$STATE_FILE")" 1
 
+# whole-run deadline: MAX_RUN_SEC=0 stops inspection at once and warns, never errors
+rm -f "$STATE_FILE" "$GLOG"; export JOB_AGE_MIN=3 RUNS_QUEUED=3 GH_BIN="$T/gh"; unset GH_CALL_TIMEOUT_SEC
+MAX_RUN_SEC=0 run
+check "run deadline writes WARNING TRUNCATED" "$(grep ^WARNING "$GLOG" | cut -f2 | jq -r .status)" TRUNCATED
+check "run deadline never writes ERROR" "$(count ERROR)" 0
+# a fresh-but-old lock (10 min) is NOT reclaimed any more (stale threshold is 15 min)
+rm -f "$STATE_FILE" "$GLOG"; export QUEUE_WAIT_SIMULATE_MIN=40; mkdir "$STATE_FILE.lockdir"; touch -t "$(date -u -d '10 minutes ago' +%Y%m%d%H%M 2>/dev/null || date -u -v-10M +%Y%m%d%H%M)" "$STATE_FILE.lockdir"
+run
+check "10-minute-old lock is still held" "$(grep -c 'holds the lock; skipping' "$T/out")" 1
+rmdir "$STATE_FILE.lockdir"
+
 echo "queue_wait_alert_test: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

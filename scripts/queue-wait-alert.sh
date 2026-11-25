@@ -31,7 +31,9 @@
 # is never inferred; the cron installer sets MAC_RUNNER_DISABLED=1 while the Mac fleet is parked
 # (AGENTS.md, bead jleechan-hxz0). Candidate runs are the first 100 queued and in-progress runs created within
 # FRESH_HOURS (doctor's fresh window; older queued runs are ghost zombies with no jobs) and at most
-# MAX_RUN_CHECKS runs are inspected; hitting that cap logs WARNING TRUNCATED (never texts).
+# MAX_RUN_CHECKS runs are inspected within MAX_RUN_SEC; hitting either bound logs WARNING TRUNCATED (never texts).
+# An unreadable cycle (GitHub API failure) neither counts as a breach nor resets the breach count; three in a
+# row log WARNING BLIND. A missing gcloud is fatal on a real run (exit 3) so a broken alert path is never silent.
 #
 # Usage: queue-wait-alert.sh [--dry-run] [--test-alert] [--ensure-gcp-policy]
 #   --test-alert        write one TEST ERROR entry (drives Slack+SMS end to end) and exit
@@ -47,6 +49,8 @@ COOLDOWN_SEC="${COOLDOWN_SEC:-1800}"
 FRESH_HOURS="${FRESH_HOURS:-8}"
 MAX_RUN_CHECKS="${MAX_RUN_CHECKS:-60}"
 GH_CALL_TIMEOUT_SEC="${GH_CALL_TIMEOUT_SEC:-30}"
+GCLOUD_CALL_TIMEOUT_SEC="${GCLOUD_CALL_TIMEOUT_SEC:-60}"
+MAX_RUN_SEC="${MAX_RUN_SEC:-240}" # whole-run deadline; must stay well under the 15 min stale-lock age
 MAC_OFF="${MAC_RUNNER_DISABLED:-0}"
 LINUX_OFF="${REMOTE_LINUX_DISABLED:-0}"
 MAX_API_FAILURES="${MAX_API_FAILURES:-3}"
@@ -76,6 +80,18 @@ NOW_EPOCH=$(date +%s); NOW_ISO=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 GCP_ARGS=(--project="$PROJECT")
 [ -z "${GCP_ACCOUNT:-}" ] || GCP_ARGS+=(--account="$GCP_ACCOUNT")
 
+bounded() { # bounded <seconds> cmd...: a hung gh/gcloud must not stack cron runs on the fleet host
+  local secs="$1"; shift
+  if command -v timeout >/dev/null 2>&1; then timeout "$secs" "$@"; return; fi
+  local p w rc # no coreutils timeout (macOS): kill the call from a watchdog
+  "$@" & p=$!
+  ( sleep "$secs"; kill "$p" 2>/dev/null; sleep 2; kill -9 "$p" 2>/dev/null ) >/dev/null 2>&1 & w=$!
+  wait "$p"; rc=$?
+  kill "$w" 2>/dev/null || true; wait "$w" 2>/dev/null || true
+  return "$rc"
+}
+gh_call() { bounded "$GH_CALL_TIMEOUT_SEC" "$GH_BIN" "$@"; }
+
 if [ "$ENSURE_POLICY" -eq 1 ]; then
   SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
   POLICY_FILE="${POLICY_FILE:-$SCRIPT_DIR/../launchd/queue-wait-alert-policy.json}"
@@ -103,7 +119,7 @@ emit() { # severity status message oldest_min queued_jobs repo
   if [ "$DRY_RUN" -eq 1 ]; then
     echo "[$NOW_ISO] [dry-run] would write $1 log: $payload"
   else
-    "$GCLOUD_BIN" logging write ezgha-runner-alerts "$payload" --payload-type=json \
+    bounded "$GCLOUD_CALL_TIMEOUT_SEC" "$GCLOUD_BIN" logging write ezgha-runner-alerts "$payload" --payload-type=json \
       --severity="$1" "${GCP_ARGS[@]}" >/dev/null
     echo "[$NOW_ISO] wrote $1 entry to ezgha-runner-alerts"
   fi
@@ -115,11 +131,11 @@ if [ "$TEST_ALERT" -eq 1 ]; then
 fi
 
 # One run at a time: an overlapping cron run would race on the state file and double-alert.
-# Portable mkdir lock (atomic everywhere, no flock needed); a lock older than 10 min is a crashed run's.
+# Portable mkdir lock (atomic everywhere, no flock needed); a lock older than 15 min is a crashed run's (a live run is bounded by MAX_RUN_SEC + gcloud timeout, about 5 min).
 LOCKDIR="$STATE_FILE.lockdir"
 if [ "$DRY_RUN" -eq 0 ]; then
   if ! mkdir "$LOCKDIR" 2>/dev/null; then
-    if [ -n "$(find "$LOCKDIR" -maxdepth 0 -mmin +10 2>/dev/null)" ]; then
+    if [ -n "$(find "$LOCKDIR" -maxdepth 0 -mmin +15 2>/dev/null)" ]; then
       rmdir "$LOCKDIR" 2>/dev/null || true
       mkdir "$LOCKDIR" 2>/dev/null || { echo "[$NOW_ISO] lost the stale-lock race; skipping"; exit 0; }
     else
@@ -140,15 +156,6 @@ save() { # breaches last_sent api_failures last_blind
   [ "$DRY_RUN" -eq 1 ] && return 0
   jq -nc --argjson b "$1" --argjson t "$2" --argjson f "$3" --argjson l "$4" \
     '{breaches:$b,last_sent:$t,api_failures:$f,last_blind:$l}' > "$STATE_FILE.tmp.$$" && mv "$STATE_FILE.tmp.$$" "$STATE_FILE"
-}
-gh_call() { # always bounded: a hung gh must not stack cron runs on the fleet host
-  if command -v timeout >/dev/null 2>&1; then timeout "$GH_CALL_TIMEOUT_SEC" "$GH_BIN" "$@"; return; fi
-  local p w rc # no coreutils timeout (macOS): kill the call from a watchdog
-  "$GH_BIN" "$@" & p=$!
-  ( sleep "$GH_CALL_TIMEOUT_SEC"; kill "$p" 2>/dev/null ) >/dev/null 2>&1 & w=$!
-  wait "$p"; rc=$?
-  kill "$w" 2>/dev/null || true; wait "$w" 2>/dev/null || true
-  return "$rc"
 }
 # Same parked-leg rule as doctor-runner (_PARKED_LEG_JQ): generic/empty labels are never excluded.
 PARKED_JQ='def is_parked_leg($mac_off; $linux_off):
@@ -171,7 +178,7 @@ measure() {
     ids=$(printf '%s' "$runs_json" | jq -r --argjson cut "$cutoff" \
       '[.workflow_runs[]? | select((.created_at|fromdateiso8601) > $cut)] | sort_by(.created_at) | .[].id') || return 1
     for id in $ids; do
-      if [ "$checked" -ge "$MAX_RUN_CHECKS" ]; then TRUNCATED=1; break; fi
+      if [ "$checked" -ge "$MAX_RUN_CHECKS" ] || [ $(( $(date +%s) - NOW_EPOCH )) -ge "$MAX_RUN_SEC" ]; then TRUNCATED=1; break; fi
       checked=$((checked + 1))
       jobs_json=$(gh_call api --paginate "repos/$repo/actions/runs/$id/jobs?per_page=100") || return 1
       waits=$(printf '%s' "$jobs_json" | jq -r --argjson now "$NOW_EPOCH" --arg mac_off "$MAC_OFF" --arg linux_off "$LINUX_OFF" \
