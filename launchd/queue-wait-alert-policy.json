@@ -8,7 +8,7 @@
   "severity": "CRITICAL",
   "conditions": [
     {
-      "displayName": "queue_wait_alert_count > 0",
+      "displayName": "CI queue backed up: oldest job waited over 20 min (runners behind)",
       "conditionThreshold": {
         "filter": "metric.type=\"logging.googleapis.com/user/queue_wait_alert_count\" AND resource.type=\"global\"",
         "comparison": "COMPARISON_GT",
