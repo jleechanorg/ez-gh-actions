@@ -26,9 +26,10 @@ cat > "$T/gh" <<'EOF'
 mk() { date -u -d "${1} minutes ago" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -v-"${1}"M +%Y-%m-%dT%H:%M:%SZ; }
 case "$*" in
   *"/jobs"*) lbl=$(printf '%s' "${JOB_LABELS:-self-hosted,ezgha}" | jq -R 'split(",")')
-     jq -nc --arg c "$(mk "${JOB_AGE_MIN}")" --argjson l "$lbl" '{jobs:[{status:"queued",created_at:$c,labels:$l}]}' ;;
-  *"status=queued"*) n=${RUNS_QUEUED:-1}; jq -nc --arg c "$(mk 1)" --argjson n "$n" '{workflow_runs:[range($n)|{id:(4000+.),created_at:$c}]}' ;;
-  *"status=in_progress"*) n=${RUNS_INPROG:-0}; jq -nc --arg c "$(mk 1)" --argjson n "$n" '{workflow_runs:[range($n)|{id:(5000+.),created_at:$c}]}' ;;
+     jid=$(printf '%s' "$*" | sed -n 's@.*runs/\([0-9]*\)/jobs.*@\1@p'); jq -nc --argjson id "$jid" --arg c "$(mk "${JOB_AGE_MIN}")" --argjson l "$lbl" '{total_count:1,jobs:[{id:$id,status:"queued",created_at:$c,started_at:null,html_url:"https://github.com/o/r/actions/runs/1/job/7",labels:$l}]}' ;;
+  *"status=queued"*) n=${RUNS_QUEUED:-1}; jq -nc --arg c "$(mk 1)" --argjson n "$n" '{total_count:$n,workflow_runs:[range($n)|{id:(4000+.),created_at:$c}]}' ;;
+  *"status=in_progress"*) n=${RUNS_INPROG:-0}; jq -nc --arg c "$(mk 1)" --argjson n "$n" '{total_count:$n,workflow_runs:[range($n)|{id:(5000+.),created_at:$c}]}' ;;
+  *) echo '{"total_count":0,"workflow_runs":[]}' ;;
 esac
 EOF
 chmod +x "$T/gh"
