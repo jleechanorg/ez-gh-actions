@@ -257,37 +257,37 @@
   },
   "latency": {
     "cancellation": {
-      "cancelled_rate_pct": 15.5,
-      "cancelled_runs": 9,
+      "cancelled_rate_pct": 13.8,
+      "cancelled_runs": 8,
       "total_non_skipped_runs": 58
     },
     "cohort": "success",
-    "generated_at": "2026-11-25T12:39:16Z",
+    "generated_at": "2026-11-25T12:50:32Z",
     "ok": true,
     "overall": {
       "e2e": {
-        "avg_s": 195.4,
+        "avg_s": 192.24,
         "max_s": 2754.0,
-        "n": 48,
+        "n": 49,
         "p50_s": 29.0,
-        "p90_s": 392.5,
-        "p99_s": 2156.63
+        "p90_s": 388.0,
+        "p99_s": 2143.92
       },
       "execution": {
-        "avg_s": 284.14,
+        "avg_s": 280.18,
         "max_s": 1407.0,
-        "n": 65,
-        "p50_s": 41.0,
-        "p90_s": 1239.2,
-        "p99_s": 1403.16
+        "n": 66,
+        "p50_s": 41.5,
+        "p90_s": 1235.0,
+        "p99_s": 1403.1
       },
       "queue_wait": {
-        "avg_s": 1.89,
+        "avg_s": 1.88,
         "max_s": 8.0,
-        "n": 65,
+        "n": 66,
         "p50_s": 2.0,
         "p90_s": 2.0,
-        "p99_s": 4.8
+        "p99_s": 4.75
       }
     },
     "partial": false,
@@ -350,12 +350,12 @@
       },
       {
         "e2e": {
-          "avg_s": 157.25,
+          "avg_s": 209.0,
           "max_s": 312.0,
-          "n": 4,
-          "p50_s": 157.5,
-          "p90_s": 309.6,
-          "p99_s": 311.76
+          "n": 3,
+          "p50_s": 304.0,
+          "p90_s": 310.4,
+          "p99_s": 311.84
         },
         "execution": {
           "avg_s": null,
@@ -490,34 +490,6 @@
       },
       {
         "e2e": {
-          "avg_s": 41.11,
-          "max_s": 272.0,
-          "n": 9,
-          "p50_s": 11.0,
-          "p90_s": 74.4,
-          "p99_s": 252.24
-        },
-        "execution": {
-          "avg_s": 39.38,
-          "max_s": 262.0,
-          "n": 8,
-          "p50_s": 8.5,
-          "p90_s": 85.6,
-          "p99_s": 244.36
-        },
-        "queue_wait": {
-          "avg_s": 2.12,
-          "max_s": 8.0,
-          "n": 8,
-          "p50_s": 1.0,
-          "p90_s": 3.8,
-          "p99_s": 7.58
-        },
-        "repo": "repo-1",
-        "workflow": "workflow-8"
-      },
-      {
-        "e2e": {
           "avg_s": 52.0,
           "max_s": 87.0,
           "n": 2,
@@ -542,24 +514,52 @@
           "p99_s": 1.0
         },
         "repo": "repo-1",
+        "workflow": "workflow-8"
+      },
+      {
+        "e2e": {
+          "avg_s": 40.44,
+          "max_s": 272.0,
+          "n": 9,
+          "p50_s": 11.0,
+          "p90_s": 69.6,
+          "p99_s": 251.76
+        },
+        "execution": {
+          "avg_s": 36.89,
+          "max_s": 262.0,
+          "n": 9,
+          "p50_s": 9.0,
+          "p90_s": 66.0,
+          "p99_s": 242.4
+        },
+        "queue_wait": {
+          "avg_s": 2.0,
+          "max_s": 8.0,
+          "n": 9,
+          "p50_s": 1.0,
+          "p90_s": 3.2,
+          "p99_s": 7.52
+        },
+        "repo": "repo-1",
         "workflow": "workflow-9"
       },
       {
         "e2e": {
-          "avg_s": 257.11,
+          "avg_s": 236.1,
           "max_s": 1483.0,
-          "n": 9,
-          "p50_s": 45.0,
-          "p90_s": 711.0,
-          "p99_s": 1405.8
+          "n": 10,
+          "p50_s": 45.5,
+          "p90_s": 614.5,
+          "p99_s": 1396.15
         },
         "execution": {
-          "avg_s": 40.25,
+          "avg_s": 41.0,
           "max_s": 52.0,
           "n": 8,
-          "p50_s": 38.5,
-          "p90_s": 45.0,
-          "p99_s": 51.3
+          "p50_s": 40.0,
+          "p90_s": 45.7,
+          "p99_s": 51.37
         },
         "queue_wait": {
           "avg_s": 2.12,
@@ -714,14 +714,14 @@
       }
     ]
   },
-  "observed_at": "2026-11-25T12:38:31Z",
-  "published_at": "2026-11-25T12:38:32Z",
+  "observed_at": "2026-11-25T12:49:47Z",
+  "published_at": "2026-11-25T12:49:49Z",
   "queue": {
     "fresh": null,
     "ghosts": null,
     "in_progress_runs": 0,
     "ok": true,
-    "oldest_fresh_wait_minutes": 217,
+    "oldest_fresh_wait_minutes": 228,
     "partial": true,
     "repos": [
       {
