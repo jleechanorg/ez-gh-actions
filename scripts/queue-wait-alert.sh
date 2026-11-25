@@ -82,11 +82,11 @@ GCP_ARGS=(--project="$PROJECT")
 
 bounded() { # bounded <seconds> cmd...: a hung gh/gcloud must not stack cron runs on the fleet host
   local secs="$1"; shift
-  if command -v timeout >/dev/null 2>&1; then timeout "$secs" "$@"; return; fi
+  if [ -z "${QUEUE_WAIT_FORCE_WATCHDOG:-}" ] && command -v timeout >/dev/null 2>&1; then timeout "$secs" "$@"; return; fi
   local p w rc # no coreutils timeout (macOS): kill the call from a watchdog
   "$@" & p=$!
   ( sleep "$secs"; kill "$p" 2>/dev/null; sleep 2; kill -9 "$p" 2>/dev/null ) >/dev/null 2>&1 & w=$!
-  wait "$p"; rc=$?
+  rc=0; wait "$p" || rc=$? # never let a killed child's status trip set -e
   kill "$w" 2>/dev/null || true; wait "$w" 2>/dev/null || true
   return "$rc"
 }
@@ -119,8 +119,12 @@ emit() { # severity status message oldest_min queued_jobs repo
   if [ "$DRY_RUN" -eq 1 ]; then
     echo "[$NOW_ISO] [dry-run] would write $1 log: $payload"
   else
-    bounded "$GCLOUD_CALL_TIMEOUT_SEC" "$GCLOUD_BIN" logging write ezgha-runner-alerts "$payload" --payload-type=json \
-      --severity="$1" "${GCP_ARGS[@]}" >/dev/null
+    # A failed or timed-out write returns 1 and aborts the run before save(), so LAST_SENT is not advanced and the next run retries.
+    if ! bounded "$GCLOUD_CALL_TIMEOUT_SEC" "$GCLOUD_BIN" logging write ezgha-runner-alerts "$payload" --payload-type=json \
+        --severity="$1" "${GCP_ARGS[@]}" >/dev/null; then
+      echo "[$NOW_ISO] ERROR: gcloud logging write failed or timed out; alert not recorded, will retry next run" >&2
+      return 1
+    fi
     echo "[$NOW_ISO] wrote $1 entry to ezgha-runner-alerts"
   fi
 }

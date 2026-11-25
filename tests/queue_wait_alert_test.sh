@@ -110,7 +110,7 @@ check "policy includes SMS channel" "$(jq -r '.notificationChannels[]' "$POLICY"
 check "policy metric is queue_wait_alert_count" "$(jq -r '.conditions[0].conditionThreshold.filter' "$POLICY" | grep -c queue_wait_alert_count)" 1
 check "script metric filter covers QUEUE_BACKED_UP and TEST" "$(grep -c 'status="QUEUE_BACKED_UP" OR jsonPayload.status="TEST"' "$SCRIPT")" 1
 
-# lock: a fresh lock makes the run skip without touching state; a stale lock (>10 min) is reclaimed
+# lock: a fresh lock makes the run skip without touching state; a stale lock (>15 min) is reclaimed
 rm -f "$STATE_FILE" "$GLOG"; export QUEUE_WAIT_SIMULATE_MIN=40 SUSTAIN_CYCLES=2; mkdir "$STATE_FILE.lockdir"
 run
 check "held lock skips the run" "$(grep -c 'holds the lock; skipping' "$T/out")" 1
@@ -122,10 +122,10 @@ check "lock is released after a run" "$([ -d "$STATE_FILE.lockdir" ] && echo hel
 # gh hang is bounded by GH_CALL_TIMEOUT_SEC even without coreutils timeout
 cat > "$T/ghhang" <<'EOF'
 #!/usr/bin/env bash
-sleep 30
+exec sleep 30
 EOF
 chmod +x "$T/ghhang"; rm -f "$STATE_FILE" "$GLOG"; unset QUEUE_WAIT_SIMULATE_MIN
-start=$(date +%s); GH_BIN="$T/ghhang" GH_CALL_TIMEOUT_SEC=2 PATH="$T/nobin:$PATH" run
+start=$(date +%s); GH_BIN="$T/ghhang" GH_CALL_TIMEOUT_SEC=2 QUEUE_WAIT_FORCE_WATCHDOG=1 run
 el=$(( $(date +%s) - start ))
 check "hung gh is cut off by the timeout (<15s)" "$([ "$el" -lt 15 ] && echo yes || echo no)" yes
 check "hung gh counts as an API failure" "$(jq -r .api_failures "$STATE_FILE")" 1
@@ -136,10 +136,22 @@ MAX_RUN_SEC=0 run
 check "run deadline writes WARNING TRUNCATED" "$(grep ^WARNING "$GLOG" | cut -f2 | jq -r .status)" TRUNCATED
 check "run deadline never writes ERROR" "$(count ERROR)" 0
 # a fresh-but-old lock (10 min) is NOT reclaimed any more (stale threshold is 15 min)
-rm -f "$STATE_FILE" "$GLOG"; export QUEUE_WAIT_SIMULATE_MIN=40; mkdir "$STATE_FILE.lockdir"; touch -t "$(date -u -d '10 minutes ago' +%Y%m%d%H%M 2>/dev/null || date -u -v-10M +%Y%m%d%H%M)" "$STATE_FILE.lockdir"
+rm -f "$STATE_FILE" "$GLOG"; export QUEUE_WAIT_SIMULATE_MIN=40; mkdir "$STATE_FILE.lockdir"; touch -t "$(date -d '10 minutes ago' +%Y%m%d%H%M 2>/dev/null || date -v-10M +%Y%m%d%H%M)" "$STATE_FILE.lockdir"
 run
 check "10-minute-old lock is still held" "$(grep -c 'holds the lock; skipping' "$T/out")" 1
 rmdir "$STATE_FILE.lockdir"
+
+# a failed gcloud write must not advance last_sent (the alert is retried next run) and must say so
+cat > "$T/gcloudfail" <<'EOF'
+#!/usr/bin/env bash
+exit 1
+EOF
+chmod +x "$T/gcloudfail"; rm -f "$STATE_FILE" "$GLOG"; export QUEUE_WAIT_SIMULATE_MIN=40 SUSTAIN_CYCLES=2
+GCLOUD_BIN="$T/gcloudfail" run; GCLOUD_BIN="$T/gcloudfail" run
+check "failed gcloud write is reported" "$(grep -c 'alert not recorded, will retry' "$T/out")" 1
+check "failed gcloud write does not advance last_sent" "$(jq -r .last_sent "$STATE_FILE")" 0
+run
+check "alert is retried and recorded once gcloud works" "$(count ERROR)" 1
 
 echo "queue_wait_alert_test: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]
