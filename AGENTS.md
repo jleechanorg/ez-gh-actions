@@ -243,9 +243,20 @@ The 30-minute throttle never engaged because the state file lived in `/tmp` and 
 reclaimer archived it; state now lives under `$HOME/.local/state/ezgha/`.
 
 The offline-runner-with-queued-work policy is also Slack-only; its legacy JSON filename is retained
-for installer compatibility. SMS remains restricted to the separately governed stable P0 route and
-the TestFlight monitor's three-consecutive-automatic-push-failure exception. Do not add an SMS
-channel to fleet, disk, queue, TEST, or API-blind operational diagnostics.
+for installer compatibility. SMS remains restricted to the separately governed stable P0 route, the TestFlight monitor's
+three-consecutive-automatic-push-failure exception, and the queue-wait alert below (operator
+instruction 2026-11-24, overriding the earlier no-SMS-for-queue rule). Do not add an SMS channel to
+fleet, disk, other queue, TEST-only, or API-blind operational diagnostics.
+
+### CI queue-wait alert (`scripts/queue-wait-alert.sh`, Slack + SMS)
+Runs every 5 min on jeff-ubuntu (cron, `scripts/install-queue-wait-alert-cron.sh`). When the oldest
+queued **job** (not run: run-level age includes concurrency waits) has waited >20 min
+(`QUEUE_WAIT_MIN`) for 2 consecutive checks, it writes an ERROR `source=queue-wait-alert` entry to
+`ezgha-runner-alerts`; metric `queue_wait_alert_count` drives policy
+`[CRITICAL] ezgha: CI queue backed up` to the Slack channel and the "WorldAI operator critical SMS"
+channel (`launchd/queue-wait-alert-policy.json`). One alert per 30 min; GitHub API failure logs
+WARNING BLIND, which never texts. Normal pickup is seconds, so 20 min is a real backlog. Apply with
+`OPERATOR-ONLY: ./scripts/queue-wait-alert.sh --ensure-gcp-policy`; prove the path with `--test-alert`.
 
 Apply the policies (idempotent) with `OPERATOR-ONLY: ./scripts/ezgha-host-health-alert.sh --ensure-policies`.
 Audit a verdict without touching GCP using `--dry-run` plus the `HEALTH_ALERT_*` env overrides
