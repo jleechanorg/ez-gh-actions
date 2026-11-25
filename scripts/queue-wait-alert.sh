@@ -20,9 +20,11 @@
 # queued for 30+ min while their jobs get runners in seconds). Throttled to one alert per
 # COOLDOWN_SEC. An unreadable GitHub API logs WARNING BLIND (never ERROR: blindness must not text).
 #
-# Why not reuse an existing probe: queue_probe.py emits public aggregate counts (no per-job ages),
-# queue-health.sh/doctor-runner only run when sourced by a human-run doctor and never alert, and
-# runner-offline-queued-alert.sh watches one named runner. None measures per-job wait on a schedule.
+# Why not reuse an existing probe: queue_probe.py does compute per-job waits but only for queued runs
+# (not in-progress runs that still hold queued jobs), has no parked-leg filter, and is built for the
+# public dashboard snapshot, so it is not coupled to a paging path here. queue-health.sh/doctor-runner
+# only run under a human-run doctor and never alert; runner-offline-queued-alert.sh watches one named
+# runner. The paging loop (~35 lines) and the parked-leg jq (copied from doctor-runner) are the cost.
 #
 # Parked legs: like doctor-runner, jobs aimed at an intentionally parked leg (MAC_RUNNER_DISABLED=1 /
 # REMOTE_LINUX_DISABLED=1) cannot be served by design and are excluded, so they never text. The opt-out
@@ -156,7 +158,7 @@ measure() {
     for id in $ids; do
       if [ "$checked" -ge "$MAX_RUN_CHECKS" ]; then TRUNCATED=1; break; fi
       checked=$((checked + 1))
-      jobs_json=$(gh_call api "repos/$repo/actions/runs/$id/jobs?per_page=100") || return 1
+      jobs_json=$(gh_call api --paginate "repos/$repo/actions/runs/$id/jobs?per_page=100") || return 1
       waits=$(printf '%s' "$jobs_json" | jq -r --argjson now "$NOW_EPOCH" --arg mac_off "$MAC_OFF" --arg linux_off "$LINUX_OFF" \
         "$PARKED_JQ"'.jobs[]? | select(.status=="queued") | if is_parked_leg($mac_off; $linux_off) then "X" else ((($now - (.created_at|fromdateiso8601)) / 60) | floor | tostring) end') || return 1
       for w in $waits; do
@@ -165,7 +167,9 @@ measure() {
         if [ "$w" -gt "$OLDEST_MIN" ]; then OLDEST_MIN=$w; WORST_REPO=$repo; fi
       done
     done
+    [ "$TRUNCATED" -eq 0 ] || break
    done
+   [ "$TRUNCATED" -eq 0 ] || break
   done
 }
 
