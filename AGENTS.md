@@ -246,7 +246,7 @@ The offline-runner-with-queued-work policy is also Slack-only; its legacy JSON f
 for installer compatibility. SMS remains restricted to the separately governed stable P0 route, the TestFlight monitor's
 three-consecutive-automatic-push-failure exception, and the queue-wait alert below (operator
 instruction 2026-11-24, overriding the earlier no-SMS-for-queue rule). Do not add an SMS channel to
-fleet, disk, other queue, TEST-only, or API-blind operational diagnostics.
+fleet, disk, other queue, or API-blind operational diagnostics (the queue-wait alert's own `--test-alert` is the one TEST entry that texts, by design, to prove the path).
 
 ### CI queue-wait alert (`scripts/queue-wait-alert.sh`, Slack + SMS)
 Runs every 5 min on jeff-ubuntu (cron, `scripts/install-queue-wait-alert-cron.sh`). When the oldest
@@ -254,9 +254,13 @@ queued **job** (not run: run-level age includes concurrency waits) has waited >2
 (`QUEUE_WAIT_MIN`) for 2 consecutive checks, it writes an ERROR `source=queue-wait-alert` entry to
 `ezgha-runner-alerts`; metric `queue_wait_alert_count` drives policy
 `[CRITICAL] ezgha: CI queue backed up` to the Slack channel and the "WorldAI operator critical SMS"
-channel (`launchd/queue-wait-alert-policy.json`). One alert per 30 min; GitHub API failure logs
-WARNING BLIND, which never texts. Normal pickup is seconds, so 20 min is a real backlog. Apply with
-`OPERATOR-ONLY: ./scripts/queue-wait-alert.sh --ensure-gcp-policy`; prove the path with `--test-alert`.
+channel (`launchd/queue-wait-alert-policy.json`). One alert per 30 min. Jobs aimed at a parked leg
+(`MAC_RUNNER_DISABLED=1`, set by the cron installer while the Mac fleet is parked, bead jleechan-hxz0)
+are excluded like `doctor-runner` does, so unservable work never texts; queued and in-progress runs are
+checked, at most 60 per run (`WARNING TRUNCATED` beyond that). GitHub API failure logs WARNING BLIND,
+which never texts. Normal pickup is seconds, so 20 min is a real backlog. Apply with
+`OPERATOR-ONLY: ./scripts/queue-wait-alert.sh --ensure-gcp-policy`; `OPERATOR-ONLY: ./scripts/queue-wait-alert.sh --test-alert`
+sends one real text.
 
 Apply the policies (idempotent) with `OPERATOR-ONLY: ./scripts/ezgha-host-health-alert.sh --ensure-policies`.
 Audit a verdict without touching GCP using `--dry-run` plus the `HEALTH_ALERT_*` env overrides

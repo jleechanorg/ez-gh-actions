@@ -19,12 +19,16 @@ if [ "$1 $2" = "logging write" ]; then
 fi
 EOF
 chmod +x "$T/gcloud"
-# stub gh: one queued run whose single queued job was created $JOB_AGE_MIN minutes ago
+# stub gh: returns JSON. RUNS_QUEUED / RUNS_INPROG = number of runs; each run has one queued job
+# created $JOB_AGE_MIN minutes ago with labels $JOB_LABELS (comma separated).
 cat > "$T/gh" <<'EOF'
 #!/usr/bin/env bash
+mk() { date -u -d "${1} minutes ago" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -v-"${1}"M +%Y-%m-%dT%H:%M:%SZ; }
 case "$*" in
-  *"/jobs"*) date -u -d "${JOB_AGE_MIN} minutes ago" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -v-"${JOB_AGE_MIN}"M +%Y-%m-%dT%H:%M:%SZ ;;
-  *"status=queued"*) printf '%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" 4242 ;;
+  *"/jobs"*) lbl=$(printf '%s' "${JOB_LABELS:-self-hosted,ezgha}" | jq -R 'split(",")')
+     jq -nc --arg c "$(mk "${JOB_AGE_MIN}")" --argjson l "$lbl" '{jobs:[{status:"queued",created_at:$c,labels:$l}]}' ;;
+  *"status=queued"*) n=${RUNS_QUEUED:-1}; jq -nc --arg c "$(mk 1)" --argjson n "$n" '{workflow_runs:[range($n)|{id:(4000+.),created_at:$c}]}' ;;
+  *"status=in_progress"*) n=${RUNS_INPROG:-0}; jq -nc --arg c "$(mk 1)" --argjson n "$n" '{workflow_runs:[range($n)|{id:(5000+.),created_at:$c}]}' ;;
 esac
 EOF
 chmod +x "$T/gh"
@@ -54,6 +58,34 @@ check "gh path: 45m job alerts after 2 cycles" "$(count ERROR)" 1
 check "gh path: wait computed >= 44" "$([ "$(grep ^ERROR "$GLOG" | cut -f2 | jq -r .oldest_wait_min)" -ge 44 ] && echo yes || echo no)" yes
 rm -f "$STATE_FILE" "$GLOG"; export JOB_AGE_MIN=3; run; run
 check "gh path: 3m job stays quiet" "$(count ERROR)" 0
+
+# parked leg: a mac-labelled job must not text while the Mac fleet is parked, and must when it is not
+rm -f "$STATE_FILE" "$GLOG"; export JOB_AGE_MIN=60 JOB_LABELS="self-hosted,self-hosted-macos" MAC_RUNNER_DISABLED=1
+run; run
+check "parked-leg job (Mac disabled) stays quiet" "$(count ERROR)" 0
+check "parked-leg exclusion is logged" "$(grep -c 'excluded 1 queued job' "$T/out")" 1
+rm -f "$STATE_FILE" "$GLOG"; export MAC_RUNNER_DISABLED=0
+run; run
+check "mac-labelled job alerts when the Mac fleet is not parked" "$(count ERROR)" 1
+unset MAC_RUNNER_DISABLED; export JOB_LABELS="self-hosted,ezgha"
+
+# in-progress run holding a queued job is seen
+rm -f "$STATE_FILE" "$GLOG"; export JOB_AGE_MIN=45 RUNS_QUEUED=0 RUNS_INPROG=1
+run; run
+check "queued job inside an in_progress run alerts" "$(count ERROR)" 1
+export RUNS_QUEUED=1 RUNS_INPROG=0
+
+# inspection cap: WARNING TRUNCATED, never ERROR for a quiet queue
+rm -f "$STATE_FILE" "$GLOG"; export JOB_AGE_MIN=3 RUNS_QUEUED=5 MAX_RUN_CHECKS=2
+run
+check "run cap writes WARNING TRUNCATED" "$(grep ^WARNING "$GLOG" | cut -f2 | jq -r .status)" TRUNCATED
+check "run cap never writes ERROR for a quiet queue" "$(count ERROR)" 0
+unset MAX_RUN_CHECKS; export RUNS_QUEUED=1
+
+# corrupt state must not abort the run
+printf '{"breaches":"x","last_sent":"y"}' > "$STATE_FILE"; rm -f "$GLOG"; export JOB_AGE_MIN=3
+run
+check "corrupt state file does not abort" "$(grep -c 'queue ok' "$T/out")" 1
 
 # API failure: WARNING BLIND only, never ERROR
 rm -f "$STATE_FILE" "$GLOG"; export GH_BIN=false MAX_API_FAILURES=3

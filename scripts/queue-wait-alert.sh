@@ -20,11 +20,22 @@
 # queued for 30+ min while their jobs get runners in seconds). Throttled to one alert per
 # COOLDOWN_SEC. An unreadable GitHub API logs WARNING BLIND (never ERROR: blindness must not text).
 #
+# Why not reuse an existing probe: queue_probe.py emits public aggregate counts (no per-job ages),
+# queue-health.sh/doctor-runner only run when sourced by a human-run doctor and never alert, and
+# runner-offline-queued-alert.sh watches one named runner. None measures per-job wait on a schedule.
+#
+# Parked legs: like doctor-runner, jobs aimed at an intentionally parked leg (MAC_RUNNER_DISABLED=1 /
+# REMOTE_LINUX_DISABLED=1) cannot be served by design and are excluded, so they never text. The opt-out
+# is never inferred; the cron installer sets MAC_RUNNER_DISABLED=1 while the Mac fleet is parked
+# (AGENTS.md, bead jleechan-hxz0). Candidate runs are the first 100 queued and in-progress runs created within
+# FRESH_HOURS (doctor's fresh window; older queued runs are ghost zombies with no jobs) and at most
+# MAX_RUN_CHECKS runs are inspected; hitting that cap logs WARNING TRUNCATED (never texts).
+#
 # Usage: queue-wait-alert.sh [--dry-run] [--test-alert] [--ensure-gcp-policy]
 #   --test-alert        write one TEST ERROR entry (drives Slack+SMS end to end) and exit
 #   --ensure-gcp-policy create/update the log metric and the Slack+SMS policy, then exit
 # Env: ALERT_REPOS QUEUE_WAIT_MIN SUSTAIN_CYCLES COOLDOWN_SEC FRESH_HOURS MAX_RUN_CHECKS STATE_FILE
-#      GH_BIN GCLOUD_BIN MAX_API_FAILURES GCP_ACCOUNT QUEUE_WAIT_SIMULATE_MIN (detector proof, skips the API)
+#      GH_BIN GCLOUD_BIN MAX_API_FAILURES GH_CALL_TIMEOUT_SEC MAC_RUNNER_DISABLED REMOTE_LINUX_DISABLED GCP_ACCOUNT QUEUE_WAIT_SIMULATE_MIN (detector proof, skips the API)
 set -euo pipefail
 
 ALERT_REPOS="${ALERT_REPOS:-jleechanorg/worldarchitect.ai jleechanorg/ez-gh-actions}"
@@ -32,7 +43,10 @@ QUEUE_WAIT_MIN="${QUEUE_WAIT_MIN:-20}"
 SUSTAIN_CYCLES="${SUSTAIN_CYCLES:-2}"
 COOLDOWN_SEC="${COOLDOWN_SEC:-1800}"
 FRESH_HOURS="${FRESH_HOURS:-8}"
-MAX_RUN_CHECKS="${MAX_RUN_CHECKS:-40}"
+MAX_RUN_CHECKS="${MAX_RUN_CHECKS:-60}"
+GH_CALL_TIMEOUT_SEC="${GH_CALL_TIMEOUT_SEC:-30}"
+MAC_OFF="${MAC_RUNNER_DISABLED:-0}"
+LINUX_OFF="${REMOTE_LINUX_DISABLED:-0}"
 MAX_API_FAILURES="${MAX_API_FAILURES:-3}"
 STATE_FILE="${STATE_FILE:-$HOME/.local/state/ezgha/queue_wait_alert.json}"
 GH_BIN="${GH_BIN:-gh}"
@@ -98,37 +112,60 @@ if [ "$TEST_ALERT" -eq 1 ]; then
   exit 0
 fi
 
+# One run at a time: an overlapping cron run would race on the state file and double-alert.
+if [ "$DRY_RUN" -eq 0 ] && command -v flock >/dev/null 2>&1; then
+  exec 9>"$STATE_FILE.lock"
+  flock -n 9 || { echo "[$NOW_ISO] another queue-wait-alert run holds the lock; skipping"; exit 0; }
+fi
 BREACHES=0; LAST_SENT=0; API_FAILS=0; LAST_BLIND=0
+num() { case "$1" in ''|*[!0-9]*) echo 0 ;; *) echo "$1" ;; esac; } # corrupt state must not abort the run
 if [ -f "$STATE_FILE" ]; then
-  BREACHES=$(jq -r '.breaches // 0' "$STATE_FILE" 2>/dev/null || echo 0)
-  LAST_SENT=$(jq -r '.last_sent // 0' "$STATE_FILE" 2>/dev/null || echo 0)
-  API_FAILS=$(jq -r '.api_failures // 0' "$STATE_FILE" 2>/dev/null || echo 0)
-  LAST_BLIND=$(jq -r '.last_blind // 0' "$STATE_FILE" 2>/dev/null || echo 0)
+  BREACHES=$(num "$(jq -r '.breaches // 0' "$STATE_FILE" 2>/dev/null || true)")
+  LAST_SENT=$(num "$(jq -r '.last_sent // 0' "$STATE_FILE" 2>/dev/null || true)")
+  API_FAILS=$(num "$(jq -r '.api_failures // 0' "$STATE_FILE" 2>/dev/null || true)")
+  LAST_BLIND=$(num "$(jq -r '.last_blind // 0' "$STATE_FILE" 2>/dev/null || true)")
 fi
 save() { # breaches last_sent api_failures last_blind
-  [ "$DRY_RUN" -eq 1 ] || jq -nc --argjson b "$1" --argjson t "$2" --argjson f "$3" --argjson l "$4" \
-    '{breaches:$b,last_sent:$t,api_failures:$f,last_blind:$l}' > "$STATE_FILE"
+  [ "$DRY_RUN" -eq 1 ] && return 0
+  jq -nc --argjson b "$1" --argjson t "$2" --argjson f "$3" --argjson l "$4" \
+    '{breaches:$b,last_sent:$t,api_failures:$f,last_blind:$l}' > "$STATE_FILE.tmp.$$" && mv "$STATE_FILE.tmp.$$" "$STATE_FILE"
 }
+gh_call() { # bounded: a hung gh must not stack cron runs on the fleet host
+  if command -v timeout >/dev/null 2>&1; then timeout "$GH_CALL_TIMEOUT_SEC" "$GH_BIN" "$@"; else "$GH_BIN" "$@"; fi
+}
+# Same parked-leg rule as doctor-runner (_PARKED_LEG_JQ): generic/empty labels are never excluded.
+PARKED_JQ='def is_parked_leg($mac_off; $linux_off):
+  ((.labels // []) | map(tostring | ascii_downcase)) as $l
+  | (($mac_off == "1" and ($l | any(. == "self-hosted-macos" or . == "macos" or . == "ez-mac-runner" or startswith("ez-mac-runner-"))))
+     or ($linux_off == "1" and ($l | any(. == "self-hosted-linux" or . == "linux" or . == "ez-runner-c" or startswith("ez-runner-c-")))));
+'
 
-# Oldest queued JOB wait (minutes) and queued-job count across ALERT_REPOS; sets OLDEST_MIN QUEUED_JOBS WORST_REPO.
+# Oldest queued JOB wait (minutes) and count across ALERT_REPOS, parked-leg jobs excluded;
+# sets OLDEST_MIN QUEUED_JOBS EXCLUDED WORST_REPO TRUNCATED.
 measure() {
-  OLDEST_MIN=0; QUEUED_JOBS=0; WORST_REPO=""
+  OLDEST_MIN=0; QUEUED_JOBS=0; EXCLUDED=0; WORST_REPO=""; TRUNCATED=0
   if [ -n "$SIMULATE_MIN" ]; then OLDEST_MIN="$SIMULATE_MIN"; QUEUED_JOBS=1; WORST_REPO=simulated; return 0; fi
-  local cutoff repo ids id created c epoch wait
+  local cutoff repo st runs_json ids id jobs_json waits w checked=0
   cutoff=$((NOW_EPOCH - FRESH_HOURS * 3600))
   for repo in $ALERT_REPOS; do
-    ids=$("$GH_BIN" api "repos/$repo/actions/runs?status=queued&per_page=100" \
-      --jq ".workflow_runs[] | select((.created_at|fromdateiso8601) > $cutoff) | [.created_at,.id] | @tsv" | sort | head -n "$MAX_RUN_CHECKS" | cut -f2) || return 1
+   # queued runs, plus in_progress runs (a partly running run can still hold queued jobs, as doctor-runner sweeps)
+   for st in queued in_progress; do
+    runs_json=$(gh_call api "repos/$repo/actions/runs?status=$st&per_page=100") || return 1
+    ids=$(printf '%s' "$runs_json" | jq -r --argjson cut "$cutoff" \
+      '[.workflow_runs[]? | select((.created_at|fromdateiso8601) > $cut)] | sort_by(.created_at) | .[].id') || return 1
     for id in $ids; do
-      created=$("$GH_BIN" api "repos/$repo/actions/runs/$id/jobs?per_page=100" \
-        --jq '.jobs[] | select(.status=="queued") | .created_at') || return 1
-      for c in $created; do
+      if [ "$checked" -ge "$MAX_RUN_CHECKS" ]; then TRUNCATED=1; break; fi
+      checked=$((checked + 1))
+      jobs_json=$(gh_call api "repos/$repo/actions/runs/$id/jobs?per_page=100") || return 1
+      waits=$(printf '%s' "$jobs_json" | jq -r --argjson now "$NOW_EPOCH" --arg mac_off "$MAC_OFF" --arg linux_off "$LINUX_OFF" \
+        "$PARKED_JQ"'.jobs[]? | select(.status=="queued") | if is_parked_leg($mac_off; $linux_off) then "X" else ((($now - (.created_at|fromdateiso8601)) / 60) | floor | tostring) end') || return 1
+      for w in $waits; do
+        if [ "$w" = X ]; then EXCLUDED=$((EXCLUDED + 1)); continue; fi
         QUEUED_JOBS=$((QUEUED_JOBS + 1))
-        epoch=$(jq -nr --arg c "$c" '$c|fromdateiso8601')
-        wait=$(( (NOW_EPOCH - epoch) / 60 ))
-        if [ "$wait" -gt "$OLDEST_MIN" ]; then OLDEST_MIN=$wait; WORST_REPO=$repo; fi
+        if [ "$w" -gt "$OLDEST_MIN" ]; then OLDEST_MIN=$w; WORST_REPO=$repo; fi
       done
     done
+   done
   done
 }
 
@@ -143,6 +180,11 @@ if ! measure; then
   exit 0
 fi
 
+if [ "$TRUNCATED" -eq 1 ] && [ $((NOW_EPOCH - LAST_BLIND)) -ge "$COOLDOWN_SEC" ]; then
+  emit WARNING TRUNCATED "queue-wait monitor hit its $MAX_RUN_CHECKS-run inspection cap; the oldest job may be outside the sample" 0 0 ""
+  LAST_BLIND=$NOW_EPOCH
+fi
+[ "$EXCLUDED" -eq 0 ] || echo "[$NOW_ISO] excluded $EXCLUDED queued job(s) aimed at a parked leg"
 if [ "$OLDEST_MIN" -gt "$QUEUE_WAIT_MIN" ]; then
   BREACHES=$((BREACHES + 1))
   echo "[$NOW_ISO] queue breach $BREACHES/$SUSTAIN_CYCLES: oldest job wait ${OLDEST_MIN}m > ${QUEUE_WAIT_MIN}m ($QUEUED_JOBS queued job(s), $WORST_REPO)"
