@@ -1,0 +1,40 @@
+{
+  "displayName": "[CRITICAL] ezgha: CI queue backed up",
+  "documentation": {
+    "content": "Oldest queued CI job has waited longer than the threshold (default 20 min) for 2 consecutive checks. Normal pickup is seconds. Routes to Slack and SMS (operator instruction 2026-11-24). Source: ez-gh-actions scripts/queue-wait-alert.sh. TEST entries have jsonPayload.status=TEST. Run ./doctor-runner to see which slots are down or starved.",
+    "mimeType": "text/markdown"
+  },
+  "combiner": "OR",
+  "severity": "CRITICAL",
+  "conditions": [
+    {
+      "displayName": "queue_wait_alert_count > 0",
+      "conditionThreshold": {
+        "filter": "metric.type=\"logging.googleapis.com/user/queue_wait_alert_count\" AND resource.type=\"global\"",
+        "comparison": "COMPARISON_GT",
+        "thresholdValue": 0,
+        "duration": "0s",
+        "aggregations": [
+          {
+            "alignmentPeriod": "60s",
+            "perSeriesAligner": "ALIGN_DELTA"
+          }
+        ],
+        "trigger": {
+          "count": 1
+        }
+      }
+    }
+  ],
+  "alertStrategy": {
+    "autoClose": "1800s",
+    "notificationPrompts": [
+      "OPENED"
+    ]
+  },
+  "notificationChannels": [
+    "projects/worldarchitecture-ai/notificationChannels/14071650426226468737",
+    "projects/worldarchitecture-ai/notificationChannels/17167119139665448890"
+  ],
+  "enabled": true
+}

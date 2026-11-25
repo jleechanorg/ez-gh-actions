@@ -6,7 +6,7 @@
 ## Fleet capacity standard — no excuses, prove per-slot execution
 The fleet MUST run its full configured capacity: **20 Linux** (ez-runner-c-1..20 on jeff-ubuntu) + **4 Mac** (ez-mac-runner-h-1..4) = **24 runners**, and **EVERY one must be proven EXECUTING a real GitHub Actions job** — a `Runner.Worker` process, verified via `docker top <container>`. Anything less than 24/24 executing is **BROKEN**: root-cause and fix it. Do NOT explain a shortfall away as "churn", "normal ephemeral cycling", "counting artifacts", or "the API is just lying". Assume the capacity SHOULD be full and PROVE it per-slot.
 
-> **Mac docker fleet is DISABLED as of 2026-11-18** — `count = 0` in the live `~/.config`-side config and in `config/config.toml.mac.example`. The contract above therefore reads **20 Linux / 20 total** until it is restored; a 20/20 Linux fleet is the correct full state, not a Mac shortfall. Reason: the four containers held ~200% CPU on the host (Colima VM at 233%, load avg 546, 20k threads) and starved the active cmux agent lanes. Declare it with `MAC_RUNNER_DISABLED=1 ./doctor-runner` and `EZGHA_SUSPENSION_RECORD=jleechan-hxz0` so the parked leg prints as intentionally DISABLED rather than a host outage. To restore: set `count = 4` in both files, re-enable the `org.jleechanorg.ezgha` launchd job, and start Colima. Never infer this opt-out from live docker state.
+> **Mac docker fleet is DISABLED as of 2026-11-18** — `count = 0` in the live `~/.config`-side config and in `config/config.toml.mac.example`. The contract above therefore reads **20 Linux / 20 total** until it is restored; a 20/20 Linux fleet is the correct full state, not a Mac shortfall. Reason: the four containers held ~200% CPU on the host (Colima VM at 233%, load avg 546, 20k threads) and starved the active cmux agent lanes. Declare it with `MAC_RUNNER_DISABLED=1 ./doctor-runner` and `EZGHA_SUSPENSION_RECORD=jleechan-hxz0` so the parked leg prints as intentionally DISABLED rather than a host outage. To restore: set `count = 4` in both files, re-enable the `org.jleechanorg.ezgha` launchd job, and start Colima. Also rerun `QUEUE_WAIT_ALERT_MAC_DISABLED=0 ./scripts/install-queue-wait-alert-cron.sh` so the queue-wait alert stops excluding Mac-labelled jobs. Never infer this opt-out from live docker state.
 - **The GitHub API CANNOT be trusted for fleet state.** Under the secondary rate limit it returned TRUNCATED/partial data — during the prior 22-runner contract, the same fleet was reported as 7 / 11 / 16 / 19 / 22 across calls minutes apart. Use LOCAL `docker top` / `docker ps` for `Runner.Worker`-per-slot as the source of truth, never API counts.
 - **`./doctor-runner` is authoritative** (`./doctor.sh` is LEGACY/BROKEN on docker 27+ — see bead ez-gh-actions-91r — kept only as a back-reference). It enforces per-slot activity truth with a 4-state model: EXECUTING (job+repo+run URL+elapsed evidence) / IDLE-OK (nothing queued, or queued for less than `IDLE_STARVED_THRESHOLD_MIN`=5min — healthy) / IDLE-STARVED (queued >=5min — defect) / DOWN (no container — defect). A busy fleet must never measure as dead — the motivating defect this replaced was a tail-grep on "Listening for Jobs" that read a fully-busy fleet as 0/16 healthy. Run it; fix any DOWN or IDLE-STARVED slot before declaring the fleet healthy.
 - **A deliberately parked platform is DISABLED, not DOWN** (bead jleechan-hxz0). One leg can be intentionally suspended (e.g. the Mac fleet is off while work runs on Linux + cmux Cloud). That is a decision, not an outage, and the two must never render the same way — otherwise a healthy 20/20 Linux fleet reads RED forever and nothing can tell a deliberate suspension from a crashed host. Declare it explicitly: `MAC_RUNNER_DISABLED=1 ./doctor-runner` (from a Linux/macOS doctor) or `REMOTE_LINUX_DISABLED=1` (from a macOS doctor). The opted-out leg prints `intentionally DISABLED (operator opt-out)`, contributes 0 slots to the contract, and adds 0 criticals. It is **never** inferred from live launchd/docker state — a daemon that died on its own also reads as "not running" — so an unset opt-out keeps today's fail-closed behavior. Record each suspension with its start date and restore condition in the bead or roadmap note that owns it, so the opt-out cannot quietly become a permanent capacity reduction. Name that record when you declare the opt-out (`EZGHA_SUSPENSION_RECORD=<bead-id>`); `./doctor-runner` prints the pointer on every parked run and **warns when it is missing** (`EZGHA_SUSPENSION_RECORD=none`), because the Mac leg sat parked from 2026-10-29 with no written record anywhere until a 2026-11-07 audit found it.
@@ -243,9 +243,24 @@ The 30-minute throttle never engaged because the state file lived in `/tmp` and 
 reclaimer archived it; state now lives under `$HOME/.local/state/ezgha/`.
 
 The offline-runner-with-queued-work policy is also Slack-only; its legacy JSON filename is retained
-for installer compatibility. SMS remains restricted to the separately governed stable P0 route and
-the TestFlight monitor's three-consecutive-automatic-push-failure exception. Do not add an SMS
-channel to fleet, disk, queue, TEST, or API-blind operational diagnostics.
+for installer compatibility. SMS remains restricted to the separately governed stable P0 route, the TestFlight monitor's
+three-consecutive-automatic-push-failure exception, and the queue-wait alert below (operator
+instruction 2026-11-24, overriding the earlier no-SMS-for-queue rule). Do not add an SMS channel to
+fleet, disk, other queue, or API-blind operational diagnostics (the queue-wait alert's own `--test-alert` is the one TEST entry that texts, by design, to prove the path).
+
+### CI queue-wait alert (`scripts/queue-wait-alert.sh`, Slack + SMS)
+Runs every 5 min on jeff-ubuntu (cron, `scripts/install-queue-wait-alert-cron.sh`). When the oldest
+queued **job** (not run: run-level age includes concurrency waits) has waited >20 min
+(`QUEUE_WAIT_MIN`) for 2 consecutive checks, it writes an ERROR `source=queue-wait-alert` entry to
+`ezgha-runner-alerts`; metric `queue_wait_alert_count` drives policy
+`[CRITICAL] ezgha: CI queue backed up` to the Slack channel and the "WorldAI operator critical SMS"
+channel (`launchd/queue-wait-alert-policy.json`). One alert per 30 min. Jobs aimed at a parked leg
+(`MAC_RUNNER_DISABLED=1`, set by the cron installer while the Mac fleet is parked, bead jleechan-hxz0)
+are excluded like `doctor-runner` does, so unservable work never texts; queued and in-progress runs are
+checked, at most 60 per run (`WARNING TRUNCATED` beyond that). GitHub API failure logs WARNING BLIND,
+which never texts. Normal pickup is seconds, so 20 min is a real backlog. Apply with
+`OPERATOR-ONLY: ./scripts/queue-wait-alert.sh --ensure-gcp-policy`; `OPERATOR-ONLY: ./scripts/queue-wait-alert.sh --test-alert`
+sends one real text.
 
 Apply the policies (idempotent) with `OPERATOR-ONLY: ./scripts/ezgha-host-health-alert.sh --ensure-policies`.
 Audit a verdict without touching GCP using `--dry-run` plus the `HEALTH_ALERT_*` env overrides

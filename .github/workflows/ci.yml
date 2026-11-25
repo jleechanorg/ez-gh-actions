@@ -57,6 +57,7 @@ jobs:
         run: |
           bash tests/colima_trim_guard_test.sh
           bash tests/runner_offline_queued_alert_test.sh
+          bash tests/queue_wait_alert_test.sh
           bash tests/scratch_migration_installer_test.sh
           bash tests/ezgha_host_health_alert_classification_test.sh
           bash tests/ezgha_host_health_alert_page_boundary_test.sh
