@@ -300,3 +300,54 @@ Update `~/.config/ezgha/config.toml` → `image = "ezgha-runner:latest"`, then r
 ```bash
 systemctl --user restart ezgha.service
 ```
+
+### Deploy-email jobs wedged queued / queue-wait alert firing every cycle for the same 1-3 jobs
+
+**Symptom**: The CI queue-wait alert (`scripts/queue-wait-alert.sh`) posts `queue breach …> 20m` every
+30-minute cooldown, always about 1-3 jobs. `Dev Deployment Email` run pages show `success` while no
+email is delivered.
+
+**Root cause**: `notify` jobs use `runs-on: [self-hosted, smtp-egress]`. That label is served by only
+two dedicated runners — `jeff-ubuntu-smtp-egress` (Linux, agentId 485933) and `mac-smtp-egress` (Mac,
+agentId 488459). If neither advertises the label, those jobs are structurally unschedulable and wait
+forever. The failure is silent: `resolve` succeeds on a normal runner, so the run shows green while
+`notify` sits queued or is skipped.
+
+"Service is running" is **not** proof. Check the label advertisement:
+```bash
+gh api "orgs/jleechanorg/actions/runners?per_page=100" \
+  --jq '.runners[] | select(any(.labels[]; .name=="smtp-egress")) | "\(.name) \(.status)"'
+```
+Two tell-tales: the repeating alert, and `queue-reaper.log` lines reading `unschedulable: N queued
+run(s) require a label no online runner advertises` (report-only, never escalated).
+
+**Fix — Linux lost its label** (online but only `self-hosted,Linux,X64`):
+```bash
+gh api --method POST "orgs/jleechanorg/actions/runners/485933/labels" -f 'labels[]=smtp-egress'
+```
+POST appends a custom label; **PUT replaces all custom labels**, so do not use PUT here.
+
+**Fix — Mac launchd job disabled, not merely unloaded** (bead jleechan-6mct, 2026-11-25):
+`launchctl bootstrap` returns `Bootstrap failed: 5: Input/output error` precisely because the job is
+explicitly disabled. Check and clear the disable first:
+```bash
+launchctl print-disabled "gui/$(id -u)" | grep smtp          # expect "=> disabled"
+launchctl enable "gui/$(id -u)/org.jleechan.github-runner-smtp-egress"
+launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/org.jleechan.github-runner-smtp-egress.plist
+```
+Then confirm the disable persisted as `false` in `/var/db/com.apple.xpc.launchd/disabled.<uid>.plist`,
+or it will silently regress on reboot.
+
+**Verify with a real email, not a green run**:
+```bash
+gog gmail search -a "$GMAIL_ACCOUNT" "subject:(WorldAI backend)" --limit 5
+```
+And prove the Mac runner can *execute*, not just register, from its own diag log (`.runner` status
+alone is insufficient — that is the exact gap that hid this for 8 days):
+```bash
+ls -t ~/actions-runner-smtp-egress/_diag/Runner_*.log | head -1 | xargs grep -E "Running job|result:"
+```
+
+**Not fixed here**: `queue-wait-alert.sh` still reports unschedulable-by-label jobs as ordinary queue
+backlog, which is why this read as "the alert always fires" rather than "the job can never run". The
+durable fix is to escalate unschedulable as its own alert cause (bead jleechan-ve4v).

@@ -93,6 +93,15 @@ Merge commits and `git commit --no-verify` bypass the gate.
 
 ## Common self-healing recipes
 
+### Deploy-email jobs stuck queued, or queue-wait alert repeating on the same 1-3 jobs
+`notify` jobs use `runs-on: [self-hosted, smtp-egress]`, served only by `jeff-ubuntu-smtp-egress`
+(Linux) and `mac-smtp-egress` (Mac). If neither advertises the label those jobs are unschedulable, and
+the failure is silent because `resolve` succeeds so the run shows green. Check the label
+advertisement, not the service status; then see
+`.claude/skills/ezgha-doctor/SKILL.md` § Deploy-email jobs wedged queued for the Linux label-append
+fix and the Mac `launchctl print-disabled`/`enable` fix (bead jleechan-6mct). Verify with a real email
+via `gog gmail search`, not a green run.
+
 ### Gate 3 FAIL: container count low
 1. Check for stale containers: `docker ps --filter label=ezgha=managed --format '{{.Names}} {{.Image}}'`
 2. Check journal: `journalctl --user -n 40 -u ezgha.service`
