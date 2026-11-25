@@ -94,6 +94,30 @@ class Discovery(unittest.TestCase):
             return dict(total_count=101,workflow_runs=[dict(id=i) for i in range(100)] if page==1 else [dict(id=99),dict(id=100)])
         r=m.discover(dict(ALERT_REPOS='o/r',QUEUE_NOW_EPOCH=str(NOW),MAX_RUN_CHECKS='200',MAX_API_CALLS='300'),call=call)
         self.assertFalse(r['complete']); self.assertEqual(len(r['jobs']),1)
+    def test_over_sixty_runs_old_breach_prioritized(self):
+        seen=[]
+        def call(path):
+            if '/jobs?' in path:
+                ident=int(path.split('/runs/')[1].split('/')[0]); seen.append(ident)
+                return dict(total_count=1 if ident==0 else 0,jobs=[job()] if ident==0 else [])
+            runs=[dict(id=i,created_at=f'2026-01-{1+i//24:02d}T{i%24:02d}:00:00Z') for i in reversed(range(80))] if 'status=queued&' in path else []
+            return dict(total_count=len(runs),workflow_runs=runs)
+        r=m.discover(dict(ALERT_REPOS='o/r',QUEUE_NOW_EPOCH=str(NOW)),call=call)
+        self.assertFalse(r['complete']); self.assertEqual(seen[0],0); self.assertEqual(len(r['jobs']),1)
+        self.assertLessEqual(r['api_calls'],200)
+    def test_fair_repository_budget_and_run_round_robin(self):
+        seen=[]
+        def call(path):
+            repo=path.split('/actions/')[0].removeprefix('repos/')
+            if '/jobs?' in path:
+                seen.append(repo); return dict(total_count=0,jobs=[])
+            runs=[dict(id=i,created_at='2026-01-01T00:00:00Z') for i in range(90 if repo=='be/r' else 1)] if 'status=queued&' in path else []
+            return dict(total_count=len(runs),workflow_runs=runs)
+        r=m.discover(dict(ALERT_REPOS='be/r fe/r ez/r',MAX_API_CALLS='60',MAX_RUN_CHECKS='60'),call=call)
+        self.assertEqual(seen[:3],['be/r','fe/r','ez/r']); self.assertLessEqual(r['api_calls'],60)
+        self.assertTrue(all(n<=20 for n in r['repo_api_calls'].values()))
+    def test_within_300_seconds_clock_skew_is_zero(self):
+        r,_=self.scan([job(age=-299)]); self.assertTrue(r['complete']); self.assertEqual(r['jobs'][0]['wait_min'],0)
     def test_short_page_with_more_count_rejected(self):
         self.assertFalse(m.discover(dict(ALERT_REPOS='o/r'),call=lambda _:dict(total_count=101,workflow_runs=[dict(id=1)]))['complete'])
 

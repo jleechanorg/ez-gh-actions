@@ -15,7 +15,7 @@ Base: `37d33caf7c4314cdd3cefdda9f6538f3dc831de2` (merged #264).
 ## Checks
 
 - Existing shell regression suite: 41 passed.
-- New hermetic Python discovery/integration suite: 27 passed.
+- New hermetic Python discovery/integration suite: 30 passed.
 - New suite is wired into the existing CI workflow.
 - Shell syntax, Python compile and diff whitespace checks passed.
 - No live queue census, GCP write or test notification was run for this patch.
@@ -24,7 +24,7 @@ Base: `37d33caf7c4314cdd3cefdda9f6538f3dc831de2` (merged #264).
 
 This is code preparation, not an activated monitor. Merge, deployment and removing the existing queue-only suppression are separate decisions. It does not prove SMS delivery.
 
-The default inspection budget is still 60 distinct active runs and 200 API calls per cycle, bounded by 240 seconds. A fleet with more active runs will report TRUNCATED, not a queue verdict. The activation dry run must establish complete coverage within the approved API/time budget. Increasing the budget is not proof of coverage. There is no cache that guesses old runs are safe to skip.
+The default inspection budget is still 60 distinct active runs and 200 API calls per cycle, bounded by 240 seconds. API calls and API time have equal per-repo shares; half is reserved for job inspection. Candidate runs are discovered before inspection, then sorted oldest-first within each repo and inspected round-robin across repos. A fleet with more active runs will report TRUNCATED, not a queue verdict. The activation dry run must establish complete coverage within the approved API/time budget. Increasing the budget is not proof of coverage. There is no cache that guesses old runs are safe to skip.
 
 Heartbeat emission alone does not create an independent missing-heartbeat alert policy. The durable local record and remote INFO record expose the signal for existing monitoring; liveness alert routing needs separate validation.
 
