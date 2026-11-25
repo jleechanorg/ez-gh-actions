@@ -262,7 +262,7 @@
       "total_non_skipped_runs": 59
     },
     "cohort": "success",
-    "generated_at": "2026-11-25T13:58:11Z",
+    "generated_at": "2026-11-25T14:09:30Z",
     "ok": true,
     "overall": {
       "e2e": {
@@ -630,14 +630,14 @@
       }
     ]
   },
-  "observed_at": "2026-11-25T13:57:22Z",
-  "published_at": "2026-11-25T13:57:23Z",
+  "observed_at": "2026-11-25T14:08:43Z",
+  "published_at": "2026-11-25T14:08:45Z",
   "queue": {
     "fresh": null,
     "ghosts": null,
     "in_progress_runs": 0,
     "ok": true,
-    "oldest_fresh_wait_minutes": 189,
+    "oldest_fresh_wait_minutes": 200,
     "partial": true,
     "repos": [
       {
