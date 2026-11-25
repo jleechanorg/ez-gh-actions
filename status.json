@@ -262,7 +262,7 @@
       "total_non_skipped_runs": 58
     },
     "cohort": "success",
-    "generated_at": "2026-11-25T13:01:46Z",
+    "generated_at": "2026-11-25T13:13:04Z",
     "ok": true,
     "overall": {
       "e2e": {
@@ -714,14 +714,14 @@
       }
     ]
   },
-  "observed_at": "2026-11-25T13:01:04Z",
-  "published_at": "2026-11-25T13:01:06Z",
+  "observed_at": "2026-11-25T13:12:18Z",
+  "published_at": "2026-11-25T13:12:19Z",
   "queue": {
     "fresh": null,
     "ghosts": null,
     "in_progress_runs": 0,
     "ok": true,
-    "oldest_fresh_wait_minutes": 239,
+    "oldest_fresh_wait_minutes": 143,
     "partial": true,
     "repos": [
       {
@@ -735,7 +735,7 @@
         "repo": "repo-2"
       }
     ],
-    "unverified_runs": 96
+    "unverified_runs": 92
   },
   "reconciliation": {
     "active_job_slots_occupied": 0,
@@ -744,7 +744,7 @@
     "configured_slots": 20,
     "cycling_slots": 0,
     "down_slots": 0,
-    "explanation": "0 active GitHub workflow runs | 0 occupied local runner slots; queue partial: 96 unverified.",
+    "explanation": "0 active GitHub workflow runs | 0 occupied local runner slots; queue partial: 92 unverified.",
     "fresh_queued_runs": null,
     "idle_slots": 20,
     "inert_ghosts": null,
