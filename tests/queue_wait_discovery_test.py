@@ -118,6 +118,21 @@ class Discovery(unittest.TestCase):
         self.assertTrue(all(n<=20 for n in r['repo_api_calls'].values()))
     def test_within_300_seconds_clock_skew_is_zero(self):
         r,_=self.scan([job(age=-299)]); self.assertTrue(r['complete']); self.assertEqual(r['jobs'][0]['wait_min'],0)
+    def test_queued_container_before_sixty_old_empty_inprogress(self):
+        inspected=[]
+        def call(path):
+            if '/jobs?' in path:
+                ident=int(path.split('/runs/')[1].split('/')[0]); inspected.append(ident)
+                return dict(total_count=1 if ident==999 else 0,jobs=[job()] if ident==999 else [])
+            if 'status=queued&' in path:
+                runs=[dict(id=999,created_at='2026-11-25T00:00:00Z')]
+            elif 'status=in_progress&' in path:
+                runs=[dict(id=i,created_at='2026-01-01T00:00:00Z') for i in range(60)]
+            else: runs=[]
+            return dict(total_count=len(runs),workflow_runs=runs)
+        r=m.discover(dict(ALERT_REPOS='o/r',QUEUE_NOW_EPOCH=str(NOW)),call=call)
+        self.assertEqual(inspected[0],999); self.assertEqual(len(r['jobs']),1)
+        self.assertFalse(r['complete']); self.assertLessEqual(r['api_calls'],200)
     def test_short_page_with_more_count_rejected(self):
         self.assertFalse(m.discover(dict(ALERT_REPOS='o/r'),call=lambda _:dict(total_count=101,workflow_runs=[dict(id=1)]))['complete'])
 

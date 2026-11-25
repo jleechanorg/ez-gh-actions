@@ -19,7 +19,6 @@ def discover(env=os.environ, call=None, clock=time.monotonic):
     jobs = {}
     issues = []
     unknown_jobs = 0
-    seen_runs = set()
     repos = env.get('ALERT_REPOS', 'jleechanorg/worldarchitect.ai jleechanorg/worldai_frontend jleechanorg/ez-gh-actions').split()
     if not repos:
         raise ValueError('empty repository scope')
@@ -129,15 +128,18 @@ def discover(env=os.environ, call=None, clock=time.monotonic):
         for status in ('queued', 'in_progress', 'waiting', 'pending', 'requested'):
             try:
                 for run in pages(f'repos/{repo}/actions/runs?status={status}', 'workflow_runs'):
-                    candidates[repo][run['id']] = run
+                    run['_queue_priority'] = 0 if status == 'queued' else 1
+                    previous = candidates[repo].get(run['id'])
+                    if previous is None or run['_queue_priority'] < previous['_queue_priority']:
+                        candidates[repo][run['id']] = run
             except Exception as exc:
                 issues.append(repo + ': ' + type(exc).__name__ + ': ' + str(exc)[:160])
                 if isinstance(exc, OverflowError):
                     break
     discovery_phase = False
-    ordered = {repo: sorted(runs.values(), key=lambda r: (r.get('created_at', ''), r['id'])) for repo, runs in candidates.items()}
+    ordered = {repo: sorted(runs.values(), key=lambda r: (r['_queue_priority'], r.get('created_at', ''), r['id'])) for repo, runs in candidates.items()}
     # Round robin prevents backend load from consuming frontend's run slots.
-    # Oldest containers go first to preserve evidence of long-waiting jobs.
+    # Queued containers go first, then oldest within status priority.
     while any(ordered.values()):
         if runs_checked >= max_runs or clock() >= deadline:
             issues.append('OverflowError: run inspection cap or cycle deadline exhausted')
