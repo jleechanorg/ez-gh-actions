@@ -257,37 +257,37 @@
   },
   "latency": {
     "cancellation": {
-      "cancelled_rate_pct": 15.9,
+      "cancelled_rate_pct": 15.6,
       "cancelled_runs": 7,
-      "total_non_skipped_runs": 44
+      "total_non_skipped_runs": 45
     },
     "cohort": "success",
-    "generated_at": "2026-11-26T20:03:06Z",
+    "generated_at": "2026-11-26T20:14:15Z",
     "ok": true,
     "overall": {
       "e2e": {
-        "avg_s": 147.92,
+        "avg_s": 144.32,
         "max_s": 2500.0,
-        "n": 37,
+        "n": 38,
         "p50_s": 16.0,
-        "p90_s": 228.6,
-        "p99_s": 2064.4
+        "p90_s": 227.7,
+        "p99_s": 2052.3
       },
       "execution": {
-        "avg_s": 170.58,
+        "avg_s": 167.39,
         "max_s": 2450.0,
-        "n": 50,
+        "n": 51,
         "p50_s": 15.0,
-        "p90_s": 733.8,
-        "p99_s": 1937.95
+        "p90_s": 733.0,
+        "p99_s": 1927.5
       },
       "queue_wait": {
-        "avg_s": 1.5,
+        "avg_s": 1.51,
         "max_s": 6.0,
-        "n": 50,
+        "n": 51,
         "p50_s": 1.0,
         "p90_s": 2.0,
-        "p99_s": 4.53
+        "p99_s": 4.5
       }
     },
     "partial": false,
@@ -462,25 +462,25 @@
       },
       {
         "e2e": {
-          "avg_s": 15.75,
+          "avg_s": 14.8,
           "max_s": 21.0,
-          "n": 4,
-          "p50_s": 14.5,
-          "p90_s": 19.5,
-          "p99_s": 20.85
+          "n": 5,
+          "p50_s": 13.0,
+          "p90_s": 19.0,
+          "p99_s": 20.8
         },
         "execution": {
-          "avg_s": 12.75,
+          "avg_s": 11.8,
           "max_s": 18.0,
-          "n": 4,
-          "p50_s": 11.5,
-          "p90_s": 16.5,
-          "p99_s": 17.85
+          "n": 5,
+          "p50_s": 10.0,
+          "p90_s": 16.0,
+          "p99_s": 17.8
         },
         "queue_wait": {
-          "avg_s": 1.75,
+          "avg_s": 1.8,
           "max_s": 2.0,
-          "n": 4,
+          "n": 5,
           "p50_s": 2.0,
           "p90_s": 2.0,
           "p99_s": 2.0
@@ -602,8 +602,8 @@
       }
     ]
   },
-  "observed_at": "2026-11-26T20:02:26Z",
-  "published_at": "2026-11-26T20:02:27Z",
+  "observed_at": "2026-11-26T20:13:34Z",
+  "published_at": "2026-11-26T20:13:36Z",
   "queue": {
     "fresh": null,
     "ghosts": null,
@@ -623,7 +623,7 @@
         "repo": "repo-2"
       }
     ],
-    "unverified_runs": 25
+    "unverified_runs": 22
   },
   "reconciliation": {
     "active_job_slots_occupied": 0,
@@ -632,7 +632,7 @@
     "configured_slots": 20,
     "cycling_slots": 0,
     "down_slots": 0,
-    "explanation": "0 active GitHub workflow runs | 0 occupied local runner slots; queue partial: 25 unverified.",
+    "explanation": "0 active GitHub workflow runs | 0 occupied local runner slots; queue partial: 22 unverified.",
     "fresh_queued_runs": null,
     "idle_slots": 20,
     "inert_ghosts": null,
