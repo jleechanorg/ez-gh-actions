@@ -17,9 +17,9 @@
         "configured": 20,
         "cycling": 0,
         "down": 0,
-        "executing": 0,
-        "idle": 20,
-        "reserved": 20
+        "executing": 16,
+        "idle": 4,
+        "reserved": 19
       },
       "parked": false,
       "parked_reason": null,
@@ -27,19 +27,19 @@
       "pause_reason": null,
       "slots": [
         {
-          "elapsed_minutes": null,
+          "elapsed_minutes": 1.6,
           "phase_badge": null,
           "slot": 1,
           "slot_id": "linux-1",
-          "state": "IDLE",
+          "state": "EXECUTING",
           "workflow_category": null
         },
         {
-          "elapsed_minutes": null,
-          "phase_badge": null,
+          "elapsed_minutes": 2.3,
+          "phase_badge": "git index-pack",
           "slot": 2,
           "slot_id": "linux-2",
-          "state": "IDLE",
+          "state": "EXECUTING",
           "workflow_category": null
         },
         {
@@ -51,59 +51,59 @@
           "workflow_category": null
         },
         {
-          "elapsed_minutes": null,
-          "phase_badge": null,
+          "elapsed_minutes": 8.1,
+          "phase_badge": "jest",
           "slot": 4,
           "slot_id": "linux-4",
-          "state": "IDLE",
+          "state": "EXECUTING",
           "workflow_category": null
         },
         {
-          "elapsed_minutes": null,
-          "phase_badge": null,
+          "elapsed_minutes": 2.8,
+          "phase_badge": "pytest",
           "slot": 5,
           "slot_id": "linux-5",
-          "state": "IDLE",
+          "state": "EXECUTING",
           "workflow_category": null
         },
         {
-          "elapsed_minutes": null,
-          "phase_badge": null,
+          "elapsed_minutes": 8.1,
+          "phase_badge": "jest",
           "slot": 6,
           "slot_id": "linux-6",
-          "state": "IDLE",
+          "state": "EXECUTING",
           "workflow_category": null
         },
         {
-          "elapsed_minutes": null,
+          "elapsed_minutes": 2.3,
           "phase_badge": null,
           "slot": 7,
           "slot_id": "linux-7",
-          "state": "IDLE",
+          "state": "EXECUTING",
           "workflow_category": null
         },
         {
-          "elapsed_minutes": null,
-          "phase_badge": null,
+          "elapsed_minutes": 8.1,
+          "phase_badge": "jest",
           "slot": 8,
           "slot_id": "linux-8",
-          "state": "IDLE",
+          "state": "EXECUTING",
           "workflow_category": null
         },
         {
-          "elapsed_minutes": null,
-          "phase_badge": null,
+          "elapsed_minutes": 8.1,
+          "phase_badge": "jest",
           "slot": 9,
           "slot_id": "linux-9",
-          "state": "IDLE",
+          "state": "EXECUTING",
           "workflow_category": null
         },
         {
-          "elapsed_minutes": null,
+          "elapsed_minutes": 2.8,
           "phase_badge": null,
           "slot": 10,
           "slot_id": "linux-10",
-          "state": "IDLE",
+          "state": "EXECUTING",
           "workflow_category": null
         },
         {
@@ -115,11 +115,11 @@
           "workflow_category": null
         },
         {
-          "elapsed_minutes": null,
-          "phase_badge": null,
+          "elapsed_minutes": 2.8,
+          "phase_badge": "pytest",
           "slot": 12,
           "slot_id": "linux-12",
-          "state": "IDLE",
+          "state": "EXECUTING",
           "workflow_category": null
         },
         {
@@ -139,51 +139,51 @@
           "workflow_category": null
         },
         {
-          "elapsed_minutes": null,
-          "phase_badge": null,
+          "elapsed_minutes": 2.8,
+          "phase_badge": "pytest",
           "slot": 15,
           "slot_id": "linux-15",
-          "state": "IDLE",
+          "state": "EXECUTING",
           "workflow_category": null
         },
         {
-          "elapsed_minutes": null,
-          "phase_badge": null,
+          "elapsed_minutes": 2.2,
+          "phase_badge": "pip",
           "slot": 16,
           "slot_id": "linux-16",
-          "state": "IDLE",
+          "state": "EXECUTING",
           "workflow_category": null
         },
         {
-          "elapsed_minutes": null,
+          "elapsed_minutes": 0.0,
           "phase_badge": null,
           "slot": 17,
           "slot_id": "linux-17",
-          "state": "IDLE",
+          "state": "EXECUTING",
           "workflow_category": null
         },
         {
-          "elapsed_minutes": null,
+          "elapsed_minutes": 2.4,
           "phase_badge": null,
           "slot": 18,
           "slot_id": "linux-18",
-          "state": "IDLE",
+          "state": "EXECUTING",
           "workflow_category": null
         },
         {
-          "elapsed_minutes": null,
-          "phase_badge": null,
+          "elapsed_minutes": 8.2,
+          "phase_badge": "jest",
           "slot": 19,
           "slot_id": "linux-19",
-          "state": "IDLE",
+          "state": "EXECUTING",
           "workflow_category": null
         },
         {
-          "elapsed_minutes": null,
-          "phase_badge": null,
+          "elapsed_minutes": 8.2,
+          "phase_badge": "jest",
           "slot": 20,
           "slot_id": "linux-20",
-          "state": "IDLE",
+          "state": "EXECUTING",
           "workflow_category": null
         }
       ],
@@ -257,37 +257,37 @@
   },
   "latency": {
     "cancellation": {
-      "cancelled_rate_pct": 17.0,
-      "cancelled_runs": 8,
+      "cancelled_rate_pct": 8.5,
+      "cancelled_runs": 4,
       "total_non_skipped_runs": 47
     },
     "cohort": "success",
-    "generated_at": "2026-11-26T11:52:11Z",
+    "generated_at": "2026-11-26T12:04:00Z",
     "ok": true,
     "overall": {
       "e2e": {
-        "avg_s": 193.08,
+        "avg_s": 184.61,
         "max_s": 2328.0,
-        "n": 38,
+        "n": 41,
         "p50_s": 15.0,
-        "p90_s": 244.4,
-        "p99_s": 2298.4
+        "p90_s": 257.0,
+        "p99_s": 2296.0
       },
       "execution": {
-        "avg_s": 269.41,
-        "max_s": 2236.0,
-        "n": 78,
-        "p50_s": 18.0,
-        "p90_s": 853.2,
-        "p99_s": 2109.72
+        "avg_s": 126.87,
+        "max_s": 1461.0,
+        "n": 62,
+        "p50_s": 14.0,
+        "p90_s": 288.4,
+        "p99_s": 1434.77
       },
       "queue_wait": {
-        "avg_s": 2.16,
-        "max_s": 44.0,
-        "n": 69,
+        "avg_s": 1.84,
+        "max_s": 17.0,
+        "n": 62,
         "p50_s": 1.0,
         "p90_s": 2.0,
-        "p99_s": 17.48
+        "p99_s": 14.56
       }
     },
     "partial": false,
@@ -302,20 +302,20 @@
           "p99_s": 2326.4
         },
         "execution": {
-          "avg_s": 549.43,
-          "max_s": 2236.0,
-          "n": 37,
-          "p50_s": 293.0,
-          "p90_s": 1435.2,
-          "p99_s": 2176.96
+          "avg_s": 443.93,
+          "max_s": 1461.0,
+          "n": 15,
+          "p50_s": 139.0,
+          "p90_s": 1374.8,
+          "p99_s": 1454.98
         },
         "queue_wait": {
-          "avg_s": 3.07,
-          "max_s": 44.0,
-          "n": 28,
+          "avg_s": 1.07,
+          "max_s": 2.0,
+          "n": 15,
           "p50_s": 1.0,
-          "p90_s": 2.0,
-          "p99_s": 33.47
+          "p90_s": 1.0,
+          "p99_s": 1.86
         },
         "repo": "repo-2",
         "workflow": "workflow-1"
@@ -330,152 +330,68 @@
           "p99_s": 979.0
         },
         "execution": {
-          "avg_s": 975.0,
-          "max_s": 975.0,
-          "n": 1,
-          "p50_s": 975.0,
-          "p90_s": 975.0,
-          "p99_s": 975.0
+          "avg_s": null,
+          "max_s": null,
+          "n": 0,
+          "p50_s": null,
+          "p90_s": null,
+          "p99_s": null
         },
         "queue_wait": {
-          "avg_s": 2.0,
-          "max_s": 2.0,
-          "n": 1,
-          "p50_s": 2.0,
-          "p90_s": 2.0,
-          "p99_s": 2.0
+          "avg_s": null,
+          "max_s": null,
+          "n": 0,
+          "p50_s": null,
+          "p90_s": null,
+          "p99_s": null
         },
         "repo": "repo-2",
         "workflow": "workflow-2"
       },
       {
         "e2e": {
-          "avg_s": 239.0,
-          "max_s": 239.0,
-          "n": 1,
-          "p50_s": 239.0,
-          "p90_s": 239.0,
-          "p99_s": 239.0
+          "avg_s": 303.0,
+          "max_s": 367.0,
+          "n": 2,
+          "p50_s": 303.0,
+          "p90_s": 354.2,
+          "p99_s": 365.72
         },
         "execution": {
-          "avg_s": null,
-          "max_s": null,
-          "n": 0,
-          "p50_s": null,
-          "p90_s": null,
-          "p99_s": null
+          "avg_s": 119.67,
+          "max_s": 247.0,
+          "n": 3,
+          "p50_s": 86.0,
+          "p90_s": 214.8,
+          "p99_s": 243.78
         },
         "queue_wait": {
-          "avg_s": null,
-          "max_s": null,
-          "n": 0,
-          "p50_s": null,
-          "p90_s": null,
-          "p99_s": null
+          "avg_s": 1.67,
+          "max_s": 3.0,
+          "n": 3,
+          "p50_s": 1.0,
+          "p90_s": 2.6,
+          "p99_s": 2.96
         },
         "repo": "repo-2",
         "workflow": "workflow-3"
       },
       {
         "e2e": {
-          "avg_s": 97.33,
+          "avg_s": 100.0,
           "max_s": 100.0,
-          "n": 3,
+          "n": 1,
           "p50_s": 100.0,
           "p90_s": 100.0,
           "p99_s": 100.0
         },
         "execution": {
-          "avg_s": 25.77,
+          "avg_s": 27.0,
           "max_s": 73.0,
-          "n": 13,
-          "p50_s": 16.0,
-          "p90_s": 72.6,
-          "p99_s": 73.0
-        },
-        "queue_wait": {
-          "avg_s": 1.54,
-          "max_s": 2.0,
-          "n": 13,
-          "p50_s": 2.0,
-          "p90_s": 2.0,
-          "p99_s": 2.0
-        },
-        "repo": "repo-1",
-        "workflow": "workflow-4"
-      },
-      {
-        "e2e": {
-          "avg_s": 53.0,
-          "max_s": 53.0,
-          "n": 1,
-          "p50_s": 53.0,
-          "p90_s": 53.0,
-          "p99_s": 53.0
-        },
-        "execution": {
-          "avg_s": 49.0,
-          "max_s": 49.0,
-          "n": 1,
-          "p50_s": 49.0,
-          "p90_s": 49.0,
-          "p99_s": 49.0
-        },
-        "queue_wait": {
-          "avg_s": 3.0,
-          "max_s": 3.0,
-          "n": 1,
-          "p50_s": 3.0,
-          "p90_s": 3.0,
-          "p99_s": 3.0
-        },
-        "repo": "repo-1",
-        "workflow": "workflow-5"
-      },
-      {
-        "e2e": {
-          "avg_s": 14.92,
-          "max_s": 25.0,
-          "n": 12,
-          "p50_s": 13.0,
-          "p90_s": 22.8,
-          "p99_s": 24.78
-        },
-        "execution": {
-          "avg_s": 12.89,
-          "max_s": 22.0,
-          "n": 9,
-          "p50_s": 11.0,
-          "p90_s": 19.6,
-          "p99_s": 21.76
-        },
-        "queue_wait": {
-          "avg_s": 1.56,
-          "max_s": 2.0,
-          "n": 9,
-          "p50_s": 2.0,
-          "p90_s": 2.0,
-          "p99_s": 2.0
-        },
-        "repo": "repo-2",
-        "workflow": "workflow-6"
-      },
-      {
-        "e2e": {
-          "avg_s": 19.67,
-          "max_s": 31.0,
-          "n": 3,
-          "p50_s": 15.0,
-          "p90_s": 27.8,
-          "p99_s": 30.68
-        },
-        "execution": {
-          "avg_s": 12.0,
-          "max_s": 16.0,
           "n": 4,
-          "p50_s": 11.0,
-          "p90_s": 14.8,
-          "p99_s": 15.88
+          "p50_s": 15.0,
+          "p90_s": 56.5,
+          "p99_s": 71.35
         },
         "queue_wait": {
           "avg_s": 1.5,
@@ -486,57 +402,141 @@
           "p99_s": 2.0
         },
         "repo": "repo-1",
-        "workflow": "workflow-7"
+        "workflow": "workflow-4"
       },
       {
         "e2e": {
-          "avg_s": 95.67,
-          "max_s": 257.0,
-          "n": 3,
+          "avg_s": 15.0,
+          "max_s": 17.0,
+          "n": 2,
           "p50_s": 15.0,
-          "p90_s": 208.6,
-          "p99_s": 252.16
+          "p90_s": 16.6,
+          "p99_s": 16.96
         },
         "execution": {
-          "avg_s": 13.5,
-          "max_s": 14.0,
-          "n": 2,
-          "p50_s": 13.5,
-          "p90_s": 13.9,
-          "p99_s": 13.99
+          "avg_s": 35.2,
+          "max_s": 191.0,
+          "n": 10,
+          "p50_s": 14.0,
+          "p90_s": 56.0,
+          "p99_s": 177.5
+        },
+        "queue_wait": {
+          "avg_s": 4.3,
+          "max_s": 17.0,
+          "n": 10,
+          "p50_s": 2.0,
+          "p90_s": 13.4,
+          "p99_s": 16.64
+        },
+        "repo": "repo-1",
+        "workflow": "workflow-5"
+      },
+      {
+        "e2e": {
+          "avg_s": 47.0,
+          "max_s": 47.0,
+          "n": 1,
+          "p50_s": 47.0,
+          "p90_s": 47.0,
+          "p99_s": 47.0
+        },
+        "execution": {
+          "avg_s": 43.0,
+          "max_s": 43.0,
+          "n": 1,
+          "p50_s": 43.0,
+          "p90_s": 43.0,
+          "p99_s": 43.0
+        },
+        "queue_wait": {
+          "avg_s": 3.0,
+          "max_s": 3.0,
+          "n": 1,
+          "p50_s": 3.0,
+          "p90_s": 3.0,
+          "p99_s": 3.0
+        },
+        "repo": "repo-1",
+        "workflow": "workflow-6"
+      },
+      {
+        "e2e": {
+          "avg_s": 30.0,
+          "max_s": 30.0,
+          "n": 1,
+          "p50_s": 30.0,
+          "p90_s": 30.0,
+          "p99_s": 30.0
+        },
+        "execution": {
+          "avg_s": 28.0,
+          "max_s": 28.0,
+          "n": 1,
+          "p50_s": 28.0,
+          "p90_s": 28.0,
+          "p99_s": 28.0
         },
         "queue_wait": {
           "avg_s": 1.0,
           "max_s": 1.0,
-          "n": 2,
+          "n": 1,
           "p50_s": 1.0,
           "p90_s": 1.0,
           "p99_s": 1.0
+        },
+        "repo": "repo-1",
+        "workflow": "workflow-7"
+      },
+      {
+        "e2e": {
+          "avg_s": 15.42,
+          "max_s": 25.0,
+          "n": 12,
+          "p50_s": 13.0,
+          "p90_s": 22.9,
+          "p99_s": 24.78
+        },
+        "execution": {
+          "avg_s": 13.6,
+          "max_s": 22.0,
+          "n": 10,
+          "p50_s": 13.5,
+          "p90_s": 20.2,
+          "p99_s": 21.82
+        },
+        "queue_wait": {
+          "avg_s": 1.5,
+          "max_s": 2.0,
+          "n": 10,
+          "p50_s": 1.5,
+          "p90_s": 2.0,
+          "p99_s": 2.0
         },
         "repo": "repo-2",
         "workflow": "workflow-8"
       },
       {
         "e2e": {
-          "avg_s": 14.0,
-          "max_s": 16.0,
-          "n": 7,
-          "p50_s": 14.0,
-          "p90_s": 15.4,
-          "p99_s": 15.94
+          "avg_s": 14.78,
+          "max_s": 17.0,
+          "n": 9,
+          "p50_s": 15.0,
+          "p90_s": 16.2,
+          "p99_s": 16.92
         },
         "execution": {
-          "avg_s": 11.14,
-          "max_s": 13.0,
-          "n": 7,
+          "avg_s": 11.78,
+          "max_s": 14.0,
+          "n": 9,
           "p50_s": 12.0,
-          "p90_s": 12.4,
-          "p99_s": 12.94
+          "p90_s": 14.0,
+          "p99_s": 14.0
         },
         "queue_wait": {
-          "avg_s": 1.43,
+          "avg_s": 1.44,
           "max_s": 2.0,
-          "n": 7,
+          "n": 9,
           "p50_s": 1.0,
           "p90_s": 2.0,
           "p99_s": 2.0
@@ -546,12 +546,40 @@
       },
       {
         "e2e": {
-          "avg_s": 13.0,
-          "max_s": 13.0,
-          "n": 1,
+          "avg_s": 74.5,
+          "max_s": 257.0,
+          "n": 4,
+          "p50_s": 15.0,
+          "p90_s": 184.4,
+          "p99_s": 249.74
+        },
+        "execution": {
+          "avg_s": 11.67,
+          "max_s": 14.0,
+          "n": 3,
           "p50_s": 13.0,
-          "p90_s": 13.0,
-          "p99_s": 13.0
+          "p90_s": 13.8,
+          "p99_s": 13.98
+        },
+        "queue_wait": {
+          "avg_s": 1.0,
+          "max_s": 1.0,
+          "n": 3,
+          "p50_s": 1.0,
+          "p90_s": 1.0,
+          "p99_s": 1.0
+        },
+        "repo": "repo-2",
+        "workflow": "workflow-10"
+      },
+      {
+        "e2e": {
+          "avg_s": 12.0,
+          "max_s": 12.0,
+          "n": 1,
+          "p50_s": 12.0,
+          "p90_s": 12.0,
+          "p99_s": 12.0
         },
         "execution": {
           "avg_s": 10.0,
@@ -570,7 +598,63 @@
           "p99_s": 1.0
         },
         "repo": "repo-1",
-        "workflow": "workflow-10"
+        "workflow": "workflow-11"
+      },
+      {
+        "e2e": {
+          "avg_s": 10.0,
+          "max_s": 10.0,
+          "n": 1,
+          "p50_s": 10.0,
+          "p90_s": 10.0,
+          "p99_s": 10.0
+        },
+        "execution": {
+          "avg_s": 7.0,
+          "max_s": 7.0,
+          "n": 1,
+          "p50_s": 7.0,
+          "p90_s": 7.0,
+          "p99_s": 7.0
+        },
+        "queue_wait": {
+          "avg_s": 1.0,
+          "max_s": 1.0,
+          "n": 1,
+          "p50_s": 1.0,
+          "p90_s": 1.0,
+          "p99_s": 1.0
+        },
+        "repo": "repo-1",
+        "workflow": "workflow-12"
+      },
+      {
+        "e2e": {
+          "avg_s": 8.33,
+          "max_s": 9.0,
+          "n": 3,
+          "p50_s": 8.0,
+          "p90_s": 8.8,
+          "p99_s": 8.98
+        },
+        "execution": {
+          "avg_s": 5.67,
+          "max_s": 6.0,
+          "n": 3,
+          "p50_s": 6.0,
+          "p90_s": 6.0,
+          "p99_s": 6.0
+        },
+        "queue_wait": {
+          "avg_s": 1.67,
+          "max_s": 2.0,
+          "n": 3,
+          "p50_s": 2.0,
+          "p90_s": 2.0,
+          "p99_s": 2.0
+        },
+        "repo": "repo-1",
+        "workflow": "workflow-13"
       },
       {
         "e2e": {
@@ -598,72 +682,16 @@
           "p99_s": 2.0
         },
         "repo": "repo-2",
-        "workflow": "workflow-11"
-      },
-      {
-        "e2e": {
-          "avg_s": 8.0,
-          "max_s": 8.0,
-          "n": 2,
-          "p50_s": 8.0,
-          "p90_s": 8.0,
-          "p99_s": 8.0
-        },
-        "execution": {
-          "avg_s": 5.5,
-          "max_s": 6.0,
-          "n": 2,
-          "p50_s": 5.5,
-          "p90_s": 5.9,
-          "p99_s": 5.99
-        },
-        "queue_wait": {
-          "avg_s": 1.5,
-          "max_s": 2.0,
-          "n": 2,
-          "p50_s": 1.5,
-          "p90_s": 1.9,
-          "p99_s": 1.99
-        },
-        "repo": "repo-1",
-        "workflow": "workflow-12"
-      },
-      {
-        "e2e": {
-          "avg_s": 8.0,
-          "max_s": 8.0,
-          "n": 1,
-          "p50_s": 8.0,
-          "p90_s": 8.0,
-          "p99_s": 8.0
-        },
-        "execution": {
-          "avg_s": 5.0,
-          "max_s": 5.0,
-          "n": 1,
-          "p50_s": 5.0,
-          "p90_s": 5.0,
-          "p99_s": 5.0
-        },
-        "queue_wait": {
-          "avg_s": 2.0,
-          "max_s": 2.0,
-          "n": 1,
-          "p50_s": 2.0,
-          "p90_s": 2.0,
-          "p99_s": 2.0
-        },
-        "repo": "repo-1",
-        "workflow": "workflow-13"
+        "workflow": "workflow-14"
       }
     ]
   },
-  "observed_at": "2026-11-26T11:51:28Z",
-  "published_at": "2026-11-26T11:51:30Z",
+  "observed_at": "2026-11-26T12:02:43Z",
+  "published_at": "2026-11-26T12:03:16Z",
   "queue": {
     "fresh": null,
     "ghosts": null,
-    "in_progress_runs": 0,
+    "in_progress_runs": 7,
     "ok": true,
     "oldest_fresh_wait_minutes": null,
     "partial": true,
@@ -679,18 +707,18 @@
         "repo": "repo-2"
       }
     ],
-    "unverified_runs": 55
+    "unverified_runs": 46
   },
   "reconciliation": {
-    "active_job_slots_occupied": 0,
-    "active_workflow_runs": 0,
+    "active_job_slots_occupied": 16,
+    "active_workflow_runs": 7,
     "available_pools": 1,
     "configured_slots": 20,
     "cycling_slots": 0,
     "down_slots": 0,
-    "explanation": "0 active GitHub workflow runs | 0 occupied local runner slots; queue partial: 55 unverified.",
+    "explanation": "7 active GitHub workflow runs | 16 occupied local runner slots; queue partial: 46 unverified.",
     "fresh_queued_runs": null,
-    "idle_slots": 20,
+    "idle_slots": 4,
     "inert_ghosts": null,
     "parked_slots": 0
   },
