@@ -257,24 +257,24 @@
   },
   "latency": {
     "cancellation": {
-      "cancelled_rate_pct": 15.5,
+      "cancelled_rate_pct": 15.8,
       "cancelled_runs": 9,
-      "total_non_skipped_runs": 58
+      "total_non_skipped_runs": 57
     },
     "cohort": "success",
-    "generated_at": "2026-11-27T15:48:55Z",
+    "generated_at": "2026-11-27T15:59:39Z",
     "ok": true,
     "overall": {
       "e2e": {
-        "avg_s": 135.39,
+        "avg_s": 138.02,
         "max_s": 2237.0,
-        "n": 49,
+        "n": 48,
         "p50_s": 17.0,
-        "p90_s": 166.6,
-        "p99_s": 1995.56
+        "p90_s": 170.4,
+        "p99_s": 2000.59
       },
       "execution": {
-        "avg_s": 271.0,
+        "avg_s": 271.02,
         "max_s": 2228.0,
         "n": 58,
         "p50_s": 32.0,
@@ -282,7 +282,7 @@
         "p99_s": 2082.08
       },
       "queue_wait": {
-        "avg_s": 19.43,
+        "avg_s": 19.41,
         "max_s": 856.0,
         "n": 58,
         "p50_s": 2.0,
@@ -434,7 +434,7 @@
       },
       {
         "e2e": {
-          "avg_s": 44.08,
+          "avg_s": 44.15,
           "max_s": 58.0,
           "n": 13,
           "p50_s": 43.0,
@@ -442,15 +442,15 @@
           "p99_s": 56.68
         },
         "execution": {
-          "avg_s": 41.56,
+          "avg_s": 41.44,
           "max_s": 54.0,
           "n": 9,
-          "p50_s": 41.0,
+          "p50_s": 40.0,
           "p90_s": 46.0,
           "p99_s": 53.2
         },
         "queue_wait": {
-          "avg_s": 2.11,
+          "avg_s": 2.0,
           "max_s": 3.0,
           "n": 9,
           "p50_s": 2.0,
@@ -490,20 +490,20 @@
       },
       {
         "e2e": {
-          "avg_s": 10.57,
+          "avg_s": 10.62,
           "max_s": 28.0,
-          "n": 14,
+          "n": 13,
           "p50_s": 9.0,
           "p90_s": 10.0,
-          "p99_s": 25.66
+          "p99_s": 25.84
         },
         "execution": {
-          "avg_s": 8.22,
+          "avg_s": 8.44,
           "max_s": 24.0,
           "n": 9,
-          "p50_s": 6.0,
-          "p90_s": 10.4,
-          "p99_s": 22.64
+          "p50_s": 7.0,
+          "p90_s": 11.2,
+          "p99_s": 22.72
         },
         "queue_wait": {
           "avg_s": 1.78,
@@ -630,11 +630,11 @@
       }
     ]
   },
-  "observed_at": "2026-11-27T15:48:39Z",
-  "published_at": "2026-11-27T15:48:41Z",
+  "observed_at": "2026-11-27T15:59:27Z",
+  "published_at": "2026-11-27T15:59:29Z",
   "queue": {
     "fresh": 0,
-    "ghosts": 25,
+    "ghosts": 16,
     "in_progress_runs": 0,
     "ok": true,
     "oldest_fresh_wait_minutes": null,
@@ -642,7 +642,7 @@
     "repos": [
       {
         "fresh": 0,
-        "ghosts": 25,
+        "ghosts": 16,
         "repo": "repo-1"
       },
       {
@@ -660,10 +660,10 @@
     "configured_slots": 20,
     "cycling_slots": 0,
     "down_slots": 0,
-    "explanation": "0 active GitHub workflow runs | 0 occupied local runner slots; 0 fresh queued / 25 inert ghosts.",
+    "explanation": "0 active GitHub workflow runs | 0 occupied local runner slots; 0 fresh queued / 16 inert ghosts.",
     "fresh_queued_runs": 0,
     "idle_slots": 20,
-    "inert_ghosts": 25,
+    "inert_ghosts": 16,
     "parked_slots": 0
   },
   "schema_version": 1,
