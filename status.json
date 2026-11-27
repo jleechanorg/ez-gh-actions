@@ -17,8 +17,8 @@
         "configured": 20,
         "cycling": 0,
         "down": 0,
-        "executing": 1,
-        "idle": 19,
+        "executing": 0,
+        "idle": 20,
         "reserved": 20
       },
       "parked": false,
@@ -51,11 +51,11 @@
           "workflow_category": null
         },
         {
-          "elapsed_minutes": 0.5,
-          "phase_badge": "gcloud",
+          "elapsed_minutes": null,
+          "phase_badge": null,
           "slot": 4,
           "slot_id": "linux-4",
-          "state": "EXECUTING",
+          "state": "IDLE",
           "workflow_category": null
         },
         {
@@ -262,11 +262,11 @@
       "total_non_skipped_runs": 56
     },
     "cohort": "success",
-    "generated_at": "2026-11-27T17:13:55Z",
+    "generated_at": "2026-11-27T17:24:31Z",
     "ok": true,
     "overall": {
       "e2e": {
-        "avg_s": 143.22,
+        "avg_s": 143.18,
         "max_s": 2237.0,
         "n": 45,
         "p50_s": 14.0,
@@ -274,7 +274,7 @@
         "p99_s": 2015.68
       },
       "execution": {
-        "avg_s": 278.5,
+        "avg_s": 278.45,
         "max_s": 2228.0,
         "n": 56,
         "p50_s": 26.5,
@@ -282,7 +282,7 @@
         "p99_s": 2087.2
       },
       "queue_wait": {
-        "avg_s": 19.93,
+        "avg_s": 19.91,
         "max_s": 856.0,
         "n": 56,
         "p50_s": 1.0,
@@ -442,10 +442,10 @@
           "p99_s": 46.92
         },
         "execution": {
-          "avg_s": 39.83,
+          "avg_s": 39.17,
           "max_s": 42.0,
           "n": 6,
-          "p50_s": 40.5,
+          "p50_s": 38.5,
           "p90_s": 42.0,
           "p99_s": 42.0
         },
@@ -574,7 +574,7 @@
       },
       {
         "e2e": {
-          "avg_s": 10.8,
+          "avg_s": 10.6,
           "max_s": 28.0,
           "n": 10,
           "p50_s": 9.0,
@@ -582,20 +582,20 @@
           "p99_s": 26.38
         },
         "execution": {
-          "avg_s": 6.17,
+          "avg_s": 6.33,
           "max_s": 8.0,
           "n": 6,
-          "p50_s": 5.5,
+          "p50_s": 6.0,
           "p90_s": 8.0,
           "p99_s": 8.0
         },
         "queue_wait": {
-          "avg_s": 1.33,
+          "avg_s": 1.17,
           "max_s": 2.0,
           "n": 6,
           "p50_s": 1.0,
-          "p90_s": 2.0,
-          "p99_s": 2.0
+          "p90_s": 1.5,
+          "p99_s": 1.95
         },
         "repo": "repo-1",
         "workflow": "workflow-11"
@@ -658,12 +658,12 @@
       }
     ]
   },
-  "observed_at": "2026-11-27T17:13:51Z",
-  "published_at": "2026-11-27T17:13:53Z",
+  "observed_at": "2026-11-27T17:24:27Z",
+  "published_at": "2026-11-27T17:24:29Z",
   "queue": {
     "fresh": 0,
     "ghosts": 0,
-    "in_progress_runs": 1,
+    "in_progress_runs": 0,
     "ok": true,
     "oldest_fresh_wait_minutes": null,
     "partial": false,
@@ -682,15 +682,15 @@
     "unverified_runs": 0
   },
   "reconciliation": {
-    "active_job_slots_occupied": 1,
-    "active_workflow_runs": 1,
+    "active_job_slots_occupied": 0,
+    "active_workflow_runs": 0,
     "available_pools": 1,
     "configured_slots": 20,
     "cycling_slots": 0,
     "down_slots": 0,
-    "explanation": "1 active GitHub workflow runs | 1 occupied local runner slots; 0 fresh queued / 0 inert ghosts.",
+    "explanation": "0 active GitHub workflow runs | 0 occupied local runner slots; 0 fresh queued / 0 inert ghosts.",
     "fresh_queued_runs": 0,
-    "idle_slots": 19,
+    "idle_slots": 20,
     "inert_ghosts": 0,
     "parked_slots": 0
   },
