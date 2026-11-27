@@ -262,11 +262,11 @@
       "total_non_skipped_runs": 56
     },
     "cohort": "success",
-    "generated_at": "2026-11-27T16:20:57Z",
+    "generated_at": "2026-11-27T16:31:37Z",
     "ok": true,
     "overall": {
       "e2e": {
-        "avg_s": 139.49,
+        "avg_s": 139.57,
         "max_s": 2237.0,
         "n": 47,
         "p50_s": 17.0,
@@ -274,7 +274,7 @@
         "p99_s": 2005.62
       },
       "execution": {
-        "avg_s": 271.14,
+        "avg_s": 271.19,
         "max_s": 2228.0,
         "n": 58,
         "p50_s": 32.0,
@@ -434,18 +434,18 @@
       },
       {
         "e2e": {
-          "avg_s": 44.75,
+          "avg_s": 45.17,
           "max_s": 58.0,
           "n": 12,
-          "p50_s": 44.0,
+          "p50_s": 44.5,
           "p90_s": 46.9,
           "p99_s": 56.79
         },
         "execution": {
-          "avg_s": 42.22,
+          "avg_s": 42.78,
           "max_s": 54.0,
           "n": 9,
-          "p50_s": 41.0,
+          "p50_s": 42.0,
           "p90_s": 46.0,
           "p99_s": 53.2
         },
@@ -490,7 +490,7 @@
       },
       {
         "e2e": {
-          "avg_s": 10.54,
+          "avg_s": 10.46,
           "max_s": 28.0,
           "n": 13,
           "p50_s": 9.0,
@@ -498,10 +498,10 @@
           "p99_s": 25.84
         },
         "execution": {
-          "avg_s": 8.44,
+          "avg_s": 8.22,
           "max_s": 24.0,
           "n": 9,
-          "p50_s": 7.0,
+          "p50_s": 6.0,
           "p90_s": 11.2,
           "p99_s": 22.72
         },
@@ -630,11 +630,11 @@
       }
     ]
   },
-  "observed_at": "2026-11-27T16:20:53Z",
-  "published_at": "2026-11-27T16:20:55Z",
+  "observed_at": "2026-11-27T16:31:33Z",
+  "published_at": "2026-11-27T16:31:35Z",
   "queue": {
     "fresh": 0,
-    "ghosts": 1,
+    "ghosts": 0,
     "in_progress_runs": 0,
     "ok": true,
     "oldest_fresh_wait_minutes": null,
@@ -642,7 +642,7 @@
     "repos": [
       {
         "fresh": 0,
-        "ghosts": 1,
+        "ghosts": 0,
         "repo": "repo-1"
       },
       {
@@ -660,10 +660,10 @@
     "configured_slots": 20,
     "cycling_slots": 0,
     "down_slots": 0,
-    "explanation": "0 active GitHub workflow runs | 0 occupied local runner slots; 0 fresh queued / 1 inert ghosts.",
+    "explanation": "0 active GitHub workflow runs | 0 occupied local runner slots; 0 fresh queued / 0 inert ghosts.",
     "fresh_queued_runs": 0,
     "idle_slots": 20,
-    "inert_ghosts": 1,
+    "inert_ghosts": 0,
     "parked_slots": 0
   },
   "schema_version": 1,
