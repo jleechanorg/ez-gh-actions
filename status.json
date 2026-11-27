@@ -257,24 +257,24 @@
   },
   "latency": {
     "cancellation": {
-      "cancelled_rate_pct": 14.0,
-      "cancelled_runs": 8,
+      "cancelled_rate_pct": 12.3,
+      "cancelled_runs": 7,
       "total_non_skipped_runs": 57
     },
     "cohort": "success",
-    "generated_at": "2026-11-27T18:38:26Z",
+    "generated_at": "2026-11-27T18:48:59Z",
     "ok": true,
     "overall": {
       "e2e": {
-        "avg_s": 215.7,
+        "avg_s": 212.0,
         "max_s": 2237.0,
-        "n": 47,
-        "p50_s": 18.0,
-        "p90_s": 908.0,
-        "p99_s": 2005.62
+        "n": 48,
+        "p50_s": 20.5,
+        "p90_s": 898.0,
+        "p99_s": 2000.59
       },
       "execution": {
-        "avg_s": 222.34,
+        "avg_s": 222.27,
         "max_s": 2228.0,
         "n": 70,
         "p50_s": 27.5,
@@ -282,7 +282,7 @@
         "p99_s": 2051.36
       },
       "queue_wait": {
-        "avg_s": 15.67,
+        "avg_s": 15.69,
         "max_s": 856.0,
         "n": 70,
         "p50_s": 1.0,
@@ -602,23 +602,23 @@
       },
       {
         "e2e": {
-          "avg_s": 44.5,
+          "avg_s": 44.0,
           "max_s": 55.0,
-          "n": 6,
-          "p50_s": 42.5,
-          "p90_s": 50.5,
-          "p99_s": 54.55
+          "n": 7,
+          "p50_s": 42.0,
+          "p90_s": 49.6,
+          "p99_s": 54.46
         },
         "execution": {
-          "avg_s": 42.5,
+          "avg_s": 41.0,
           "max_s": 51.0,
           "n": 4,
-          "p50_s": 41.5,
-          "p90_s": 48.9,
-          "p99_s": 50.79
+          "p50_s": 38.5,
+          "p90_s": 47.4,
+          "p99_s": 50.64
         },
         "queue_wait": {
-          "avg_s": 1.75,
+          "avg_s": 2.0,
           "max_s": 2.0,
           "n": 4,
           "p50_s": 2.0,
@@ -714,8 +714,8 @@
       }
     ]
   },
-  "observed_at": "2026-11-27T18:38:23Z",
-  "published_at": "2026-11-27T18:38:24Z",
+  "observed_at": "2026-11-27T18:48:56Z",
+  "published_at": "2026-11-27T18:48:57Z",
   "queue": {
     "fresh": 0,
     "ghosts": 0,
