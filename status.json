@@ -96,24 +96,24 @@
   },
   "latency": {
     "cancellation": {
-      "cancelled_rate_pct": 3.8,
+      "cancelled_rate_pct": 3.7,
       "cancelled_runs": 2,
-      "total_non_skipped_runs": 53
+      "total_non_skipped_runs": 54
     },
     "cohort": "success",
-    "generated_at": "2026-11-28T17:16:28Z",
+    "generated_at": "2026-11-28T17:27:03Z",
     "ok": true,
     "overall": {
       "e2e": {
-        "avg_s": 289.48,
+        "avg_s": 284.47,
         "max_s": 2818.0,
-        "n": 50,
+        "n": 51,
         "p50_s": 18.0,
-        "p90_s": 650.0,
-        "p99_s": 2695.01
+        "p90_s": 475.0,
+        "p99_s": 2692.5
       },
       "execution": {
-        "avg_s": 376.51,
+        "avg_s": 376.52,
         "max_s": 2559.0,
         "n": 95,
         "p50_s": 40.0,
@@ -217,12 +217,12 @@
       },
       {
         "e2e": {
-          "avg_s": 43.55,
+          "avg_s": 43.67,
           "max_s": 50.0,
-          "n": 11,
-          "p50_s": 42.0,
-          "p90_s": 48.0,
-          "p99_s": 49.8
+          "n": 12,
+          "p50_s": 43.0,
+          "p90_s": 47.9,
+          "p99_s": 49.78
         },
         "execution": {
           "avg_s": 39.75,
@@ -301,12 +301,12 @@
       },
       {
         "e2e": {
-          "avg_s": 14.5,
-          "max_s": 18.0,
-          "n": 2,
-          "p50_s": 14.5,
-          "p90_s": 17.3,
-          "p99_s": 17.93
+          "avg_s": 11.0,
+          "max_s": 11.0,
+          "n": 1,
+          "p50_s": 11.0,
+          "p90_s": 11.0,
+          "p99_s": 11.0
         },
         "execution": {
           "avg_s": 9.0,
@@ -329,15 +329,15 @@
       },
       {
         "e2e": {
-          "avg_s": 8.82,
+          "avg_s": 8.67,
           "max_s": 11.0,
-          "n": 11,
+          "n": 12,
           "p50_s": 9.0,
-          "p90_s": 11.0,
+          "p90_s": 10.9,
           "p99_s": 11.0
         },
         "execution": {
-          "avg_s": 6.12,
+          "avg_s": 6.25,
           "max_s": 8.0,
           "n": 8,
           "p50_s": 6.0,
@@ -357,8 +357,8 @@
       }
     ]
   },
-  "observed_at": "2026-11-28T17:16:20Z",
-  "published_at": "2026-11-28T17:16:26Z",
+  "observed_at": "2026-11-28T17:26:56Z",
+  "published_at": "2026-11-28T17:27:02Z",
   "queue": {
     "fresh": 0,
     "ghosts": 0,
