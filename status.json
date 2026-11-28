@@ -101,7 +101,7 @@
       "total_non_skipped_runs": 48
     },
     "cohort": "success",
-    "generated_at": "2026-11-28T13:01:36Z",
+    "generated_at": "2026-11-28T13:12:21Z",
     "ok": true,
     "overall": {
       "e2e": {
@@ -113,23 +113,23 @@
         "p99_s": 2542.07
       },
       "execution": {
-        "avg_s": 282.14,
+        "avg_s": 278.3,
         "max_s": 2281.0,
-        "n": 70,
-        "p50_s": 18.5,
-        "p90_s": 793.8,
-        "p99_s": 2240.98
+        "n": 71,
+        "p50_s": 18.0,
+        "p90_s": 789.0,
+        "p99_s": 2240.4
       },
       "queue_wait": {
         "avg_s": 1.41,
         "max_s": 5.0,
-        "n": 63,
+        "n": 64,
         "p50_s": 1.0,
         "p90_s": 2.0,
-        "p99_s": 3.76
+        "p99_s": 3.74
       }
     },
-    "partial": true,
+    "partial": false,
     "workflows": [
       {
         "e2e": {
@@ -337,20 +337,20 @@
           "p99_s": 18.75
         },
         "execution": {
-          "avg_s": 11.0,
+          "avg_s": 10.5,
           "max_s": 16.0,
-          "n": 3,
+          "n": 4,
           "p50_s": 9.0,
-          "p90_s": 14.6,
-          "p99_s": 15.86
+          "p90_s": 13.9,
+          "p99_s": 15.79
         },
         "queue_wait": {
-          "avg_s": 1.33,
+          "avg_s": 1.25,
           "max_s": 2.0,
-          "n": 3,
+          "n": 4,
           "p50_s": 1.0,
-          "p90_s": 1.8,
-          "p99_s": 1.98
+          "p90_s": 1.7,
+          "p99_s": 1.97
         },
         "repo": "repo-2",
         "workflow": "workflow-8"
@@ -469,12 +469,12 @@
       }
     ]
   },
-  "observed_at": "2026-11-28T13:01:29Z",
-  "published_at": "2026-11-28T13:01:34Z",
+  "observed_at": "2026-11-28T13:12:14Z",
+  "published_at": "2026-11-28T13:12:19Z",
   "queue": {
     "fresh": 0,
     "ghosts": 0,
-    "in_progress_runs": 1,
+    "in_progress_runs": 2,
     "ok": true,
     "oldest_fresh_wait_minutes": null,
     "partial": false,
@@ -494,7 +494,7 @@
   },
   "reconciliation": {
     "active_job_slots_occupied": null,
-    "active_workflow_runs": 1,
+    "active_workflow_runs": 2,
     "available_pools": 0,
     "configured_slots": null,
     "cycling_slots": null,
