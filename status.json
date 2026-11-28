@@ -101,7 +101,7 @@
       "total_non_skipped_runs": 50
     },
     "cohort": "success",
-    "generated_at": "2026-11-28T03:41:32Z",
+    "generated_at": "2026-11-28T03:52:04Z",
     "ok": true,
     "overall": {
       "e2e": {
@@ -525,12 +525,12 @@
       }
     ]
   },
-  "observed_at": "2026-11-28T03:41:24Z",
-  "published_at": "2026-11-28T03:41:30Z",
+  "observed_at": "2026-11-28T03:51:57Z",
+  "published_at": "2026-11-28T03:52:02Z",
   "queue": {
     "fresh": 0,
     "ghosts": 0,
-    "in_progress_runs": 0,
+    "in_progress_runs": 1,
     "ok": true,
     "oldest_fresh_wait_minutes": null,
     "partial": false,
@@ -550,7 +550,7 @@
   },
   "reconciliation": {
     "active_job_slots_occupied": null,
-    "active_workflow_runs": 0,
+    "active_workflow_runs": 1,
     "available_pools": 0,
     "configured_slots": null,
     "cycling_slots": null,
