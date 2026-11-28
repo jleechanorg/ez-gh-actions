@@ -96,24 +96,24 @@
   },
   "latency": {
     "cancellation": {
-      "cancelled_rate_pct": 4.1,
+      "cancelled_rate_pct": 3.9,
       "cancelled_runs": 2,
-      "total_non_skipped_runs": 49
+      "total_non_skipped_runs": 51
     },
     "cohort": "success",
-    "generated_at": "2026-11-28T16:55:17Z",
+    "generated_at": "2026-11-28T17:05:51Z",
     "ok": true,
     "overall": {
       "e2e": {
-        "avg_s": 314.89,
+        "avg_s": 302.9,
         "max_s": 2818.0,
-        "n": 46,
+        "n": 48,
         "p50_s": 18.0,
-        "p90_s": 1350.0,
-        "p99_s": 2705.05
+        "p90_s": 1000.0,
+        "p99_s": 2700.03
       },
       "execution": {
-        "avg_s": 374.33,
+        "avg_s": 374.37,
         "max_s": 2559.0,
         "n": 101,
         "p50_s": 44.0,
@@ -245,18 +245,18 @@
       },
       {
         "e2e": {
-          "avg_s": 43.78,
+          "avg_s": 43.8,
           "max_s": 50.0,
-          "n": 9,
-          "p50_s": 42.0,
-          "p90_s": 48.4,
-          "p99_s": 49.84
+          "n": 10,
+          "p50_s": 43.0,
+          "p90_s": 48.2,
+          "p99_s": 49.82
         },
         "execution": {
-          "avg_s": 39.25,
+          "avg_s": 39.38,
           "max_s": 44.0,
           "n": 8,
-          "p50_s": 38.5,
+          "p50_s": 39.0,
           "p90_s": 43.3,
           "p99_s": 43.93
         },
@@ -357,20 +357,20 @@
       },
       {
         "e2e": {
-          "avg_s": 8.67,
+          "avg_s": 8.8,
           "max_s": 11.0,
-          "n": 9,
+          "n": 10,
           "p50_s": 9.0,
           "p90_s": 11.0,
           "p99_s": 11.0
         },
         "execution": {
-          "avg_s": 5.88,
-          "max_s": 7.0,
+          "avg_s": 6.25,
+          "max_s": 8.0,
           "n": 8,
           "p50_s": 6.0,
-          "p90_s": 6.3,
-          "p99_s": 6.93
+          "p90_s": 7.3,
+          "p99_s": 7.93
         },
         "queue_wait": {
           "avg_s": 1.25,
@@ -385,12 +385,12 @@
       }
     ]
   },
-  "observed_at": "2026-11-28T16:55:10Z",
-  "published_at": "2026-11-28T16:55:16Z",
+  "observed_at": "2026-11-28T17:05:44Z",
+  "published_at": "2026-11-28T17:05:50Z",
   "queue": {
     "fresh": 0,
     "ghosts": 0,
-    "in_progress_runs": 1,
+    "in_progress_runs": 0,
     "ok": true,
     "oldest_fresh_wait_minutes": null,
     "partial": false,
@@ -410,7 +410,7 @@
   },
   "reconciliation": {
     "active_job_slots_occupied": null,
-    "active_workflow_runs": 1,
+    "active_workflow_runs": 0,
     "available_pools": 0,
     "configured_slots": null,
     "cycling_slots": null,
